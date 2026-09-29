@@ -10,8 +10,9 @@ function appName(): Plugin {
 }
 
 // The web app is a static site: it bundles @evm-midnight-transparent/core and nothing that needs
-// Node. TODO(P3): the in-browser Midnight wallet SDK (WASM) comes with the live wallet module
-// (src/swap/wiring.ts); G-TAKE T.5 bundled it with Vite and no plugins.
+// Node. The in-browser Midnight wallet (packages/wallet, with the ledger and runtime WASM) is a
+// separate chunk loaded on first use (src/swap/wiring.ts); Vite bundles it with no plugins (the
+// WASM files are emitted as assets), as G-TAKE T.5 and L-WALLET LW.4 did.
 export default defineConfig({
   plugins: [react(), appName()],
   base: './',

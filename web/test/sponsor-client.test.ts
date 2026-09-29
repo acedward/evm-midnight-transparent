@@ -5,15 +5,19 @@
 
 import {
   OpenSwapRequestSchema as CoreOpenSwapRequestSchema,
+  OpenSwapResponseSchema as CoreOpenSwapResponseSchema,
   ProveRequestSchema as CoreProveRequestSchema,
+  SponsorApiError as CoreSponsorApiError,
+  SwapResponseSchema as CoreSwapResponseSchema,
   SwapViewSchema as CoreSwapViewSchema,
   TakeReportSchema as CoreTakeReportSchema,
   WithdrawParamsSchema as CoreWithdrawParamsSchema,
   payloadHash,
 } from '@evm-midnight-transparent/core';
+import { SponsorApiError as WalletSponsorApiError } from '@evm-midnight-transparent/wallet/sponsor-client';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadSiteConfig } from '../src/config.js';
+import { loadSiteConfig, resolveSponsorUrl } from '../src/config.js';
 import type { MockEnvironment } from '../src/swap/mock/index.js';
 import {
   HttpSponsorApi,
@@ -28,6 +32,35 @@ let env: MockEnvironment;
 afterEach(() => env?.stop());
 
 const H = (c: string) => c.repeat(64);
+
+/** A swap view as the REAL sponsor serves it (core SwapViewSchema), nulls for the legs not started. */
+const coreView = () => {
+  const leg = { colour: H('a'), amount: '1040000', symbol: 'USDC', erc20Address: `0x${'1c'.repeat(20)}`, decimals: 6 };
+  return {
+    swapId: H('5'),
+    state: 'awaiting_funds',
+    evmAddress: `0x${'48'.repeat(20)}`,
+    offerId: H('9'),
+    pay: leg,
+    receive: { ...leg, colour: H('b'), amount: '100000000', symbol: 'stkA' },
+    tempCoinPk: H('c'),
+    depositAddress: `0x${'fa'.repeat(20)}`,
+    erc20Address: `0x${'1c'.repeat(20)}`,
+    amount: '1040000',
+    sweepGas: {
+      gasLimit: '65000',
+      maxFeePerGas: '2500000000',
+      maxPriorityFeePerGas: '500000000',
+      ethWei: '162500000000000',
+    },
+    deposit: null,
+    takeTx: null,
+    withdraw: null,
+    withdrawals: [],
+    createdAt: 1_790_000_000,
+    updatedAt: 1_790_000_000,
+  };
+};
 
 async function setup() {
   env = mockEnv();
@@ -155,28 +188,52 @@ describe('the sponsor client against the mock sponsor', () => {
     expect((await api.reportTake(swapId, swapToken, { outcome: 'not-available' })).state).toBe('awaiting_funds');
   });
 
-  it('marks the stale answers that mean "rebuild"', () => {
-    expect(new SponsorError('x', 409, 'stale-vault-state').rebuild).toBe(true);
-    expect(new SponsorError('x', 409, 'stale-evm-nonce').rebuild).toBe(true);
-    expect(new SponsorError('x', 409, 'swap-conflict').rebuild).toBe(false);
+  it('marks the stale answers that mean "rebuild" (one error class: core\'s SponsorApiError)', () => {
+    expect(new SponsorError(409, 'stale-vault-state', 'x').rebuild).toBe(true);
+    expect(new SponsorError(409, 'stale-evm-nonce', 'x').rebuild).toBe(true);
+    expect(new SponsorError(409, 'swap-conflict', 'x').rebuild).toBe(false);
+    expect(SponsorError).toBe(CoreSponsorApiError);
+    expect(SponsorError).toBe(WalletSponsorApiError);
   });
 
   it('reads a view with null legs and hashes as absent (L-SPONSOR 4)', async () => {
     const api = new HttpSponsorApi('https://sponsor.invalid', {
-      fetch: async () =>
-        new Response(
-          JSON.stringify({
-            swapId: `0x${H('5')}`,
-            state: 'minted',
-            deposit: null,
-            takeTx: null,
-            withdraw: null,
-            withdrawals: [],
-            extra: 1,
-          }),
-        ),
+      fetch: async () => new Response(JSON.stringify({ swap: { ...coreView(), state: 'minted', extra: 1 } })),
     });
-    expect(await api.swap(`0x${H('5')}`, 't')).toEqual({ swapId: `0x${H('5')}`, state: 'minted' });
+    const v = await api.swap(`0x${H('5')}`, 't');
+    expect(v).toMatchObject({ swapId: `0x${H('5')}`, state: 'minted' });
+    expect(v.deposit).toBeUndefined();
+    expect(v.withdraw).toBeUndefined();
+    expect(v.takeTx).toBeUndefined();
+  });
+
+  it("every answer of the mock sponsor has the real sponsor's shape (core swap-api.ts)", async () => {
+    const { payload, swapId, sign } = await setup();
+    const raw = (url: string, init: RequestInit = {}) => env.sponsorFetch(`https://sponsor.mock.invalid${url}`, init);
+    const body = async (r: Promise<Response>) => (await r).json() as Promise<unknown>;
+    const open = await body(
+      raw('/v1/swaps', { method: 'POST', body: JSON.stringify({ swap: swapId, payload, auth: await sign() }) }),
+    );
+    const opened = CoreOpenSwapResponseSchema.parse(open);
+    expect(opened.resumed).toBe(false);
+    const auth = { authorization: `Bearer ${opened.swapToken}` };
+    expect(CoreSwapResponseSchema.safeParse(await body(raw(`/v1/swaps/${swapId}`, { headers: auth }))).success).toBe(
+      true,
+    );
+    const params = await body(raw(`/v1/swaps/${swapId}/withdraw-params?kind=bridge-back`, { headers: auth }));
+    expect(CoreWithdrawParamsSchema.safeParse(params).success).toBe(true);
+    const report = await body(
+      raw(`/v1/swaps/${swapId}/take`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ outcome: 'not-available' }),
+      }),
+    );
+    expect(CoreSwapResponseSchema.safeParse(report).success).toBe(true);
+    const again = await body(
+      raw('/v1/swaps', { method: 'POST', body: JSON.stringify({ swap: swapId, payload, auth: await sign() }) }),
+    );
+    expect(CoreOpenSwapResponseSchema.parse(again).resumed).toBe(true);
   });
 
   it('surfaces network failures and unreadable answers as SponsorErrors', async () => {
@@ -255,9 +312,14 @@ describe("the sponsor's own wire (core swap-api.ts, L-SPONSOR)", () => {
     expect(CoreOpenSwapRequestSchema.safeParse(JSON.parse(JSON.stringify(request))).success).toBe(true);
   });
 
-  it('reads a view as the sponsor serves it (id without 0x, stage times in seconds)', async () => {
-    const api = new HttpSponsorApi('https://sponsor.invalid', {
+  it('reads a view as the sponsor serves it ({swap} envelope, id without 0x, stage times in seconds)', async () => {
+    // P3 found this: the real sponsor answers GET /v1/swaps/:id with {swap: view}; a bare view is not its wire.
+    const bare = new HttpSponsorApi('https://sponsor.invalid', {
       fetch: async () => new Response(JSON.stringify(view)),
+    });
+    expect((await refusal(bare.swap(`0x${H64('5')}`, 't'))).code).toBe('invalid-response');
+    const api = new HttpSponsorApi('https://sponsor.invalid', {
+      fetch: async () => new Response(JSON.stringify({ swap: view })),
     });
     const v = await api.swap(`0x${H64('5')}`, 't');
     expect(v.swapId).toBe(`0x${H64('5')}`);
@@ -305,5 +367,20 @@ describe('the site config', () => {
     expect((await loadSiteConfig(serve({ network: 'stagenet' }))).mock).toBeUndefined();
     await expect(loadSiteConfig(serve({ mock: { stepMs: 'fast' } }))).rejects.toThrow(/mock settings/);
     await expect(loadSiteConfig(serve({ mock: { secret: 1 } }))).rejects.toThrow(/mock settings/);
+  });
+
+  it("resolves a relative sponsor URL (the deploy bundle's same-origin /sponsor) against the page", async () => {
+    const at = 'http://127.0.0.1:8080/#swap';
+    expect((await loadSiteConfig(serve({ sponsorUrl: '/sponsor' }), at)).sponsorUrl).toBe(
+      'http://127.0.0.1:8080/sponsor',
+    );
+    expect((await loadSiteConfig(serve({ sponsorUrl: 'https://s.example/api/' }), at)).sponsorUrl).toBe(
+      'https://s.example/api',
+    );
+    expect((await loadSiteConfig(serve({ sponsorUrl: '' }), at)).sponsorUrl).toBe('');
+    expect(resolveSponsorUrl('/sponsor', undefined)).toBe('');
+    expect(resolveSponsorUrl(42, at)).toBe('');
+    // The adapter takes the resolved URL.
+    expect(new HttpSponsorApi(resolveSponsorUrl('/sponsor/', at)).baseUrl).toBe('http://127.0.0.1:8080/sponsor');
   });
 });

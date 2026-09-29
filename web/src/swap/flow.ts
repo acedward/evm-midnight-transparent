@@ -208,26 +208,46 @@ export function stageStates(record: SwapRecord | null): Record<StageKey, StageSt
   return out;
 }
 
-/** Plain titles for the sponsor's stage ids, per leg; an unknown id is shown as it came. */
+/** Plain titles for the sponsor's stage ids, per leg (the real sponsor's, sponsor/src/swaps/service.ts,
+ *  and the mock's `settled`); an unknown id is shown as it came. */
 export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Readonly<Record<string, string>>>> = {
   deposit: {
+    'waiting-for-funds': 'Waiting for your funds at the deposit address',
+    'funds-seen': 'Your funds reached the deposit address',
     starting: 'Starting the deposit on Midnight',
+    adopted: 'Deposit found on Midnight',
     started: 'Deposit started on Midnight',
     'mpc-signed': 'Sweep signed by the MPC network',
     'evm-broadcast': 'Sweep sent on Sepolia',
+    'evm-not-broadcast': 'The sweep could not be sent on Sepolia',
     'evm-final': 'Sweep final on Sepolia',
     attested: 'Sweep attested by the MPC network',
+    'relay-stalled': 'Waiting on the bridge (the sponsor retries)',
+    completing: 'Minting to the temporary wallet',
+    completed: 'Minted to the temporary wallet',
     settled: 'Minted to the temporary wallet',
+    abandoning: 'The sweep did not happen: closing the request',
+    abandoned: 'The sweep did not happen: the deposit will be retried',
+    closed: 'Deposit request closed',
   },
   withdraw: {
+    queued: 'Waiting for the withdrawal lane',
+    starting: 'Starting the withdrawal on Midnight',
+    submitting: 'Submitting the withdrawal on Midnight',
     started: 'Withdrawal started on Midnight',
+    resumed: 'Withdrawal resumed by the sponsor',
     'mpc-signed': 'Transfer signed by the MPC network',
     'evm-broadcast': 'Tokens sent to you on Sepolia',
+    'evm-not-broadcast': 'The Sepolia transfer could not be sent',
     'evm-final': 'Transfer final on Sepolia',
     'evm-failed': 'The Sepolia transfer failed',
     attested: 'Transfer attested by the MPC network',
+    'relay-stalled': 'Waiting on the bridge (the sponsor retries)',
+    completing: 'Closing the withdrawal on Midnight',
+    completed: 'Withdrawal closed on Midnight',
     settled: 'Withdrawal closed on Midnight',
     refunded: 'Refunded to the temporary wallet',
+    failed: 'The withdrawal failed',
   },
 };
 

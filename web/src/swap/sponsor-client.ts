@@ -1,6 +1,12 @@
-// The sponsor API client (the plan's Lane contracts, "The sponsor API", and L-WEB's reading of its
-// gaps). This is the REAL client: P3 points it at the real sponsor; in mock mode its `fetch` is the
-// in-browser mock sponsor (./mock/sponsor.ts), so the same code runs in both.
+// The sponsor API as the page calls it (the plan's Lane contracts, "The sponsor API", and L-WEB's
+// reading of its gaps). The HTTP is NOT written here (plan P3, L-SPONSOR's recommendation 3, one
+// client per call): the calls before a swap token exists and the state polling go through core's
+// `SponsorClient`, the calls authorised by the token through the wallet module's `sponsorClient`
+// (`@evm-midnight-transparent/wallet/sponsor-client`, which imports no WASM). Both parse the
+// sponsor's wire with core's schemas (swap-api.ts); this adapter then reads the answers the page's
+// way (the tolerant `SwapView` below) and turns a failed fetch or an unreadable answer into core's
+// `SponsorApiError` (exported here as `SponsorError`). In mock mode the `fetch` both clients use is
+// the in-browser mock sponsor (./mock/sponsor.ts), so the same code runs in both.
 //
 //   GET  /v1/auth/nonce                      a single-use nonce for a SponsorAction signature
 //   POST /v1/swaps                           open (or re-open, to resume) a swap: one SponsorAction
@@ -19,13 +25,15 @@
 // fields dropped, unknown stage ids kept as text).
 
 import {
-  NonceResponseSchema,
   OPEN_SWAP_ACTION,
+  SponsorApiError,
+  SponsorClient,
   payloadHash,
   sponsorActionTypedData,
   type NonceResponse,
   type SponsorActionMessage,
 } from '@evm-midnight-transparent/core';
+import { sponsorClient } from '@evm-midnight-transparent/wallet/sponsor-client';
 import { getAddress, getBytes } from 'ethers';
 import { z } from 'zod';
 
@@ -116,26 +124,7 @@ export const OpenSwapResponseSchema = z.object({
 });
 export type OpenSwapResponse = z.infer<typeof OpenSwapResponseSchema>;
 
-const ProveResponseSchema = z.object({ tx: z.string().regex(/^(0x)?[0-9a-fA-F]+$/) });
 const SwapAnswerSchema = z.object({ swap: SwapViewSchema });
-const whole = z.union([z.string().regex(/^\d{1,40}$/), z.number().int().nonnegative()]).transform((v) => BigInt(v));
-const WithdrawParamsSchema = z.object({
-  kind: z.enum(['swap', 'bridge-back']),
-  colour: z
-    .string()
-    .regex(/^(0x)?[0-9a-fA-F]{64}$/)
-    .transform((v) => v.replace(/^0x/, '').toLowerCase()),
-  amount: whole,
-  erc20Address: evmAddress,
-  dest: evmAddress,
-  refundRecipient: z
-    .union([z.string(), z.object({ left: z.string() })])
-    .transform((v) => (typeof v === 'string' ? v : v.left).replace(/^0x/, '').toLowerCase())
-    .pipe(hex64),
-  gas: z.object({ gasLimit: whole, maxFeePerGas: whole, maxPriorityFeePerGas: whole, keyVersion: whole }),
-  evmNonce: whole,
-});
-const ApiErrorBody = z.object({ error: z.object({ code: z.string(), message: z.string() }) });
 
 /** What the user asks the sponsor to open: the offer's two legs and the temporary wallet's keys. */
 export interface OpenSwapPayload {
@@ -153,21 +142,9 @@ export interface OpenSwapRequest {
   auth: { message: SponsorActionMessage; signature: string };
 }
 
-export class SponsorError extends Error {
-  override name = 'SponsorError';
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code: string,
-  ) {
-    super(message);
-  }
-
-  /** The withdrawal must be rebuilt on fresh state and proven again (L-SPONSOR 8–9). */
-  get rebuild(): boolean {
-    return this.code === 'stale-vault-state' || this.code === 'stale-evm-nonce';
-  }
-}
+/** Every sponsor error the page sees: core's `SponsorApiError` (`status`, `code`, `message`, `detail`,
+ *  and `rebuild` for the stale answers that mean "rebuild the withdrawal and prove again"). */
+export { SponsorApiError as SponsorError };
 
 export type ProveRequest =
   { purpose: 'take'; tx: string } | { purpose: 'withdraw'; tx: string; coinNonce: string; evmNonce: string };
@@ -213,16 +190,35 @@ export async function signOpenSwap(
 ): Promise<{ message: SponsorActionMessage; signature: string }> {
   const signature = await signer.signTypedData(sponsorActionTypedData(message, chainId));
   if (getBytes(signature).length !== 65)
-    throw new SponsorError('the wallet returned a malformed signature', 0, 'bad-signature');
+    throw new SponsorApiError(0, 'bad-signature', 'the wallet returned a malformed signature');
   return { message, signature };
 }
 
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
+/** How long a proof may take at the sponsor (its own limit is PROOF_TIMEOUT_SECONDS, 900 s). */
+const PROVE_TIMEOUT_MS = 15 * 60_000;
+
+const isZodError = (e: unknown) => (e as { name?: unknown } | null)?.name === 'ZodError';
+
+/** A failed fetch or an unreadable answer, as the page words it; the sponsor's own errors pass through. */
+async function guarded<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    if (e instanceof SponsorApiError) throw e;
+    if (isZodError(e))
+      throw new SponsorApiError(200, 'invalid-response', 'The sponsor service sent an answer this page cannot read.');
+    throw new SponsorApiError(0, 'network', 'The sponsor service could not be reached.');
+  }
+}
+
 export class HttpSponsorApi implements SponsorApi {
   readonly baseUrl: string;
   private readonly fetchImpl: FetchImpl;
   private readonly timeoutMs: number;
+  /** The calls before a swap token exists, and the state polling. */
+  private readonly core: SponsorClient;
 
   constructor(baseUrl: string, options: { fetch?: FetchImpl; timeoutMs?: number } = {}) {
     let url: URL;
@@ -235,90 +231,54 @@ export class HttpSponsorApi implements SponsorApi {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.fetchImpl = options.fetch ?? ((u, i) => globalThis.fetch(u, i));
     this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.core = new SponsorClient({ baseUrl: this.baseUrl, fetch: this.fetchImpl, timeoutMs: this.timeoutMs });
   }
 
-  private async call<T>(
-    method: 'GET' | 'POST',
-    path: string,
-    schema: z.ZodType<T>,
-    opts: { token?: string; body?: unknown } = {},
-  ): Promise<T> {
-    const headers: Record<string, string> = { accept: 'application/json' };
-    if (opts.body !== undefined) headers['content-type'] = 'application/json';
-    if (opts.token !== undefined) headers.authorization = `Bearer ${opts.token}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-        method,
-        headers,
-        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch {
-      throw new SponsorError('The sponsor service could not be reached.', 0, 'network');
-    }
-    const text = await res.text();
-    let json: unknown;
-    try {
-      json = text === '' ? null : JSON.parse(text);
-    } catch {
-      json = null;
-    }
-    if (!res.ok) {
-      const err = ApiErrorBody.safeParse(json);
-      throw new SponsorError(
-        err.success ? err.data.error.message : `The sponsor service answered ${res.status}.`,
-        res.status,
-        err.success ? err.data.error.code : res.status === 429 ? 'rate-limited' : 'http',
-      );
-    }
-    const parsed = schema.safeParse(json);
-    if (!parsed.success)
-      throw new SponsorError(
-        'The sponsor service sent an answer this page cannot read.',
-        res.status,
-        'invalid-response',
-      );
-    return parsed.data;
+  /** The calls authorised by this swap's bearer token: the wallet module's client. */
+  private withToken(swapId: string, token: string, timeoutMs = this.timeoutMs) {
+    return sponsorClient({
+      baseUrl: this.baseUrl,
+      swapId,
+      swapToken: token,
+      fetchImpl: this.fetchImpl as typeof fetch,
+      timeoutMs,
+    });
   }
 
   nonce(): Promise<NonceResponse> {
-    return this.call('GET', '/v1/auth/nonce', NonceResponseSchema);
+    return guarded(() => this.core.nonce());
   }
 
   openSwap(request: OpenSwapRequest): Promise<OpenSwapResponse> {
-    return this.call('POST', '/v1/swaps', OpenSwapResponseSchema, { body: request });
-  }
-
-  swap(swapId: string, token: string): Promise<SwapView> {
-    return this.call('GET', `/v1/swaps/${encodeURIComponent(swapId)}`, SwapViewSchema, { token });
-  }
-
-  withdrawParams(swapId: string, token: string, kind: WithdrawParams['kind']): Promise<WithdrawParams> {
-    return this.call(
-      'GET',
-      `/v1/swaps/${encodeURIComponent(swapId)}/withdraw-params?kind=${kind}`,
-      WithdrawParamsSchema,
-      {
-        token,
-      },
+    return guarded(async () =>
+      OpenSwapResponseSchema.parse(await this.core.openSwap(request.swap, request.payload, request.auth)),
     );
   }
 
+  swap(swapId: string, token: string): Promise<SwapView> {
+    return guarded(async () => SwapViewSchema.parse(await this.core.swap(swapId, token)));
+  }
+
+  withdrawParams(swapId: string, token: string, kind: WithdrawParams['kind']): Promise<WithdrawParams> {
+    return guarded(() => this.withToken(swapId, token).withdrawParams(kind));
+  }
+
   prove(swapId: string, token: string, body: ProveRequest): Promise<{ tx: string }> {
-    return this.call('POST', `/v1/swaps/${encodeURIComponent(swapId)}/prove`, ProveResponseSchema, { token, body });
+    return guarded(async () => ({
+      tx: await this.withToken(swapId, token, PROVE_TIMEOUT_MS).prove(
+        body.purpose,
+        body.tx,
+        body.purpose === 'withdraw' ? { coinNonce: body.coinNonce, evmNonce: BigInt(body.evmNonce) } : undefined,
+      ),
+    }));
   }
 
-  async withdraw(swapId: string, token: string, body: { tx: string }): Promise<SwapView> {
-    return (
-      await this.call('POST', `/v1/swaps/${encodeURIComponent(swapId)}/withdraw`, SwapAnswerSchema, { token, body })
-    ).swap;
+  withdraw(swapId: string, token: string, body: { tx: string }): Promise<SwapView> {
+    return guarded(async () => SwapAnswerSchema.parse(await this.withToken(swapId, token).withdraw(body.tx)).swap);
   }
 
-  async reportTake(swapId: string, token: string, report: TakeReport): Promise<SwapView> {
-    return (
-      await this.call('POST', `/v1/swaps/${encodeURIComponent(swapId)}/take`, SwapAnswerSchema, { token, body: report })
-    ).swap;
+  reportTake(swapId: string, token: string, report: TakeReport): Promise<SwapView> {
+    return guarded(async () => SwapAnswerSchema.parse(await this.withToken(swapId, token).reportTake(report)).swap);
   }
 }
 

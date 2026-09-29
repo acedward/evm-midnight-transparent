@@ -109,45 +109,70 @@ describe('SponsorClient', () => {
     return { f, calls };
   };
 
-  it('sends the bearer token and JSON, and parses the answers', async () => {
+  const view = {
+    swapId: hex('ab'),
+    state: 'depositing',
+    evmAddress: `0x${'48'.repeat(20)}`,
+    offerId: hex('9e'),
+    pay: { colour: hex('5e'), amount: '104166667', symbol: 'stkA', erc20Address: `0x${'2a'.repeat(20)}`, decimals: 6 },
+    receive: {
+      colour: hex('e5'),
+      amount: '1000000',
+      symbol: 'USDC',
+      erc20Address: `0x${'1c'.repeat(20)}`,
+      decimals: 6,
+    },
+    tempCoinPk: hex('6b'),
+    depositAddress: `0x${'fa'.repeat(20)}`,
+    erc20Address: `0x${'2a'.repeat(20)}`,
+    amount: '104166667',
+    sweepGas: {
+      gasLimit: '65000',
+      maxFeePerGas: '2500000000',
+      maxPriorityFeePerGas: '500000000',
+      ethWei: '162500000000000',
+    },
+    deposit: { stage: 'started', stages: [{ stage: 'started', at: 1_790_000_000 }], requestId: hex('e3'), attempts: 1 },
+    takeTx: null,
+    withdraw: null,
+    withdrawals: [],
+    createdAt: 1_790_000_000,
+    updatedAt: 1_790_000_001,
+  };
+
+  it('sends the bearer token, and reads the swap from its {swap} envelope (as the sponsor serves it)', async () => {
     const { f, calls } = fakeFetch({
-      [`POST /v1/swaps/${hex('ab')}/prove`]: { status: 200, body: { tx: 'beef' } },
-      [`GET /v1/swaps/${hex('ab')}/withdraw-params`]: {
+      [`GET /v1/swaps/${hex('ab')}`]: { status: 200, body: { swap: view } },
+      ['GET /v1/auth/nonce']: {
         status: 200,
-        body: {
-          kind: 'swap',
-          colour: hex('e5'),
-          amount: '1000000',
-          erc20Address: `0x${'1c'.repeat(20)}`,
-          dest: `0x${'48'.repeat(20)}`,
-          refundRecipient: hex('6b'),
-          gas: { gasLimit: '100000', maxFeePerGas: '10000000000', maxPriorityFeePerGas: '1000000000', keyVersion: '1' },
-          evmNonce: '9',
-          vaultAddress: hex('77'),
-        },
+        body: { nonce: `0x${hex('0d')}`, expiresAt: 1_790_000_600, maxTtlSeconds: 600 },
       },
     });
     const c = new SponsorClient({ baseUrl: 'https://sponsor.example/', fetch: f });
-    expect(await c.prove(hex('ab'), 'tok'.repeat(15), { purpose: 'take', tx: 'ab' })).toBe('beef');
-    expect(calls[0]!.url).toBe(`https://sponsor.example/v1/swaps/${hex('ab')}/prove`);
+    const v = await c.swap(hex('ab'), 'tok'.repeat(15));
+    expect(v).toMatchObject({ state: 'depositing', deposit: { requestId: hex('e3') }, takeTx: null });
+    expect(calls[0]!.url).toBe(`https://sponsor.example/v1/swaps/${hex('ab')}`);
     expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${'tok'.repeat(15)}`);
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ purpose: 'take', tx: 'ab' });
-    const p = await c.withdrawParams(hex('ab'), 't'.repeat(43), 'swap');
-    expect(p.evmNonce).toBe('9');
-    expect(calls[1]!.url).toMatch(/withdraw-params\?kind=swap$/);
+    expect((await c.nonce()).maxTtlSeconds).toBe(600);
+    // A bare view (no envelope) is not the sponsor's wire.
+    const bare = fakeFetch({ [`GET /v1/swaps/${hex('ab')}`]: { status: 200, body: view } });
+    await expect(
+      new SponsorClient({ baseUrl: 'https://s.example', fetch: bare.f }).swap(hex('ab'), 't'),
+    ).rejects.toThrow();
   });
 
-  it('turns the sponsor’s error into a SponsorApiError with its code and detail', async () => {
+  it('turns the sponsor’s error into a SponsorApiError with its code, detail and rebuild flag', async () => {
     const { f } = fakeFetch({
-      [`POST /v1/swaps/${hex('ab')}/prove`]: {
-        status: 422,
-        body: { error: { code: 'invalid-tx', message: 'no', detail: 'wrong-offer' } },
+      [`GET /v1/swaps/${hex('ab')}`]: {
+        status: 409,
+        body: { error: { code: 'stale-vault-state', message: 'rebuild', detail: 'moved' } },
       },
     });
     const c = new SponsorClient({ baseUrl: 'https://sponsor.example', fetch: f });
-    const e = await c.prove(hex('ab'), 't'.repeat(43), { purpose: 'take', tx: 'ab' }).catch((x: unknown) => x);
+    const e = await c.swap(hex('ab'), 't'.repeat(43)).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(SponsorApiError);
-    expect(e).toMatchObject({ status: 422, code: 'invalid-tx', detail: 'wrong-offer' });
-    await expect(c.swap(hex('cd'), 't'.repeat(43))).rejects.toMatchObject({ status: 404, code: 'not-found' });
+    expect(e).toMatchObject({ status: 409, code: 'stale-vault-state', detail: 'moved', rebuild: true });
+    const nf = await c.swap(hex('cd'), 't'.repeat(43)).catch((x: unknown) => x);
+    expect(nf).toMatchObject({ status: 404, code: 'not-found', rebuild: false });
   });
 });

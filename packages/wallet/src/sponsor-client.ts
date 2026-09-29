@@ -14,31 +14,17 @@
 // (`{error: {code, message, detail?}}`): `stale-vault-state` and `stale-evm-nonce` (409) mean
 // "rebuild the withdrawal and prove again".
 // The swap token is a bearer credential: it lives in memory only, like the key.
+//
+// This module imports core only (no WASM): the web app loads it with its first bundle, as
+// `@evm-midnight-transparent/wallet/sponsor-client`, while the wallet itself loads lazily. Errors are
+// core's `SponsorApiError` (one class for every sponsor call; `rebuild` marks the stale answers).
 
-import { type ApiError, ApiErrorSchema, type EvmGasPolicy } from '@evm-midnight-transparent/core';
+import { type ApiError, ApiErrorSchema, type EvmGasPolicy, SponsorApiError } from '@evm-midnight-transparent/core';
 
-import { type ProvingService } from './prover.js';
-import { type UnprovenTx, provenUnboundFromHex, txToHex } from './tx.js';
+export { SponsorApiError };
 
 export type ProvePurpose = 'take' | 'withdraw';
 export type WithdrawKind = 'swap' | 'bridge-back';
-
-export class SponsorApiError extends Error {
-  override name = 'SponsorApiError';
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly detail?: string,
-  ) {
-    super(message);
-  }
-
-  /** The withdrawal must be rebuilt on fresh state and proven again. */
-  get rebuild(): boolean {
-    return this.code === 'stale-vault-state' || this.code === 'stale-evm-nonce';
-  }
-}
 
 export interface SponsorClientOptions {
   /** The sponsor's origin, e.g. `https://sponsor.example` (no trailing `/v1`). */
@@ -166,7 +152,9 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
       const e = ApiErrorSchema.safeParse(parsed);
       const err: ApiError['error'] = e.success
         ? e.data.error
-        : { code: `http-${res.status}`, message: text.slice(0, 300) || res.statusText };
+        : res.status === 429
+          ? { code: 'rate-limited', message: 'The sponsor service is busy: too many requests. Try again shortly.' }
+          : { code: `http-${res.status}`, message: text.slice(0, 300) || res.statusText };
       throw new SponsorApiError(res.status, err.code, err.message, err.detail);
     }
     return parsed;
@@ -211,9 +199,4 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
       );
     },
   };
-}
-
-/** A `ProvingService` over the sponsor's `/prove` for takes (code written against the SDK's service). */
-export function sponsorProvingService(client: SponsorClient, purpose: 'take'): ProvingService {
-  return { prove: async (tx: UnprovenTx) => provenUnboundFromHex(await client.prove(purpose, txToHex(tx))) };
 }

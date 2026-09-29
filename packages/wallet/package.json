@@ -6,7 +6,8 @@
   "description": "The swap's temporary Midnight wallet, browser-safe: keys from the start-swap signature's seed, a shielded-only wallet, the take builder (balance the maker's offer; the sponsor proves; merge; submit to the batcher), the vault startWithdraw builder (built on the vault's live state from the vendored compiled contract), and the sponsor client for /prove and /withdraw.",
   "license": "Apache-2.0",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./sponsor-client": "./src/sponsor-client.ts"
   },
   "dependencies": {
     "@evm-midnight-transparent/core": "workspace:*",
