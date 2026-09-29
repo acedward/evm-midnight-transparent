@@ -106,7 +106,8 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
   const next: SwapRecord = { ...record, bridgeIn, bridgeOut, take, phase, updatedAt: now };
   if (view.state === 'done')
     next.outcome = view.outcome ?? (record.choice === 'bridge-back' ? 'bridged-back' : 'swapped');
-  if (view.state === 'failed') next.error = (view.reason ?? 'The sponsor stopped this swap.').slice(0, 500);
+  if (view.state === 'failed')
+    next.error = (view.message ?? view.reason ?? 'The sponsor stopped this swap.').slice(0, 500);
   return next;
 }
 

@@ -154,7 +154,7 @@ export class MockSponsor {
     const msg = b?.auth?.message;
     if (!b || typeof b.swap !== 'string' || !p || !msg || typeof b.auth?.signature !== 'string')
       return fail(400, 'bad-request', 'expected {swap, payload, auth}');
-    if ((msg.action as string) !== OPEN_SWAP_ACTION) return fail(401, 'unauthorised', `signed for "${msg.action}"`);
+    if (msg.action !== OPEN_SWAP_ACTION) return fail(401, 'unauthorised', `signed for "${msg.action}"`);
     if (msg.network !== this.o.network) return fail(401, 'unauthorised', 'signed for another network');
     if (msg.swap !== b.swap) return fail(401, 'unauthorised', 'signed for another swap');
     let owner: string;
@@ -217,7 +217,8 @@ export class MockSponsor {
         ethWei: (gasLimit * maxFeePerGas).toString(),
       },
       token: randomHex(32),
-      view: { swapId: b.swap, state: 'awaiting_funds' },
+      // As the real sponsor: the id without 0x, stage times in unix seconds.
+      view: { swapId: b.swap.replace(/^0x/, ''), state: 'awaiting_funds' },
       script: null,
       step: 0,
       withdrawals: 0,
@@ -336,7 +337,7 @@ export class MockSponsor {
   }
 
   private stage(stage: string): SponsorStage {
-    return { stage, at: this.now() };
+    return { stage, at: Math.floor(this.now() / 1000) };
   }
 
   // ── persistence ───────────────────────────────────────────────────────

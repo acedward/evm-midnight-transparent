@@ -20,6 +20,7 @@
 
 import {
   NonceResponseSchema,
+  OPEN_SWAP_ACTION,
   payloadHash,
   sponsorActionTypedData,
   type NonceResponse,
@@ -30,9 +31,8 @@ import { z } from 'zod';
 
 import type { TypedDataSigner, WithdrawParams } from './ports.js';
 
-/** The SponsorAction name for opening a swap (Lane contracts; core's list still has the P0
- *  placeholder `swap-open`, which L-SPONSOR replaces). */
-export const OPEN_SWAP_ACTION = 'open-swap';
+/** The SponsorAction name for opening a swap: core's (L-SPONSOR 1). */
+export { OPEN_SWAP_ACTION };
 
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 const swapIdRe = /^0x[0-9a-f]{64}$/;
@@ -86,13 +86,19 @@ const LegProgressSchema = z.object({
 
 /** `GET /v1/swaps/:id` (L-WEB's reading, item 4). */
 const SwapViewShape = z.object({
-  swapId: z.string().regex(swapIdRe),
+  /** The sponsor answers the id without 0x (core `SwapIdSchema`); the page keeps it with. */
+  swapId: z
+    .string()
+    .regex(/^(0x)?[0-9a-fA-F]{64}$/)
+    .transform((v) => `0x${v.replace(/^0x/i, '').toLowerCase()}`),
   state: z.enum(SWAP_STATES),
   deposit: LegProgressSchema.optional(),
   takeTx: optText,
   withdraw: LegProgressSchema.optional(),
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
+  /** On `failed`: a stable code, and the sentence for the page. */
   reason: z.string().max(500).optional(),
+  message: z.string().max(500).optional(),
 });
 export type SwapView = z.infer<typeof SwapViewShape>;
 export const SwapViewSchema = z.preprocess(dropNulls, SwapViewShape);
@@ -189,8 +195,7 @@ export function openSwapMessage(input: {
 }): SponsorActionMessage {
   if (!swapIdRe.test(input.swapId)) throw new RangeError('the swap id must be 0x + 64 lowercase hex');
   return {
-    // Not yet in core's SPONSOR_ACTIONS (see OPEN_SWAP_ACTION); the typed data does not care.
-    action: OPEN_SWAP_ACTION as SponsorActionMessage['action'],
+    action: OPEN_SWAP_ACTION,
     network: input.network,
     owner: getAddress(input.payload.evmAddress),
     swap: input.swapId,

@@ -3,7 +3,14 @@
 // unknown nonce, another signer, a missing or wrong bearer token), and how errors reach the page.
 // Also: the site config's mock block.
 
-import { payloadHash } from '@evm-midnight-transparent/core';
+import {
+  OpenSwapRequestSchema as CoreOpenSwapRequestSchema,
+  ProveRequestSchema as CoreProveRequestSchema,
+  SwapViewSchema as CoreSwapViewSchema,
+  TakeReportSchema as CoreTakeReportSchema,
+  WithdrawParamsSchema as CoreWithdrawParamsSchema,
+  payloadHash,
+} from '@evm-midnight-transparent/core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { loadSiteConfig } from '../src/config.js';
@@ -186,6 +193,107 @@ describe('the sponsor client against the mock sponsor', () => {
     });
     expect((await refusal(limited.nonce())).code).toBe('rate-limited');
     expect(() => new HttpSponsorApi('ftp://x')).toThrow(RangeError);
+  });
+});
+
+describe("the sponsor's own wire (core swap-api.ts, L-SPONSOR)", () => {
+  const H64 = (c: string) => c.repeat(64);
+  const leg = {
+    colour: H64('a'),
+    amount: '1040000',
+    symbol: 'USDC',
+    erc20Address: `0x${'1c'.repeat(20)}`,
+    decimals: 6,
+  };
+  const view = CoreSwapViewSchema.parse({
+    swapId: H64('5'),
+    state: 'withdrawing',
+    evmAddress: `0x${'48'.repeat(20)}`,
+    offerId: H64('9'),
+    pay: leg,
+    receive: { ...leg, colour: H64('b'), amount: '100000000', symbol: 'stkA' },
+    tempCoinPk: H64('c'),
+    depositAddress: `0x${'fa'.repeat(20)}`,
+    erc20Address: `0x${'1c'.repeat(20)}`,
+    amount: '1040000',
+    sweepGas: {
+      gasLimit: '65000',
+      maxFeePerGas: '2500000000',
+      maxPriorityFeePerGas: '500000000',
+      ethWei: '162500000000000',
+    },
+    deposit: {
+      stage: 'completed',
+      stages: [{ stage: 'started', at: 1_790_000_000, detail: { txHash: H64('d') } }],
+      requestId: H64('1'),
+      startTx: H64('2'),
+      startTxId: `00${H64('2')}`,
+      sweepTx: `0x${H64('3')}`,
+      completeTx: H64('4'),
+      attested: 'success',
+      attempts: 1,
+    },
+    takeTx: H64('e'),
+    withdraw: {
+      kind: 'swap',
+      colour: H64('b'),
+      amount: '100000000',
+      stage: 'evm-broadcast',
+      stages: [{ stage: 'started', at: 1_790_000_100 }],
+      requestId: H64('6'),
+      sepoliaTx: `0x${H64('7')}`,
+      refunds: 0,
+    },
+    withdrawals: [],
+    createdAt: 1_790_000_000,
+    updatedAt: 1_790_000_100,
+  });
+
+  it('sends an open-swap request core accepts', async () => {
+    const { payload, swapId, sign } = await setup();
+    const request = { swap: swapId, payload, auth: await sign() };
+    expect(CoreOpenSwapRequestSchema.safeParse(JSON.parse(JSON.stringify(request))).success).toBe(true);
+  });
+
+  it('reads a view as the sponsor serves it (id without 0x, stage times in seconds)', async () => {
+    const api = new HttpSponsorApi('https://sponsor.invalid', {
+      fetch: async () => new Response(JSON.stringify(view)),
+    });
+    const v = await api.swap(`0x${H64('5')}`, 't');
+    expect(v.swapId).toBe(`0x${H64('5')}`);
+    expect(v.deposit).toMatchObject({ requestId: H64('1'), sweepTx: `0x${H64('3')}`, completeTx: H64('4') });
+    expect(v.withdraw).toMatchObject({ colour: H64('b'), sepoliaTx: `0x${H64('7')}`, refunds: 0 });
+    expect(v.takeTx).toBe(H64('e'));
+  });
+
+  it('reads withdraw-params as core types them, and sends prove and take bodies core accepts', async () => {
+    const params = {
+      kind: 'swap',
+      colour: H64('b'),
+      amount: '100000000',
+      erc20Address: `0x${'2a'.repeat(20)}`,
+      dest: `0x${'48'.repeat(20)}`,
+      refundRecipient: H64('c'),
+      gas: { gasLimit: '100000', maxFeePerGas: '10000000000', maxPriorityFeePerGas: '1000000000', keyVersion: '1' },
+      evmNonce: '0',
+      vaultAddress: H64('7'),
+    };
+    const bodies: unknown[] = [];
+    const api = new HttpSponsorApi('https://sponsor.invalid', {
+      fetch: async (url, init) => {
+        if (init.body) bodies.push(JSON.parse(String(init.body)));
+        if (url.includes('withdraw-params'))
+          return new Response(JSON.stringify(CoreWithdrawParamsSchema.parse(params)));
+        if (url.endsWith('/prove')) return new Response(JSON.stringify({ tx: 'ab' }));
+        return new Response(JSON.stringify({ swap: view }));
+      },
+    });
+    const p = await api.withdrawParams(`0x${H64('5')}`, 't', 'swap');
+    expect([p.amount, p.evmNonce, p.refundRecipient, p.gas.keyVersion]).toEqual([100_000_000n, 0n, H64('c'), 1n]);
+    await api.prove(`0x${H64('5')}`, 't', { purpose: 'withdraw', tx: 'ab', coinNonce: H64('f'), evmNonce: '0' });
+    await api.reportTake(`0x${H64('5')}`, 't', { outcome: 'taken', takeTx: H64('e') });
+    expect(CoreProveRequestSchema.safeParse(bodies[0]).success).toBe(true);
+    expect(CoreTakeReportSchema.safeParse(bodies[1]).success).toBe(true);
   });
 });
 
