@@ -81,3 +81,12 @@ condition = "AND"
 paths = ['''(^|/)packages/wallet/test/vendor-vault\.test\.ts$''']
 regexTarget = "match"
 regexes = ['''^publishTokenMetadata: '[0-9a-f]{64}'$''']
+
+# The web bundle (CI scans web/dist): the page builds the token registry from those same vendored
+# records, so the build carries their PUBLIC per-token domain separators. Scoped to that rule, the
+# bundle's JavaScript AND that one field's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js$''']
+regexTarget = "match"
+regexes = ['''^vaultTokenDomainSeparator:`[0-9a-f]{64}`$''']

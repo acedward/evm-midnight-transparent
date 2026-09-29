@@ -1,0 +1,45 @@
+/* The swap pages: hash lists and the sponsor's sub-stages inside a tracker stage. Tokens only (the
+   colour pairs are ink, slate and muted on the surface: web/test/design-contrast.test.ts). */
+
+.tx-list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+.tx-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+  padding: 6px 0;
+  border-top: var(--rule-hair);
+  font-size: var(--text-md);
+  min-width: 0;
+}
+.tx-line:first-child {
+  border-top: none;
+}
+.tx-label {
+  color: var(--slate);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tx-label .sub {
+  max-width: 60ch;
+}
+.substages {
+  list-style: none;
+  margin: var(--space-2) 0;
+  padding: 0 0 0 var(--space-3);
+  border-left: 2px solid var(--rule);
+  font-size: var(--text-sm);
+  color: var(--ink);
+}
+.substages li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0 var(--space-3);
+  padding: 2px 0;
+}

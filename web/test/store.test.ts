@@ -70,8 +70,8 @@ describe('keys', () => {
     }
   });
 
-  it('has no secret record kind', () => {
-    expect([...RECORD_KINDS]).toEqual(['profile', 'settings']);
+  it('has no secret record kind (a swap record holds no key: test/swap-records.test.ts)', () => {
+    expect([...RECORD_KINDS]).toEqual(['profile', 'settings', 'swap']);
   });
 });
 

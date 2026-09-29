@@ -1,10 +1,8 @@
 // The application shell: the masthead (the app's name, the connected wallet with its Sepolia badge,
 // and the Midnight network), the tab bar, the sections and the testnet footer. The pieces come from
 // ./design; this file only wires them to the wallet and the store. Adapted from MN Bank
-// (acedward/passport-evm-dapp @ 911647b, web/src/App.tsx).
-//
-// TODO(L-WEB): the Swap section (the live offers both of whose tokens the vault bridges, the swap
-// page and its stages, "Swap is not available" with Bridge back, and resume).
+// (acedward/passport-evm-dapp @ 911647b, web/src/App.tsx). The Swap section is ./pages/swap: the
+// live offers, the swap page and its stages, "Swap is not available" with Bridge back, and resume.
 
 import { useEffect, useState } from 'react';
 
@@ -12,19 +10,10 @@ import type { NetworkProfile } from '@evm-midnight-transparent/core';
 
 import { APP_NAME } from './brand.js';
 import { loadSiteConfig, type SiteConfig } from './config.js';
-import {
-  Button,
-  EmptyState,
-  IdentityChip,
-  Masthead,
-  NetworkBadge,
-  Notice,
-  PageHead,
-  SiteFooter,
-  TabNav,
-  shortHex,
-} from './design/index.js';
+import { Button, IdentityChip, Masthead, NetworkBadge, Notice, SiteFooter, TabNav, shortHex } from './design/index.js';
 import { LocalData } from './pages/LocalData.js';
+import { SwapSection } from './pages/swap/Swap.js';
+import { SwapProvider } from './swap/SwapContext.js';
 import { storageText } from './store/messages.js';
 import { StoreProvider, useStore } from './store/StoreContext.js';
 import { WalletProvider, useWallet } from './wallet/WalletContext.js';
@@ -147,7 +136,8 @@ function ProfileRecorder({ network }: { network: string }) {
   return null;
 }
 
-function Shell({ network }: { network: NetworkProfile }) {
+function Shell({ config }: { config: SiteConfig }) {
+  const { network } = config;
   const [section, setSection] = useState<SectionId>(sectionFromHash);
   useEffect(() => {
     const on = () => setSection(sectionFromHash());
@@ -191,19 +181,7 @@ function Shell({ network }: { network: NetworkProfile }) {
           </Notice>
         )}
       </div>
-      <main className="wrap">
-        {section === 'local' ? (
-          <LocalData network={network.name} />
-        ) : (
-          <section data-testid="section-swap">
-            <PageHead title="Swap" />
-            <EmptyState title="Coming soon">
-              The offers you can take from your EVM wallet will be listed here. Your records are under{' '}
-              <a href="#local">Local data</a>.
-            </EmptyState>
-          </section>
-        )}
-      </main>
+      <main className="wrap">{section === 'local' ? <LocalData network={network.name} /> : <SwapSection />}</main>
       <SiteFooter networkName={`Midnight ${network.name}`} evmName={`Ethereum ${network.evm.chainName}`} />
       <ProfileRecorder network={network.name} />
     </div>
@@ -233,7 +211,9 @@ export function App() {
   return (
     <StoreProvider>
       <WalletProvider network={config.network}>
-        <Shell network={config.network} />
+        <SwapProvider config={config}>
+          <Shell config={config} />
+        </SwapProvider>
       </WalletProvider>
     </StoreProvider>
   );

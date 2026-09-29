@@ -3,18 +3,53 @@
 // the stagenet profile. Adapted from MN Bank (acedward/passport-evm-dapp @ 911647b, web/src/config.ts).
 
 import { type NetworkOverrides, type NetworkProfile, resolveNetwork } from '@evm-midnight-transparent/core';
+import { z } from 'zod';
 
 export interface SiteConfig {
   network: NetworkProfile;
-  /** The sponsor service's base URL ('' until the app calls it). */
+  /** The sponsor service's base URL ('' when none is configured: swaps cannot start). */
   sponsorUrl: string;
   /** The token list when the network has no built-in one (a local stack's colours); stagenet's
    *  comes from the vault records vendored in core. */
   tokens?: unknown;
+  /** Mock mode (P2, CI and the browser specs): the exchange, the sponsor and the wallet module run
+   *  in the page on a mock chain, with no real funds. Absent in a real deployment. */
+  mock?: MockSettings;
+}
+
+/** `config.json`'s `mock` block. `true` means all defaults. */
+export const MockSettingsSchema = z
+  .object({
+    stepMs: z.number().int().min(10).max(60_000).default(1_500),
+    scenario: z
+      .object({
+        offerGoneAtTake: z.boolean().optional(),
+        refundFirstWithdrawal: z.boolean().optional(),
+        refuseOpen: z.string().max(200).optional(),
+        staleWithdrawOnce: z.boolean().optional(),
+      })
+      .strict()
+      .default({}),
+    evmWallet: z.boolean().default(false),
+    book: z.enum(['default', 'empty']).default('default'),
+    persist: z.boolean().default(true),
+  })
+  .strict();
+export type MockSettings = z.infer<typeof MockSettingsSchema>;
+
+export class SiteConfigError extends Error {
+  override name = 'SiteConfigError';
+}
+
+function parseMock(raw: unknown): MockSettings | undefined {
+  if (raw === undefined || raw === false || raw === null) return undefined;
+  const parsed = MockSettingsSchema.safeParse(raw === true ? {} : raw);
+  if (!parsed.success) throw new SiteConfigError('config.json: the mock settings are not valid');
+  return parsed.data;
 }
 
 export async function loadSiteConfig(fetchImpl: typeof fetch = fetch): Promise<SiteConfig> {
-  let raw: { network?: unknown; sponsorUrl?: unknown; overrides?: unknown; tokens?: unknown } = {};
+  let raw: { network?: unknown; sponsorUrl?: unknown; overrides?: unknown; tokens?: unknown; mock?: unknown } = {};
   try {
     const res = await fetchImpl('./config.json', { cache: 'no-store' });
     if (res.ok) raw = (await res.json()) as typeof raw;
@@ -23,9 +58,11 @@ export async function loadSiteConfig(fetchImpl: typeof fetch = fetch): Promise<S
   }
   const name = typeof raw.network === 'string' ? raw.network : 'stagenet';
   const overrides = raw.overrides && typeof raw.overrides === 'object' ? (raw.overrides as NetworkOverrides) : {};
+  const mock = parseMock(raw.mock);
   return {
     network: resolveNetwork(name, overrides),
     sponsorUrl: typeof raw.sponsorUrl === 'string' ? raw.sponsorUrl : '',
     ...(raw.tokens !== undefined ? { tokens: raw.tokens } : {}),
+    ...(mock ? { mock } : {}),
   };
 }

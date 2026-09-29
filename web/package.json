@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@evm-midnight-transparent/core": "workspace:*",
+    "@evm-midnight-transparent/wallet": "workspace:*",
     "@fontsource/libre-caslon-text": "5.3.0",
     "@fontsource/source-sans-3": "5.3.0",
     "ethers": "6.17.0",

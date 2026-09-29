@@ -11,8 +11,8 @@
 // only, and is re-derived by signing the swap's message again (spec FR-003, Q4).
 //
 // Copied from MN Bank (acedward/passport-evm-dapp @ 911647b, web/src/store/schema.ts) without its
-// account level and its secret records. TODO(L-WEB): the `swap` record kind (no secrets), with its
-// strict shape in ./record-schemas.ts.
+// account level and its secret records. The `swap` kind (one record per swap, id = the swap id's 64
+// hex) holds no secret either: its strict shape is ../swap/record-shape.ts.
 
 import { z } from 'zod';
 
@@ -21,7 +21,7 @@ export const SCHEMA_KEY = 'evm-midnight-transparent/schema';
 export const SCHEMA_VERSION = 1;
 const V1 = 'evm-midnight-transparent/v1/';
 
-export const RECORD_KINDS = ['profile', 'settings'] as const;
+export const RECORD_KINDS = ['profile', 'settings', 'swap'] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
 export interface WalletScope {
