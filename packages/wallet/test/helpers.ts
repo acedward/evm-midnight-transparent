@@ -11,18 +11,12 @@ import {
   deserializeLedgerParameters,
   deserializeZswapChainState,
 } from '@midnight-ntwrk/midnight-js-utils';
-import * as ledger from '@midnightntwrk/ledger-v9';
-import { ShieldedWallet } from '@midnightntwrk/wallet-sdk-shielded';
 
-import { STAGENET, bytesToHex, hexToBytes, type NetworkProfile } from '@evm-midnight-transparent/core';
+import { hexToBytes } from '@evm-midnight-transparent/core';
 
-import {
-  NO_TX_HISTORY,
-  createTempWallet,
-  wrapShieldedWallet,
-  type TempWallet,
-  type VaultStateReader,
-} from '../src/index.js';
+import { type VaultStateReader } from '../src/index.js';
+
+export { walletWithCoins } from './restored-wallet.js';
 
 export const WUSDC = 'e5afe273bcb1252cfbc81ad6ca1caaafe22312c8c29f9b104a2fe3ead980bb2d';
 export const WSTKA = '5eb2a3cebb2ebe7ba910c78f62c9e28e0d74acbd00c810730def3578860e6a02';
@@ -35,43 +29,6 @@ export const fixture = <T>(name: string): T =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')) as T;
 export const fixtureText = (name: string): string =>
   readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8').trim();
-
-/** A temporary wallet for `seed` whose shielded state holds exactly `coins` (colour → values). */
-export async function walletWithCoins(
-  seed: string,
-  coins: { colour: string; value: bigint }[],
-  profile: NetworkProfile = STAGENET,
-): Promise<TempWallet> {
-  return createTempWallet(seed, {
-    profile,
-    openWallet: async (keys, endpoints) => {
-      const W = ShieldedWallet({
-        networkId: endpoints.networkId,
-        indexerClientConnection: {
-          indexerHttpUrl: 'http://127.0.0.1:9/unused',
-          indexerWsUrl: 'ws://127.0.0.1:9/unused',
-        },
-        txHistoryStorage: NO_TX_HISTORY,
-      } as never);
-      const sk = keys.shieldedSecretKeys;
-      const empty = W.startWithSecretKeys(sk);
-      const snapshot = JSON.parse(await empty.serializeState()) as Record<string, unknown>;
-      await empty.stop();
-      let state = new ledger.ZswapLocalState();
-      for (const c of coins) state = state.insertCoin(sk, ledger.createShieldedCoinInfo(c.colour, c.value));
-      const coinHashes: Record<string, { commitment: string; nullifier: string }> = {};
-      for (const c of state.coins) {
-        coinHashes[c.nonce] = {
-          commitment: ledger.coinCommitment(c, sk.coinPublicKey),
-          nullifier: ledger.coinNullifier(c, sk.coinSecretKey),
-        };
-      }
-      snapshot.state = bytesToHex(state.serialize());
-      snapshot.coinHashes = coinHashes;
-      return wrapShieldedWallet(W.restore(JSON.stringify(snapshot)) as never);
-    },
-  });
-}
 
 export interface VaultFixture {
   block: { height: number; hash: string; timestamp: number };
