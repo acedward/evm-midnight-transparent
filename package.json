@@ -28,6 +28,7 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "17.12.0",
     "happy-dom": "20.14.5",
+    "playwright-core": "1.62.0",
     "prettier": "3.9.9",
     "typescript": "5.9.3",
     "typescript-eslint": "8.70.1",

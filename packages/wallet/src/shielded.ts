@@ -31,9 +31,10 @@ const NoHistory = {
 
 export interface SyncProgressReport {
   synced: boolean;
-  /** The indexer position the wallet has applied, and the chain's highest (public numbers). */
+  /** The last zswap ledger event the wallet applied, and the indexer's latest (public numbers).
+   *  Synced = connected and the two are equal (the SDK's `isStrictlyComplete`). */
   appliedIndex: number;
-  highestIndex: number;
+  latestIndex: number;
 }
 
 export interface OpenedShieldedWallet {
@@ -75,7 +76,7 @@ export async function openShieldedWallet(
         cb({
           synced: s.progress.isStrictlyComplete(),
           appliedIndex: Number(s.progress.appliedIndex),
-          highestIndex: Number(s.progress.highestIndex),
+          latestIndex: Number(s.progress.highestRelevantWalletIndex),
         }),
       );
       return () => sub.unsubscribe();

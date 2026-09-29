@@ -14,6 +14,7 @@
     "@midnightntwrk/wallet-sdk-capabilities": "4.0.0-beta.2",
     "@midnightntwrk/wallet-sdk-hd": "3.1.0-beta.1",
     "@midnightntwrk/wallet-sdk-shielded": "4.0.0-beta.2",
+    "buffer": "6.0.3",
     "rxjs": "7.8.2"
   },
   "devDependencies": {
