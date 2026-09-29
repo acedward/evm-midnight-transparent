@@ -1,7 +1,8 @@
-// The sponsor starts under Bun and serves: its config, a nonce, a refused unsigned action, and a
-// /health answer (503 while no proof server or sponsor wallet is there). No wallet is opened, and
-// every probe /health makes points at a closed local port. Used by CI and by
-// scripts/docker-check.sh:
+// The sponsor starts under Bun and serves: its config, a nonce, a refused unsigned open-swap, a
+// refused bearer call, and a /health answer (503 while no proof server or sponsor wallet is there).
+// No wallet is opened, no bridge is loaded (no key directory, no Sepolia RPC), and every probe
+// /health makes points at a closed local port. The swaps are kept in a temporary directory. Used by
+// CI and by scripts/docker-check.sh:
 //
 //   bun scripts/sponsor-smoke.ts        (port: SPONSOR_SMOKE_PORT, or a random one in 10000–59999)
 
@@ -33,6 +34,8 @@ const child = Bun.spawn(['bun', join(root, 'sponsor/src/main.ts')], {
     MIDNIGHT_PROOF_SERVER_URL: closed,
     ZSWAP_KERNEL_URL: closed,
     ZSWAP_BATCHER_URL: closed,
+    SPONSOR_DATA_DIR: join(dir, 'data'),
+    VAULT_MANAGED_DIR: join(dir, 'no-keys'),
   },
   stdout: 'pipe',
   stderr: 'pipe',
@@ -54,15 +57,21 @@ try {
   if (body.network !== 'undeployed' || body.chainId !== 11155111) fail(`unexpected config ${JSON.stringify(body)}`);
   const nonce = await fetch(`${base}/v1/auth/nonce`);
   if (!nonce.ok) fail(`/v1/auth/nonce answered ${nonce.status}`);
-  const action = await fetch(`${base}/v1/actions/bridge-withdraw`, {
+  const open = await fetch(`${base}/v1/swaps`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ swap: '11'.repeat(32), payload: {} }),
   });
-  if (action.status < 400) fail(`an unsigned action was accepted (${action.status})`);
-  const health = await fetch(`${base}/health`);
-  if (health.status !== 503 && health.status !== 200) fail(`/health answered ${health.status}`);
-  console.log(`sponsor-smoke: PASS (port ${port}; unsigned action ${action.status}; health ${health.status})`);
+  if (open.status < 400) fail(`an unsigned open-swap was accepted (${open.status})`);
+  const bearer = await fetch(`${base}/v1/swaps/${'11'.repeat(32)}`, {
+    headers: { authorization: `Bearer ${'x'.repeat(43)}` },
+  });
+  if (bearer.status !== 401) fail(`a wrong bearer token answered ${bearer.status}`);
+  const health = await fetch(`${base}/v1/health`);
+  if (health.status !== 503 && health.status !== 200) fail(`/v1/health answered ${health.status}`);
+  console.log(
+    `sponsor-smoke: PASS (port ${port}; unsigned open ${open.status}; bearer ${bearer.status}; health ${health.status})`,
+  );
 } finally {
   child.kill();
   await child.exited;

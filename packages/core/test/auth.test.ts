@@ -64,7 +64,7 @@ describe('SponsorAction typed data', () => {
   it("names the sponsor and Sepolia, and matches ethers' own encoding", async () => {
     const wallet = Wallet.createRandom();
     const msg = buildSponsorActionMessage({
-      action: 'bridge-deposit',
+      action: 'open-swap',
       network: 'stagenet',
       owner: wallet.address,
       payload: { amount: '1' },
@@ -87,7 +87,7 @@ describe('verifySponsorAction', () => {
     const book = nonceBook();
     const payload = { erc20: `0x${'aa'.repeat(20)}`, amount: '1000000' };
     const message = buildSponsorActionMessage({
-      action: 'bridge-deposit',
+      action: 'open-swap',
       network: 'stagenet',
       owner: wallet.address,
       payload,
@@ -97,7 +97,7 @@ describe('verifySponsorAction', () => {
     });
     const signature = await sign(wallet, message);
     const options: VerifySponsorActionOptions = {
-      expectedAction: 'bridge-deposit',
+      expectedAction: 'open-swap',
       network: 'stagenet',
       payload,
       now: NOW,
@@ -122,7 +122,7 @@ describe('verifySponsorAction', () => {
   it('refuses a nonce the sponsor never issued (or forgot on restart)', async () => {
     const { wallet, payload, options } = await setup();
     const message = buildSponsorActionMessage({
-      action: 'bridge-deposit',
+      action: 'open-swap',
       network: 'stagenet',
       owner: wallet.address,
       payload,
@@ -173,8 +173,9 @@ describe('verifySponsorAction', () => {
 
   it('refuses another action, network or swap', async () => {
     const { message, signature, options } = await setup();
+    const foreign = await setup({ action: 'other-action' });
     expect(
-      verifySponsorAction({ message, signature }, { ...options, expectedAction: 'bridge-withdraw' }),
+      verifySponsorAction({ message: foreign.message, signature: foreign.signature }, foreign.options),
     ).toMatchObject({
       code: 'wrong-action',
     });

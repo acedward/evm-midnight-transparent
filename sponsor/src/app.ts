@@ -1,56 +1,68 @@
-// The sponsor's HTTP API (Hono). Routes:
+// The sponsor's HTTP API (Hono): the swap routes of core swap-api.ts.
 //
-//   GET  /health                  health (200 ok/degraded, 503 down; rate-limited in its own bucket)
-//   GET  /v1/config               public configuration
-//   GET  /v1/auth/nonce           a single-use nonce for a SponsorAction authorisation
-//   POST /v1/actions/:action      THE ONLY state-changing route: every action is authorised
-//   GET  /v1/jobs/:requestId      resume a job by its request id
-//   GET  /v1/queue                queue depth per lane
+//   GET  /health, /v1/health                  health (200 ok/degraded, 503 down; its own rate bucket)
+//   GET  /v1/config                           public configuration
+//   GET  /v1/auth/nonce                       a single-use nonce for the open-swap signature
+//   POST /v1/swaps                            open or re-open a swap (EIP-712 SponsorAction "open-swap")
+//   GET  /v1/swaps/:id                        the swap                                   (bearer)
+//   GET  /v1/swaps/:id/withdraw-params        what startWithdraw needs                   (bearer)
+//   POST /v1/swaps/:id/prove                  prove a take or a startWithdraw            (bearer)
+//   POST /v1/swaps/:id/withdraw               submit the proven, bound startWithdraw     (bearer)
+//   POST /v1/swaps/:id/take                   the take's outcome                         (bearer)
 //
-// Request bodies are never logged. Errors are JSON: {"error": {"code", "message", "detail"?}}.
+// Request bodies and the Authorization header are never logged. Errors are JSON:
+// {"error": {"code", "message", "detail"?}}.
 //
-// Copied from MN Bank's relay (acedward/passport-evm-dapp @ 911647b, relay/src/app.ts) without its
-// account, bridge-quote and Passport-call routes. TODO(L-SPONSOR): the swap routes and the
-// proof-server proxy.
+// The skeleton (error shape, CORS, client address, rate limits, body limit) is MN Bank's relay's
+// (acedward/passport-evm-dapp @ 911647b, relay/src/app.ts); L-SPONSOR replaced its action/job routes.
 
 import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 import {
-  API_PATHS,
-  ActionRequestSchema,
-  SPONSOR_ACTIONS,
+  OPEN_SWAP_ACTION,
+  OpenSwapRequestSchema,
+  ProveRequestSchema,
+  SWAP_PATHS,
+  SwapIdSchema,
+  TakeReportSchema,
+  WITHDRAW_KINDS,
+  WithdrawRequestSchema,
+  sponsorDomain,
+  startSwapDomain,
   type HealthResponse,
   type NonceResponse,
-  type PublicConfig,
-  type SponsorActionName,
+  type OpenSwapResponse,
+  type SwapConfig,
+  type WithdrawKind,
 } from '@evm-midnight-transparent/core';
 
-import type { AdmissionOutcome } from './actions/admission.js';
-import type { ActionDefinition } from './actions/catalogue.js';
 import type { NonceStore } from './auth/nonces.js';
+import { bearerOf } from './auth/swap-token.js';
 import { verifySponsorActionRequest } from './auth/verifiers.js';
 import type { SponsorConfig } from './config.js';
 import type { Logger } from './log.js';
-import type { JobQueue } from './queue/jobs.js';
 import { RateLimiter } from './ratelimit.js';
 import type { SponsorSession } from './sponsor/session.js';
+import { SwapError } from './swaps/errors.js';
+import { swapView } from './swaps/model.js';
+import type { SwapService } from './swaps/service.js';
 
 export interface AppDeps {
   config: SponsorConfig;
   version: string;
   log: Logger;
   nonces: NonceStore;
-  queue: JobQueue;
-  catalogue: ReadonlyMap<SponsorActionName, ActionDefinition>;
+  swaps: SwapService;
   sponsor: SponsorSession;
   health: () => Promise<HealthResponse>;
   /** The caller's address for rate limiting (default: the socket's, or X-Forwarded-For's last hop). */
   clientAddress?: (c: Context) => string;
+  /** Unix seconds (the signature expiry check). */
   now?: () => number;
 }
 
-type ErrorStatus = 400 | 401 | 403 | 404 | 413 | 429 | 500 | 501 | 503;
+type ErrorStatus = 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 500 | 501 | 503;
 
 const apiError = (c: Context, status: ErrorStatus, code: string, message: string, detail?: string) =>
   c.json({ error: { code, message, ...(detail ? { detail } : {}) } }, status);
@@ -76,14 +88,17 @@ function defaultClientAddress(trustProxy: boolean): (c: Context) => string {
 }
 
 export function createApp(deps: AppDeps): Hono {
-  const { config, log } = deps;
+  const { config, log, swaps } = deps;
   const clientAddress = deps.clientAddress ?? defaultClientAddress(config.trustProxy);
   const limits = config.limits;
   const readLimiter = new RateLimiter(limits.readsPerMinute);
   const healthLimiter = new RateLimiter(limits.healthPerMinute);
   const nonceLimiter = new RateLimiter(limits.noncesPerMinute);
-  const actionLimiter = new RateLimiter(limits.actionsPerMinute);
-  const ownerLimiter = new RateLimiter(limits.actionsPerOwnerPerMinute);
+  const openLimiter = new RateLimiter(limits.opensPerMinute);
+  const ownerLimiter = new RateLimiter(limits.opensPerOwnerPerMinute);
+  const proveLimiter = new RateLimiter(limits.provesPerMinute);
+  const proveSwapLimiter = new RateLimiter(limits.provesPerSwapPerMinute);
+  const writeLimiter = new RateLimiter(limits.writesPerMinute);
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
 
   const app = new Hono();
@@ -105,7 +120,7 @@ export function createApp(deps: AppDeps): Hono {
       cors({
         origin: config.corsOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
-        allowHeaders: ['content-type'],
+        allowHeaders: ['content-type', 'authorization'],
         maxAge: 600,
       }),
     );
@@ -118,31 +133,70 @@ export function createApp(deps: AppDeps): Hono {
     return apiError(c, 429, 'rate-limited', 'too many requests; try again shortly');
   };
 
+  const bodyLimited = bodyLimit({
+    maxSize: limits.maxBodyBytes,
+    onError: (c) => apiError(c, 413, 'payload-too-large', 'the request body is too large'),
+  });
+
+  const readJson = async (c: Context): Promise<unknown> => {
+    try {
+      return await c.req.json();
+    } catch {
+      throw new SwapError(400, 'bad-request', 'the body must be JSON');
+    }
+  };
+
+  /** The swap a bearer route acts on. */
+  const authorised = (c: Context) => {
+    const id = SwapIdSchema.safeParse(c.req.param('id'));
+    if (!id.success) throw new SwapError(400, 'bad-request', 'not a swap id');
+    return swaps.authorize(id.data, bearerOf(c.req.header('authorization')));
+  };
+
   // ── reads ──────────────────────────────────────────────────────────────────
 
-  app.get(API_PATHS.health, async (c) => {
-    // Its own bucket, so a monitor is never starved by a user's reads.
+  const health = async (c: Context) => {
     const refused = limited(healthLimiter, clientAddress(c), c);
     if (refused) return refused;
     const h = await deps.health();
     return c.json(h, h.status === 'down' ? 503 : 200);
-  });
+  };
+  app.get('/health', health);
+  app.get(SWAP_PATHS.health, health);
 
-  app.get(API_PATHS.config, (c) => {
-    const body: PublicConfig = {
-      network: config.network.name,
-      chainId: config.network.evm.chainId,
+  app.get(SWAP_PATHS.config, (c) => {
+    const n = config.network;
+    const body: SwapConfig = {
+      network: n.name,
+      chainId: n.evm.chainId,
       sponsorVersion: deps.version,
+      appName: config.appName,
+      eip712: { sponsorDomain: sponsorDomain(n.evm.chainId), swapKeyDomain: startSwapDomain(n.evm.chainId) },
       bridge: {
-        vaultAddress: config.network.bridge.vaultAddress,
-        vaultEvmAddress: config.network.bridge.vaultEvmAddress,
+        vaultAddress: n.bridge.vaultAddress,
+        vaultEvmAddress: n.bridge.vaultEvmAddress,
+        signetSingleton: n.bridge.signetSingleton,
       },
-      limits: { authMaxTtlSeconds: limits.authMaxTtlSeconds, jobTtlSeconds: limits.jobTtlSeconds },
+      tokens: config.tokens.tokens.map((t) => ({
+        symbol: t.symbol,
+        name: t.name,
+        midnightName: t.midnightName,
+        decimals: t.decimals,
+        sepoliaAddress: t.sepoliaAddress,
+        midnightColour: t.midnightColour,
+      })),
+      kernelUrl: n.zswap.kernelUrl,
+      batcher: { url: n.zswap.batcherUrl, target: n.zswap.batcherTarget },
+      limits: {
+        authMaxTtlSeconds: limits.authMaxTtlSeconds,
+        minOfferTtlSeconds: config.swaps.minOfferTtlSeconds,
+        proofsPerSwap: config.swaps.proofsPerSwap,
+      },
     };
     return c.json(body);
   });
 
-  app.get(API_PATHS.nonce, (c) => {
+  app.get(SWAP_PATHS.nonce, (c) => {
     const refused = limited(nonceLimiter, clientAddress(c), c);
     if (refused) return refused;
     const { nonce, expiresAt } = deps.nonces.issue();
@@ -151,127 +205,118 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(body);
   });
 
-  app.get('/v1/jobs/:requestId', (c) => {
-    const refused = limited(readLimiter, clientAddress(c), c);
+  // ── open ───────────────────────────────────────────────────────────────────
+
+  app.post(SWAP_PATHS.swaps, bodyLimited, async (c) => {
+    const refused = limited(openLimiter, clientAddress(c), c);
     if (refused) return refused;
-    const id = c.req.param('requestId');
-    if (!/^[0-9a-f]{32}$/.test(id)) return apiError(c, 400, 'bad-request', 'not a request id');
-    const job = deps.queue.get(id);
-    return job
-      ? c.json({ job })
-      : apiError(c, 404, 'not-found', 'no such job (it may have expired, or the sponsor restarted)');
+    const parsed = OpenSwapRequestSchema.safeParse(await readJson(c));
+    if (!parsed.success) return apiError(c, 400, 'bad-request', 'the request does not have the expected shape');
+    const { swap: swapId, payload, auth } = parsed.data;
+    const known = swaps.isKnown(swapId);
+    // A NEW swap will cost the sponsor DUST: refuse before any nonce is spent if it cannot pay.
+    if (!known) {
+      const s = deps.sponsor.status();
+      if (!s.synced) {
+        return apiError(
+          c,
+          503,
+          'sponsor-unavailable',
+          'the sponsor cannot pay network fees right now; try again later',
+        );
+      }
+      if (s.dustSpecks !== null && s.dustSpecks < config.sponsor.dustLowSpecks) {
+        return apiError(c, 503, 'sponsor-low', 'the sponsor is low on network fee funds; try again later');
+      }
+    }
+    const outcome = verifySponsorActionRequest(auth, {
+      action: OPEN_SWAP_ACTION,
+      network: config.network.name,
+      chainId: config.network.evm.chainId,
+      swap: swapId,
+      payload,
+      maxTtlSeconds: limits.authMaxTtlSeconds,
+      nonces: deps.nonces,
+      now: now(),
+    });
+    if (!outcome.ok) {
+      log.info('open refused', { code: outcome.code });
+      return apiError(c, 401, 'unauthorised', outcome.reason, outcome.code);
+    }
+    const ownerRefused = limited(ownerLimiter, outcome.signer.toLowerCase(), c);
+    if (ownerRefused) return ownerRefused;
+    const { token, rec, resumed } = await swaps.open({ swapId, payload, signer: outcome.signer });
+    const body: OpenSwapResponse = {
+      swapToken: token,
+      depositAddress: rec.depositAddress,
+      sweepGas: { ...rec.sweepGas },
+      erc20Address: rec.pay.erc20Address,
+      amount: rec.pay.amount,
+      resumed,
+      swap: swapView(rec),
+    };
+    c.header('Cache-Control', 'no-store');
+    return c.json(body, resumed ? 200 : 201);
   });
 
-  app.get(API_PATHS.queue, (c) => {
+  // ── the swap (bearer) ──────────────────────────────────────────────────────
+
+  app.get('/v1/swaps/:id', (c) => {
     const refused = limited(readLimiter, clientAddress(c), c);
     if (refused) return refused;
-    return c.json(deps.queue.stats());
+    c.header('Cache-Control', 'no-store');
+    return c.json({ swap: swapView(authorised(c)) });
   });
 
-  // ── the one state-changing route ─────────────────────────────────────────
+  app.get('/v1/swaps/:id/withdraw-params', async (c) => {
+    const refused = limited(readLimiter, clientAddress(c), c);
+    if (refused) return refused;
+    const rec = authorised(c);
+    const kind = c.req.query('kind') ?? 'swap';
+    if (!(WITHDRAW_KINDS as readonly string[]).includes(kind)) {
+      return apiError(c, 400, 'bad-request', `kind must be one of ${WITHDRAW_KINDS.join(', ')}`);
+    }
+    c.header('Cache-Control', 'no-store');
+    return c.json(await swaps.withdrawParams(rec, kind as WithdrawKind));
+  });
 
-  app.post(
-    '/v1/actions/:action',
-    bodyLimit({
-      maxSize: limits.maxBodyBytes,
-      onError: (c) => apiError(c, 413, 'payload-too-large', 'the request body is too large'),
-    }),
-    async (c) => {
-      const refused = limited(actionLimiter, clientAddress(c), c);
-      if (refused) return refused;
-      const name = c.req.param('action') as SponsorActionName;
-      const def = (SPONSOR_ACTIONS as readonly string[]).includes(name) ? deps.catalogue.get(name) : undefined;
-      if (!def) return apiError(c, 404, 'not-found', 'no such action');
+  app.post('/v1/swaps/:id/prove', bodyLimited, async (c) => {
+    const refused = limited(proveLimiter, clientAddress(c), c);
+    if (refused) return refused;
+    const rec = authorised(c);
+    const perSwap = limited(proveSwapLimiter, rec.swapId, c);
+    if (perSwap) return perSwap;
+    const parsed = ProveRequestSchema.safeParse(await readJson(c));
+    if (!parsed.success) return apiError(c, 400, 'bad-request', 'the request does not have the expected shape');
+    const proven = await swaps.prove(rec, parsed.data);
+    return c.json({ tx: Buffer.from(proven).toString('hex') });
+  });
 
-      let body: unknown;
-      try {
-        body = await c.req.json();
-      } catch {
-        return apiError(c, 400, 'bad-request', 'the body must be JSON');
-      }
-      const parsed = ActionRequestSchema.safeParse(body);
-      if (!parsed.success) return apiError(c, 400, 'bad-request', 'the request does not have the expected shape');
-      const request = parsed.data;
-      const swap = request.swap?.replace(/^0x/, '').toLowerCase();
-      if (def.requiresSwap && !swap) return apiError(c, 400, 'bad-request', 'this action needs a swap');
-      if (!def.requiresSwap && swap) return apiError(c, 400, 'bad-request', 'this action takes no swap');
-      const payload = def.payload.safeParse(request.payload);
-      if (!payload.success) return apiError(c, 400, 'bad-request', 'the action arguments are not valid');
+  app.post('/v1/swaps/:id/withdraw', bodyLimited, async (c) => {
+    const refused = limited(writeLimiter, clientAddress(c), c);
+    if (refused) return refused;
+    const rec = authorised(c);
+    const parsed = WithdrawRequestSchema.safeParse(await readJson(c));
+    if (!parsed.success) return apiError(c, 400, 'bad-request', 'the request does not have the expected shape');
+    const updated = swaps.withdraw(rec, parsed.data.tx);
+    return c.json({ swap: swapView(updated) }, 202);
+  });
 
-      // Before consuming any nonce: can the sponsor pay for this at all?
-      if (def.requiresSponsor) {
-        const s = deps.sponsor.status();
-        if (!s.synced)
-          return apiError(
-            c,
-            503,
-            'sponsor-unavailable',
-            'the sponsor cannot pay network fees right now; try again later',
-          );
-        if (s.dustSpecks !== null && s.dustSpecks < config.sponsor.dustLowSpecks) {
-          return apiError(c, 503, 'sponsor-low', 'the sponsor is low on network fee funds; try again later');
-        }
-      }
-
-      const outcome = verifySponsorActionRequest(request.auth, {
-        action: def.action,
-        network: config.network.name,
-        chainId: config.network.evm.chainId,
-        swap,
-        payload: request.payload,
-        maxTtlSeconds: limits.authMaxTtlSeconds,
-        nonces: deps.nonces,
-        now: now(),
-      });
-      if (!outcome.ok) {
-        log.info('action refused', { action: def.action, code: outcome.code });
-        return apiError(c, 401, 'unauthorised', outcome.reason, outcome.code);
-      }
-
-      const ownerRefused = limited(ownerLimiter, outcome.signer.toLowerCase(), c);
-      if (ownerRefused) return ownerRefused;
-
-      // The action's own admission check, before any queue slot.
-      let admitted: AdmissionOutcome = { ok: true };
-      if (def.admit) {
-        try {
-          admitted = await def.admit({ swap, payload: payload.data, signer: outcome.signer });
-        } catch (e) {
-          log.warn('admission check failed', { action: def.action, error: e });
-          return apiError(c, 503, 'chain-unavailable', 'the swap could not be checked right now; try again shortly');
-        }
-        if (!admitted.ok) {
-          log.info('action refused', { action: def.action, code: admitted.detail ?? admitted.code });
-          return apiError(c, admitted.status, admitted.code, admitted.reason, admitted.detail);
-        }
-      }
-
-      let job: ReturnType<JobQueue['submit']> = null;
-      try {
-        job = deps.queue.submit({
-          action: def.action,
-          lane: def.lane,
-          swap,
-          payload: {
-            ...request.payload,
-            ...(request.auth ? { auth: request.auth } : {}),
-            ...(swap ? { swap } : {}),
-            signer: outcome.signer,
-          },
-          executor: def.executor,
-        });
-      } finally {
-        // Refused after admission (a full queue, or an error): give back what the admission claimed.
-        if (!job && admitted.ok) admitted.release?.();
-      }
-      if (!job) return apiError(c, 503, 'busy', 'the sponsor is at capacity; try again later');
-      log.info('action queued', { action: def.action, requestId: job.requestId });
-      return c.json({ job }, 202);
-    },
-  );
+  app.post('/v1/swaps/:id/take', bodyLimited, async (c) => {
+    const refused = limited(writeLimiter, clientAddress(c), c);
+    if (refused) return refused;
+    const rec = authorised(c);
+    const parsed = TakeReportSchema.safeParse(await readJson(c));
+    if (!parsed.success) return apiError(c, 400, 'bad-request', 'the request does not have the expected shape');
+    return c.json({ swap: swapView(swaps.reportTake(rec, parsed.data)) });
+  });
 
   app.notFound((c) => apiError(c, 404, 'not-found', 'no such route'));
   app.onError((err, c) => {
+    if (err instanceof SwapError) {
+      if (err.status >= 500) log.warn('swap route refused', { path: c.req.path, code: err.code });
+      return apiError(c, err.status, err.code, err.message, err.detail);
+    }
     log.error('unhandled error', { path: c.req.path, error: err });
     return apiError(c, 500, 'internal-error', 'the sponsor hit an internal error');
   });
@@ -279,10 +324,10 @@ export function createApp(deps: AppDeps): Hono {
   return app;
 }
 
-/** The routes that change state, for the auth test to enumerate (every one must refuse
- *  unsigned or wrongly signed calls). */
-export const STATE_CHANGING_ROUTES = SPONSOR_ACTIONS.map((a) => ({
-  method: 'POST',
-  path: API_PATHS.action(a),
-  action: a,
-}));
+/** The routes that change state, with how each is authorised (the auth tests enumerate them). */
+export const STATE_CHANGING_ROUTES = [
+  { method: 'POST', path: SWAP_PATHS.swaps, auth: 'eip712' },
+  { method: 'POST', path: '/v1/swaps/:id/prove', auth: 'bearer' },
+  { method: 'POST', path: '/v1/swaps/:id/withdraw', auth: 'bearer' },
+  { method: 'POST', path: '/v1/swaps/:id/take', auth: 'bearer' },
+] as const;
