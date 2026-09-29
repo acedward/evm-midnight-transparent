@@ -14,8 +14,9 @@
 #                                         sponsor + web; wait until the sponsor wallet has synced
 #   run-live.sh stop | start              stop the sponsor and release the lock | take it and start
 #   run-live.sh health <name>             the sponsor's /v1/health -> evidence <name>.json
-#   run-live.sh phase <e2|e3> <offerId>   the Playwright phase, in the web container's network
-#                                         namespace (the site is http://127.0.0.1:8080)
+#   run-live.sh phase <e2|e3> <offerId> [import]   the Playwright phase, in the web container's
+#                                         network namespace (the site is http://127.0.0.1:8080); e2 with
+#                                         an export file (in the state directory) continues that swap
 #   run-live.sh temp-check <swapId> <name>   the swap's temporary wallet, re-derived in-process
 #   run-live.sh competitor-fund <offerId> E.3: the G-TAKE gate's `fund` for a competitor wallet
 #                                         (derived from the test EVM key with its own salt; the
@@ -280,6 +281,7 @@ PY
   phase)
     name="${1:?phase: e2|e3}"
     offer="${2:?offerId}"
+    import="${3:-}" # e2 only: a swap record export file in the state directory (continue that swap)
     [[ -s "$STATE/lock-holder.pid" ]] || { say "the funding lock is not held: run 'up' first"; exit 2; }
     for i in $(seq 1 16); do
       if ! ps -axo command | grep -E 'run-stagenet|deposit-fund|stagenet\.ts|gates/bridge/gate\.ts fund|run-live\.sh phase' | grep -v grep | grep -v "phase $name" >/dev/null; then break; fi
@@ -298,6 +300,7 @@ PY
       -e PATH=/opt/bun:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e CI=1 -e HOME=/root \
       -e LIVE_BASE_URL=http://127.0.0.1:8080 -e LIVE_PHASE="$name" -e LIVE_OFFER_ID="$offer" \
       -e LIVE_STATE_DIR=/live -e LIVE_OUT_DIR=/evidence -e LIVE_KEY_FILE=/secrets/sepolia -e LIVE_SEPOLIA_RPC="$RPC" \
+      ${import:+-e LIVE_IMPORT_FILE="/live/$import"} \
       -w /app "$PW_IMAGE" npx playwright test -c test/live/live.config.ts --reporter=list >"$log" 2>&1
     status=$?
     set -e

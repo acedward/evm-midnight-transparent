@@ -105,7 +105,11 @@ function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): st
     case 'opening':
       return 'Opening the swap with the sponsor…';
     case 'fund':
-      return s.sending ? 'Confirm the transfers in your wallet.' : 'Send the funds to start the bridge.';
+      return s.sending === 'confirming'
+        ? 'Waiting for the sweep gas transfer to be confirmed on Sepolia before the token transfer.'
+        : s.sending
+          ? 'Confirm the transfers in your wallet.'
+          : 'Send the funds to start the bridge.';
     case 'working':
       return `${s.what}…`;
     case 'unavailable':
@@ -323,11 +327,13 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           <Button data-testid="send-funds" disabled={fundStatus !== null} onClick={() => void session?.sendFunds()}>
             {fundStatus === 'eth'
               ? 'Confirm the sweep gas in your wallet…'
-              : fundStatus === 'token'
-                ? `Confirm the ${record.offer.pay.symbol} transfer in your wallet…`
-                : fundStatus === 'checking'
-                  ? 'Checking…'
-                  : 'Send funds'}
+              : fundStatus === 'confirming'
+                ? 'Waiting for the sweep gas to be confirmed…'
+                : fundStatus === 'token'
+                  ? `Confirm the ${record.offer.pay.symbol} transfer in your wallet…`
+                  : fundStatus === 'checking'
+                    ? 'Checking…'
+                    : 'Send funds'}
           </Button>
         </ButtonRow>
       )}

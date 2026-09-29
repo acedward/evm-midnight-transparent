@@ -25,12 +25,15 @@ import { Contract, Interface, JsonRpcProvider } from 'ethers';
 
 import { connect, typedDataCalls } from '../e2e/fixtures.js';
 import { type TestWallet, installTestWallet } from '../e2e/test-wallet.js';
+import { readSepoliaKey } from './sepolia-key.js';
 
 const PHASE = process.env.LIVE_PHASE ?? '';
 const OFFER = (process.env.LIVE_OFFER_ID ?? '').toLowerCase();
 const OUT = process.env.LIVE_OUT_DIR ?? '';
 const STATE_DIR = process.env.LIVE_STATE_DIR ?? '';
 const KEY_FILE = process.env.LIVE_KEY_FILE ?? '/secrets/sepolia';
+/** e2: continue a swap already opened (its public record, an export file) instead of starting one. */
+const IMPORT_FILE = process.env.LIVE_IMPORT_FILE ?? '';
 const RPC = process.env.LIVE_SEPOLIA_RPC ?? 'https://ethereum-sepolia-rpc.publicnode.com';
 const INDEXER = 'https://indexer.stagenet.shielded.tools/api/v4/graphql';
 const KERNEL = 'https://stagenet.api-zswap.zkdojo.com';
@@ -43,12 +46,8 @@ test.setTimeout(150 * MIN);
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────
 
-/** The test user's key, from its SK= file: in-process only, never printed. */
-function userKey(): string {
-  const m = /^\s*SK\s*=\s*(?:0x)?([0-9a-fA-F]{64})\s*$/m.exec(readFileSync(KEY_FILE, 'utf8'));
-  if (!m) throw new Error('the Sepolia key file does not hold an SK= line');
-  return `0x${m[1]!}`;
-}
+/** The test user's key (in-process only, never printed). */
+const userKey = () => readSepoliaKey(KEY_FILE);
 
 const sepolia = () => new JsonRpcProvider(RPC, 11155111, { staticNetwork: true });
 const ERC20 = [
@@ -243,11 +242,41 @@ async function startSwap(page: Page, w: TestWallet, times: Record<string, number
   return { listed, deposit, temp, record: rec! };
 }
 
-/** "Send funds": the sweep ETH, then exactly the pay amount, both broadcast on Sepolia by the page. */
-async function sendFunds(page: Page, w: TestWallet, times: Record<string, number>, t0: number) {
+/** Import a swap's record (Local data → Import, FR-007) and resume it from Your swaps: the "start
+ *  swap" message signed once (the coin key must match), then the sponsor's re-open. */
+async function importAndResume(page: Page, w: TestWallet, times: Record<string, number>, t0: number) {
+  const text = readFileSync(IMPORT_FILE, 'utf8');
+  const file = JSON.parse(text) as { records: Array<{ value: { data: Record<string, unknown> } }> };
+  const swapId = String(file.records[0]!.value.data.swapId);
+  await page.goto('/#swap');
+  await connect(page);
+  await page.goto('/#local');
+  await page.getByTestId('import-file').setInputFiles({
+    name: 'swap-record.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(text),
+  });
+  await expect(page.getByTestId('local-message')).toContainText('Imported 1 records');
+  await shot(page, '00-imported');
+  await page.goto('/#swap');
+  const row = page.locator(`[data-testid=swap-record][data-swap-id="${swapId}"]`);
+  await expect(row).toBeVisible({ timeout: 2 * MIN });
+  await expect(row).toHaveAttribute('data-phase', 'funding');
+  times.resumeAtFundingClicked = since(t0);
+  await row.getByTestId('record-resume').click();
+  await expect(page.getByTestId('send-funds')).toBeVisible({ timeout: 5 * MIN });
+  times.fundReady = since(t0);
+  expect(typedDataCalls(w).map((t) => t.primaryType)).toEqual(['StartSwap', 'SponsorAction']);
+  await shot(page, '03-fund');
+  return { swapId, record: (await swapRecord(page, swapId))! };
+}
+
+/** "Send funds": the sweep ETH (unless the deposit address has it), then exactly the pay amount, both
+ *  broadcast on Sepolia by the page; the token transfer after the sweep is mined. */
+async function sendFunds(page: Page, w: TestWallet, times: Record<string, number>, t0: number, expected = 2) {
   await expect(page.getByTestId('send-funds')).toBeEnabled();
   await page.getByTestId('send-funds').click();
-  await expect.poll(() => w.sent.length, { timeout: 5 * MIN }).toBe(2);
+  await expect.poll(() => w.sent.length, { timeout: 8 * MIN }).toBe(expected);
   times.fundsSent = since(t0);
   await expect(page.getByTestId('funding-token')).toContainText('confirmed', { timeout: 10 * MIN });
   await expect(page.getByTestId('funding-eth')).toContainText('confirmed', { timeout: 2 * MIN });
@@ -283,18 +312,31 @@ test('E.2 + E.4: the full swap through the UI, with a resume after closing the p
   const key = userKey();
   const page1 = await context.newPage();
   const w1 = await installTestWallet(page1, { privateKey: key, live: { rpcUrl: RPC } });
-  const started = await startSwap(page1, w1, times, t0);
-  const swapId = String(started.record.swapId);
-  await evidence('e2-01-opened', {
-    swapId,
-    listed: started.listed,
-    depositAddress: started.deposit,
-    tempAddress: started.temp,
-    record: started.record,
-    times,
-  });
+  let swapId: string;
+  if (IMPORT_FILE) {
+    // Continue a swap opened earlier (its sweep ETH already at the deposit address): import + resume.
+    const resumed = await importAndResume(page1, w1, times, t0);
+    swapId = resumed.swapId;
+    await evidence('e2-01b-imported-and-resumed', {
+      swapId,
+      record: resumed.record,
+      signatures: typedDataCalls(w1).map((t) => t.primaryType),
+      times,
+    });
+  } else {
+    const started = await startSwap(page1, w1, times, t0);
+    swapId = String(started.record.swapId);
+    await evidence('e2-01-opened', {
+      swapId,
+      listed: started.listed,
+      depositAddress: started.deposit,
+      tempAddress: started.temp,
+      record: started.record,
+      times,
+    });
+  }
 
-  const funding = await sendFunds(page1, w1, times, t0);
+  const funding = await sendFunds(page1, w1, times, t0, IMPORT_FILE ? 1 : 2);
   await evidence('e2-02-funded', {
     swapId,
     funding,

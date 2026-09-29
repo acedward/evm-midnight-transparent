@@ -44,13 +44,19 @@ import {
 /** The most sweep ETH the page will send (the sponsor sizes it; G-BRIDGE: 0.0001625 ETH). */
 export const MAX_SWEEP_WEI = 3n * 10n ** 15n;
 
+/** How long "Send funds" waits for the sweep transfer to be mined before it asks for the token
+ *  transfer (then the user presses Send funds again: the sweep is not sent twice). */
+export const SWEEP_RECEIPT_WAIT_MS = 5 * 60_000;
+const RECEIPT_POLL_MS = 3_000;
+
 export type SessionStatus =
   | { kind: 'signing'; prompt: 'start-1' | 'start-2' | 'sponsor' | 'resume' }
   /** The two "start swap" signatures differed: waiting for the user to accept or cancel. */
   | { kind: 'confirm-nondeterministic' }
   | { kind: 'opening' }
-  /** Waiting for the user's "Send funds"; `sending` while a wallet prompt is open. */
-  | { kind: 'fund'; sending: 'checking' | 'eth' | 'token' | null }
+  /** Waiting for the user's "Send funds"; `sending` while a wallet prompt is open, or while the sweep
+   *  transfer is being mined before the token transfer (`confirming`). */
+  | { kind: 'fund'; sending: 'checking' | 'eth' | 'confirming' | 'token' | null }
   | { kind: 'working'; what: string }
   /** The offer was gone at take time: waiting for Bridge back. */
   | { kind: 'unavailable' }
@@ -365,7 +371,10 @@ export class SwapSession {
   // ── funding ─────────────────────────────────────────────────────────────
 
   /** "Send funds": the sweep ETH first (so the gas is there when the sponsor starts the deposit),
-   *  then the exact token amount; each only if the deposit address still lacks it. */
+   *  then the exact token amount; each only if the deposit address still lacks it. The token
+   *  transfer waits until the sweep transfer is mined: an EIP-7702-delegated account (a MetaMask
+   *  smart account) may have ONE pending transaction, and the node refuses a second one ("in-flight
+   *  transaction limit reached for delegated accounts"; plan P3 E.2 attempt 1). */
   async sendFunds(): Promise<void> {
     if (this.snap.status.kind !== 'fund' || this.snap.status.sending !== null) return;
     const { evm } = this.deps;
@@ -393,6 +402,7 @@ export class SwapSession {
         );
       if (needEth > myEth)
         throw new SessionError('Your wallet holds less Sepolia ETH than the sweep gas. Nothing was sent.');
+      let sweepPending: string | null = pendingEth ? r.funding.eth!.hash : null;
       if (needEth > 0n) {
         this.status({ kind: 'fund', sending: 'eth' });
         const hash = await evm.sendTransaction({ to: dep.address, value: needEth }, 'the sweep gas transfer');
@@ -401,6 +411,25 @@ export class SwapSession {
           funding: { ...this.record.funding, eth: { hash, status: 'sent' } },
           updatedAt: this.deps.now(),
         });
+        sweepPending = hash;
+      }
+      if (needToken > 0n && sweepPending) {
+        this.status({ kind: 'fund', sending: 'confirming' });
+        const outcome = await this.minedOutcome(sweepPending);
+        if (outcome === null)
+          throw new SessionError(
+            'Your sweep gas transfer is not confirmed on Sepolia yet. Press Send funds again once it is: it will not be sent twice.',
+          );
+        this.saveRecord({
+          ...this.record,
+          funding: {
+            ...this.record.funding,
+            eth: { hash: sweepPending, status: outcome === 'success' ? 'confirmed' : 'failed' },
+          },
+          updatedAt: this.deps.now(),
+        });
+        if (outcome !== 'success')
+          throw new SessionError('Your sweep gas transfer failed on Sepolia. Send the funds again.');
       }
       if (needToken > 0n) {
         this.status({ kind: 'fund', sending: 'token' });
@@ -418,6 +447,17 @@ export class SwapSession {
       void this.loop();
     } catch (e) {
       this.set({ status: { kind: 'fund', sending: null }, notice: describe(e) });
+    }
+  }
+
+  /** The receipt's outcome once the transaction is mined, or null after SWEEP_RECEIPT_WAIT_MS. */
+  private async minedOutcome(hash: string): Promise<'success' | 'reverted' | null> {
+    const deadline = this.deps.now() + SWEEP_RECEIPT_WAIT_MS;
+    for (;;) {
+      const outcome = await this.deps.evm.receipt(hash).catch(() => null);
+      if (outcome !== null || this.closed) return outcome;
+      if (this.deps.now() >= deadline) return null;
+      await this.deps.sleep(RECEIPT_POLL_MS);
     }
   }
 
