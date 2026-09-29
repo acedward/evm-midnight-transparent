@@ -1,0 +1,5 @@
+# One flat node_modules at the root, and exact versions: the stagenet SDK set is pinned (ledger-v9
+# 1.0.0-rc.3, wallet-sdk-facade 5.0.0-beta.2; newer pre-releases fail stagenet's fees).
+[install]
+linker = "hoisted"
+exact = true

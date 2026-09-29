@@ -1,0 +1,293 @@
+// The Local data tab (spec FR-007): every record this app keeps in this browser, and Export, Import
+// and CLEAR ALL. No record holds a secret (each swap's Midnight key lives in the tab's memory only).
+// A ruled record table that stacks on a phone, and the CLEAR ALL dialog with "Export first" and a
+// typed confirmation. Copied from MN Bank (acedward/passport-evm-dapp @ 911647b,
+// web/src/pages/LocalData.tsx) without its secret records and asset filter.
+
+import { useMemo, useRef, useState, type ChangeEvent } from 'react';
+
+import { APP_NAME } from '../brand.js';
+import {
+  Button,
+  ButtonRow,
+  Cell,
+  EmptyState,
+  Notice,
+  PageHead,
+  Panel,
+  StatementTable,
+  Sub,
+  TypedConfirmDialog,
+} from '../design/index.js';
+import { storageText } from '../store/messages.js';
+import { useStore } from '../store/StoreContext.js';
+import { MAX_IMPORT_READ_BYTES, SCHEMA_VERSION, STORE_PREFIX, type ExportFile } from '../store/schema.js';
+import { ImportError, type RecordView } from '../store/store.js';
+import { useWallet } from '../wallet/WalletContext.js';
+
+export const CLEAR_ALL_PHRASE = 'CLEAR ALL';
+
+const short = (s: string, head = 6, tail = 4) =>
+  s.length <= head + tail + 1 ? s : `${s.slice(0, head)}…${s.slice(-tail)}`;
+const when = (ms: number | null) => (ms === null ? '—' : new Date(ms).toISOString().replace('T', ' ').slice(0, 19));
+const size = (bytes: number) => (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`);
+
+/** The export file's text, as the page downloads it: compact JSON, so the file is about the size
+ *  of its records and always within what Import reads. */
+export const exportFileText = (file: ExportFile): string => `${JSON.stringify(file)}\n`;
+
+function download(name: string, text: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+export function LocalData({ network }: { network: string }) {
+  const { status, store, revision } = useStore();
+  const wallet = useWallet();
+  const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  // `revision` changes on every write here or in another tab.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const records = useMemo<RecordView[]>(() => store?.list() ?? [], [store, revision]);
+  const scope = wallet.address ? { network, evmAddress: wallet.address } : null;
+  const mine = scope
+    ? records.filter(
+        (r) =>
+          !r.parsed.scope.global &&
+          r.parsed.scope.network === network &&
+          r.parsed.scope.evmAddress === scope.evmAddress.toLowerCase(),
+      )
+    : [];
+  const wallets = new Set(
+    records
+      .filter((r) => !r.parsed.scope.global)
+      .map((r) => (r.parsed.scope.global ? '' : `${r.parsed.scope.network}/${r.parsed.scope.evmAddress}`)),
+  );
+  const totalBytes = records.reduce((n, r) => n + r.bytes, 0);
+
+  const exportMine = () => {
+    if (!store || !scope) return;
+    const file = store.exportWallet(scope);
+    const date = new Date().toISOString().slice(0, 10);
+    download(
+      `evm-midnight-transparent-${network}-${scope.evmAddress.toLowerCase().slice(0, 10)}-${date}.json`,
+      exportFileText(file),
+    );
+    setMessage({ kind: 'ok', text: `Exported ${file.records.length} records. The file holds no secret.` });
+  };
+
+  const onImport = async (e: ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f || !store) return;
+    if (!scope) {
+      setMessage({ kind: 'error', text: 'Connect the wallet the file belongs to before importing it.' });
+      return;
+    }
+    if (f.size > MAX_IMPORT_READ_BYTES) {
+      setMessage({
+        kind: 'error',
+        text: `This file is larger than a ${APP_NAME} export can be (20 MB). Nothing was imported.`,
+      });
+      return;
+    }
+    try {
+      const json: unknown = JSON.parse(await f.text());
+      const r = store.importWallet(json, scope);
+      setMessage({
+        kind: 'ok',
+        text: `Imported ${r.imported} records${r.replaced ? ` (${r.replaced} replaced)` : ''}.`,
+      });
+    } catch (err) {
+      setMessage({
+        kind: 'error',
+        text:
+          err instanceof ImportError
+            ? err.message
+            : `This file could not be read as a ${APP_NAME} export. Nothing was imported.`,
+      });
+    }
+  };
+
+  const clearAll = () => {
+    if (!store) return;
+    const n = store.clearAll();
+    setConfirming(false);
+    setMessage({ kind: 'ok', text: `Removed ${n} keys. ${APP_NAME} keeps nothing in this browser now.` });
+  };
+
+  return (
+    <section aria-labelledby="local-data-title" data-testid="local-data">
+      <PageHead
+        eyebrow="Your records"
+        title="Local data"
+        titleId="local-data-title"
+        lede={`Everything ${APP_NAME} keeps about you stays in this browser: a record of each swap, so it can be resumed. The servers keep none of it, and no record holds a key: a swap's Midnight wallet is re-created by signing its message again.`}
+      />
+
+      {status !== 'ok' && (
+        <Notice
+          tone="danger"
+          role="alert"
+          className="panel-intro"
+          data-testid="storage-blocked"
+          data-status={status}
+          title={storageText(status).title}
+        >
+          {storageText(status).text}
+        </Notice>
+      )}
+      {store?.readOnly && (
+        <Notice tone="danger" role="alert" className="panel-intro" data-testid="store-read-only">
+          This browser holds data from a newer version of {APP_NAME}. This page will not change it.
+        </Notice>
+      )}
+      {message && (
+        <Notice
+          tone={message.kind === 'error' ? 'danger' : 'success'}
+          role="status"
+          className="panel-intro"
+          data-testid="local-message"
+        >
+          {message.text}
+        </Notice>
+      )}
+
+      <Panel>
+        <p className="ns-line">
+          Stored under <span className="mono">{STORE_PREFIX}v1/…</span> · schema version {SCHEMA_VERSION} ·{' '}
+          {records.length} {records.length === 1 ? 'record' : 'records'} ·{' '}
+          <span className="num">{size(totalBytes)}</span>
+          {wallets.size > 1 ? ` · ${wallets.size} wallets` : ''}
+        </p>
+
+        {records.length === 0 ? (
+          <EmptyState data-testid="records-empty" title="Nothing stored">
+            {APP_NAME} keeps nothing in this browser.
+          </EmptyState>
+        ) : (
+          <StatementTable
+            data-testid="records"
+            caption="Records kept in this browser"
+            columns={[
+              { label: 'Record' },
+              { label: 'Contents' },
+              { label: 'Size', align: 'right' },
+              { label: 'Updated', sub: 'UTC', align: 'right' },
+            ]}
+          >
+            {records.map((r) => {
+              const s = r.parsed.scope;
+              const value = r.record ? JSON.stringify(r.record.data) : '(unreadable)';
+              return (
+                <tr key={r.key} data-testid="record-row" data-kind={r.parsed.kind} data-key={r.key}>
+                  <Cell block>
+                    <strong>
+                      {r.parsed.kind}
+                      {r.parsed.id ? ` / ${r.parsed.id}` : ''}
+                    </strong>
+                    <Sub multiline>
+                      {s.global ? (
+                        'all networks and wallets'
+                      ) : (
+                        <>
+                          {s.network} · wallet <span title={s.evmAddress}>{short(s.evmAddress)}</span>
+                        </>
+                      )}
+                    </Sub>
+                  </Cell>
+                  <Cell label="Contents">
+                    <span className="record-contents">
+                      <code data-testid="record-value">{value.length > 240 ? `${value.slice(0, 240)}…` : value}</code>
+                    </span>
+                  </Cell>
+                  <Cell label="Size" align="right" num>
+                    {r.bytes} B
+                  </Cell>
+                  <Cell label="Updated" align="right" num>
+                    {when(r.updatedAt)}
+                  </Cell>
+                </tr>
+              );
+            })}
+          </StatementTable>
+        )}
+
+        <div className="danger-zone">
+          <div>
+            <ButtonRow>
+              <Button
+                variant="secondary"
+                data-testid="export"
+                onClick={exportMine}
+                disabled={!store || !scope || mine.length === 0}
+              >
+                Export this wallet&apos;s data
+              </Button>
+              <Button
+                variant="secondary"
+                data-testid="import"
+                onClick={() => fileInput.current?.click()}
+                disabled={!store || !scope}
+              >
+                Import
+              </Button>
+              <input
+                ref={fileInput}
+                type="file"
+                accept="application/json,.json"
+                hidden
+                data-testid="import-file"
+                onChange={(e) => void onImport(e)}
+              />
+            </ButtonRow>
+            <p className="explain">
+              {scope
+                ? `Export saves this wallet's records as a JSON file, to resume a swap in another browser. Import accepts only a file for ${network} and this wallet.`
+                : 'Connect your wallet to export or import its data.'}
+            </p>
+          </div>
+          <Button
+            variant="danger"
+            data-testid="clear-all"
+            onClick={() => setConfirming(true)}
+            disabled={!store || records.length === 0}
+          >
+            CLEAR ALL
+          </Button>
+        </div>
+      </Panel>
+
+      <TypedConfirmDialog
+        open={confirming}
+        title={`Clear all ${APP_NAME} data from this browser?`}
+        phrase={CLEAR_ALL_PHRASE}
+        testIdPrefix="clear"
+        warning={
+          <>
+            <strong>A swap in progress loses its record</strong>, which holds what resuming it needs. Export first if a
+            swap is not finished.
+          </>
+        }
+        onExportFirst={scope && mine.length > 0 ? exportMine : undefined}
+        exportLabel="Export this wallet's data first"
+        confirmLabel="Clear all data"
+        onConfirm={clearAll}
+        onCancel={() => setConfirming(false)}
+      >
+        <p>
+          This removes all {records.length} records {APP_NAME} keeps here, for {wallets.size} wallet
+          {wallets.size === 1 ? '' : 's'}. The servers have no copy.
+        </p>
+      </TypedConfirmDialog>
+    </section>
+  );
+}

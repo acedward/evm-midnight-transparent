@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+bun.lock
+# Vendored byte-for-byte from acedward/passport; never reformat
+packages/core/src/tokens/deployments/*.json
+packages/core/src/vendor/
+# Prose and tables are formatted by hand
+*.md
+# Kernel responses captured verbatim from the staging exchange; never reformat
+packages/core/test/fixtures/kernel/staging-*/

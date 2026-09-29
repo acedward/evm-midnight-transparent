@@ -25,3 +25,52 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 `main`. Work is done on short-lived branches whose temporary pull requests target this branch,
 and each is merged in with a merge commit once its checks are green. The master pull request
 stays a draft until the work is complete; the owner merges it.
+
+## Repository layout
+
+| Path | What it holds |
+|---|---|
+| `packages/core` | Shared, environment-neutral TypeScript: network profiles, the token registry (every token the vault bridges; no token is special), amount maths, the exchange client and the swappable-offer book, the batcher envelope, the bridge's wire types and preflights, and the sponsor's authorisation and API types. |
+| `packages/core/src/tokens/deployments` | The vault's deployment records, vendored byte for byte (`PROVENANCE.md`). |
+| `sponsor/` | The sponsor service (Bun + Hono): its wallet, configuration with `*_FILE` secrets, rate limits, health, job lanes and the operator's wallet tool. |
+| `web/` | The web app (Vite + React): the design system, the shell, the EVM wallet connection, the browser store and the Local data tab. |
+| `scripts/` | The Docker check runner, the sponsor start-up smoke and the secret scan. |
+
+Much of this is copied from MN Bank (`acedward/passport-evm-dapp` @ `911647b`), without its
+Passport parts; see `NOTICE`.
+
+## Development
+
+Requirements: Bun 1.3.11 and Node 24 (for the test runner), or Docker only.
+
+```sh
+bun install
+bun run check                        # format, lint, typecheck, unit tests
+bun run build:web
+bun scripts/sponsor-smoke.ts         # the sponsor starts and serves
+```
+
+To run everything in Docker instead (`node_modules` stays in a Docker volume):
+
+```sh
+scripts/docker-check.sh all          # install, check, web build, sponsor start-up
+scripts/docker-check.sh down         # remove the container and volumes
+```
+
+## Checks and the secret scan
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request: format, lint, typecheck, unit
+tests, the web build, the sponsor start-up check, and the secret scan over the built bundle and
+over the full history.
+
+This repository is public. Run the secret scan before every push:
+
+```sh
+SECRET_SCAN_FILES=/path/to/secret-file:/path/to/another bash scripts/secret-scan.sh
+```
+
+It runs gitleaks (the default rules plus wallet-secret, mnemonic, keyed-RPC-URL and
+labelled-private-key rules, each proven by a self-test on random fakes) over the whole history
+and the working tree. With `SECRET_SCAN_FILES`, it also reads those files in-process and checks
+that no 3-word window of a mnemonic and no key's hex appears anywhere in the tree or the
+history. It never prints a secret.

@@ -1,0 +1,17 @@
+{
+  "name": "@evm-midnight-transparent/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared, environment-neutral code: network profiles, the token registry of the vault's tokens, amount maths, the exchange client and swappable-offer book, the bridge's wire types, and the sponsor's authorisation and API types.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.2.0",
+    "@scure/base": "2.0.0",
+    "ethers": "6.17.0",
+    "zod": "4.6.5"
+  }
+}

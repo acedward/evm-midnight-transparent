@@ -1,0 +1,33 @@
+{
+  "name": "@evm-midnight-transparent/sponsor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The sponsor service: pays the DUST of each swap's bridge legs from its own wallet, drives the bridge's MPC steps and the withdrawal lane, and never holds a user's keys.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@evm-midnight-transparent/core": "workspace:*",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
+    "@midnightntwrk/ledger-v9": "1.0.0-rc.3",
+    "@midnightntwrk/wallet-sdk-dust-wallet": "5.0.0-beta.2",
+    "@midnightntwrk/wallet-sdk-facade": "5.0.0-beta.2",
+    "@midnightntwrk/wallet-sdk-hd": "3.1.0-beta.1",
+    "@midnightntwrk/wallet-sdk-shielded": "4.0.0-beta.2",
+    "@midnightntwrk/wallet-sdk-unshielded-wallet": "4.0.0-beta.2",
+    "@scure/bip39": "2.0.1",
+    "ethers": "6.17.0",
+    "hono": "4.13.9",
+    "rxjs": "7.8.2",
+    "ws": "8.19.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@midnightntwrk/wallet-sdk-address-format": "4.0.0-beta.2",
+    "@types/bun": "1.3.11",
+    "@types/ws": "8.18.1"
+  }
+}
