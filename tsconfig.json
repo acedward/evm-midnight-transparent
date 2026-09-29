@@ -4,5 +4,5 @@
     "lib": ["ES2023", "DOM"],
     "types": ["node", "bun"]
   },
-  "include": ["scripts/**/*.ts", "vitest.config.ts", "eslint.config.js"]
+  "include": ["scripts/**/*.ts", "test/**/*.ts", "vitest.config.ts", "eslint.config.js"]
 }

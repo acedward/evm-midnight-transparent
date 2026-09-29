@@ -11,7 +11,7 @@
     "web"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/core && tsc -p sponsor && tsc -p web && tsc -p .",
+    "typecheck": "tsc -p packages/core && tsc -p packages/wallet && tsc -p sponsor && tsc -p web && tsc -p .",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -28,6 +28,7 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "17.12.0",
     "happy-dom": "20.14.5",
+    "playwright-core": "1.62.0",
     "prettier": "3.9.9",
     "typescript": "5.9.3",
     "typescript-eslint": "8.70.1",
