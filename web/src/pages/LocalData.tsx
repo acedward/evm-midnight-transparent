@@ -190,9 +190,9 @@ export function LocalData({ network }: { network: string }) {
               return (
                 <tr key={r.key} data-testid="record-row" data-kind={r.parsed.kind} data-key={r.key}>
                   <Cell block>
-                    <strong>
+                    <strong title={r.parsed.id}>
                       {r.parsed.kind}
-                      {r.parsed.id ? ` / ${r.parsed.id}` : ''}
+                      {r.parsed.id ? ` / ${short(r.parsed.id, 8, 6)}` : ''}
                     </strong>
                     <Sub multiline>
                       {s.global ? (

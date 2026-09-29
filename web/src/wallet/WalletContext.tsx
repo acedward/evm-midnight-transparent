@@ -22,6 +22,8 @@ export interface WalletState {
   address: string | null;
   chainId: string | null;
   walletName: string | null;
+  /** The wallet's EIP-6963 reverse-DNS id, when it announced one. */
+  walletRdns: string | null;
   /** The connected wallet's EIP-1193 provider (signatures and Sepolia reads go through it). */
   provider: Eip1193Provider | null;
   /** True when connected to the chain the app uses (Sepolia). */
@@ -112,6 +114,7 @@ export function WalletProvider({ network, children }: { network: NetworkProfile;
     address,
     chainId,
     walletName: selected?.name ?? null,
+    walletRdns: status === 'connected' ? (selected?.rdns ?? null) : null,
     provider: status === 'connected' ? (selected?.provider ?? null) : null,
     onRightChain: sameChain(chainId, chain.chainIdHex),
     error,

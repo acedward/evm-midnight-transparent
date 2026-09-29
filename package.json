@@ -17,12 +17,15 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "build:web": "vite build web",
+    "e2e": "playwright test -c test/e2e/playwright.config.ts",
     "sponsor": "bun sponsor/src/main.ts",
     "secret-scan": "bash scripts/secret-scan.sh",
     "check": "bun run format:check && bun run lint && bun run typecheck && bun run test"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@noble/curves": "1.2.0",
+    "@playwright/test": "1.62.0",
     "@types/node": "24.19.0",
     "eslint": "10.11.0",
     "eslint-plugin-react-hooks": "7.1.1",

@@ -1,10 +1,19 @@
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vite';
+import { type Plugin, defineConfig } from 'vite';
+
+import { APP_NAME } from './src/brand.js';
+
+/** The app's name lives in ONE constant (src/brand.ts, questions Q10): index.html takes it from there. */
+function appName(): Plugin {
+  const escaped = APP_NAME.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+  return { name: 'app-name', transformIndexHtml: (html) => html.replaceAll('%APP_NAME%', escaped) };
+}
 
 // The web app is a static site: it bundles @evm-midnight-transparent/core and nothing that needs
-// Node. TODO(L-WALLET): the in-browser Midnight wallet SDK (WASM) will need its own bundling notes.
+// Node. TODO(P3): the in-browser Midnight wallet SDK (WASM) comes with the live wallet module
+// (src/swap/wiring.ts); G-TAKE T.5 bundled it with Vite and no plugins.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), appName()],
   base: './',
   // Keep JSON as per-field exports (never one JSON.parse blob), so the bundle carries only the
   // fields of the vendored deployment records that the code actually imports.
