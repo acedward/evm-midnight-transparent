@@ -81,3 +81,12 @@ condition = "AND"
 paths = ['''(^|/)packages/wallet/test/vendor-vault\.test\.ts$''']
 regexTarget = "match"
 regexes = ['''^publishTokenMetadata: '[0-9a-f]{64}'$''']
+
+# The vault key job pins the SHA-256 of the vault's PUBLIC Compact sources (deploy/vault-keys/build.sh);
+# the rule reads the variable name `TOKEN_METADATA_SHA256` (the MIP-0018 module's source hash) as a
+# token label. Scoped to that rule, that file AND that one assignment's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)deploy/vault-keys/build\.sh$''']
+regexTarget = "match"
+regexes = ['''^TOKEN_METADATA_SHA256=[0-9a-f]{64}$''']
