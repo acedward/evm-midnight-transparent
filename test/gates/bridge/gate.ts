@@ -31,7 +31,16 @@ import * as path from 'node:path';
 import { ethers } from 'ethers';
 import * as Rx from 'rxjs';
 
-import { DEFAULT_EVM_GAS, STAGENET, depositPreflight, stagenetRegistry } from '@evm-midnight-transparent/core';
+import {
+  DEFAULT_EVM_GAS,
+  STAGENET,
+  SWAP_KEY_DERIVATION_VERSION,
+  depositPreflight,
+  newSwapSalt,
+  stagenetRegistry,
+  startSwapTypedData,
+} from '@evm-midnight-transparent/core';
+import { type TemporaryWalletKeys } from '@evm-midnight-transparent/wallet';
 import vaultRecord from '../../../packages/core/src/tokens/deployments/stagenet-vault.json';
 import { parseSponsorSeed } from '../../../sponsor/src/config.js';
 import { openFacadeWallet, type OpenedWallet } from '../../../sponsor/src/sponsor/facade.js';
@@ -60,13 +69,7 @@ import {
   getSignetContractAddress,
   normaliseSecp256k1PublicKey,
 } from '../../../sponsor/src/bridge/vendor/signet-sdk.js';
-import {
-  buildStartWithdraw,
-  deriveTempWallet,
-  openTempShielded,
-  startSwapTypedData,
-  type TempKeys,
-} from './temp-wallet.js';
+import { buildStartWithdraw, deriveTemp, openTemp } from './temp-wallet.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Any = any;
@@ -343,16 +346,19 @@ async function sponsorProvidersRecording(rt: VaultRuntime, sp: Sponsor) {
 
 // ── The temporary wallet ──────────────────────────────────────────────────────
 
-async function tempKeysFromSignature(s: State): Promise<TempKeys> {
+async function tempKeysFromSignature(
+  s: State,
+): Promise<{ keys: TemporaryWalletKeys; deterministic: boolean; prompts: number }> {
   const provider = sepolia();
   try {
     const user = await sepoliaUser(provider);
-    const keys = await deriveTempWallet(user, need(s.typedData, 'typedData') as ReturnType<typeof startSwapTypedData>);
-    if (!keys.deterministic) throw new Error('the two start-swap signatures differ: the signer is not deterministic');
-    if (s.temp && keys.coinPublicKeyHex !== s.temp.coinPublicKey) {
+    const d = await deriveTemp(user, { network: NETWORK_ID, vault: VAULT, salt: need(s.salt, 'salt') });
+    if (!d.deterministic) throw new Error('the two start-swap signatures differ: the signer is not deterministic');
+    if (s.temp && d.keys.coinPublicKey !== s.temp.coinPublicKey) {
+      d.keys.clear();
       throw new Error('the re-derived temporary wallet is not the one recorded');
     }
-    return keys;
+    return { keys: d.keys, deterministic: d.deterministic, prompts: d.prompts };
   } finally {
     provider.destroy();
   }
@@ -418,23 +424,21 @@ async function cmdDerive() {
   const t = tokenFromArgs();
   s.token = t;
   s.amount = (10n ** BigInt(t.decimals)).toString(); // exactly 1 token
-  s.salt = bytesToHex(new Uint8Array(randomBytes(32)));
-  s.typedData = startSwapTypedData({
-    chainId: Number(SEPOLIA_CHAIN_ID),
-    network: NETWORK_ID,
-    vault: VAULT,
-    salt: s.salt,
-  });
+  s.salt = newSwapSalt();
+  s.typedData = {
+    ...startSwapTypedData({ network: NETWORK_ID, vault: VAULT, salt: s.salt }),
+    derivationVersion: SWAP_KEY_DERIVATION_VERSION,
+  };
   const t0 = Date.now();
-  const keys = await tempKeysFromSignature(s);
+  const { keys, deterministic, prompts } = await tempKeysFromSignature(s);
   const deriveMs = Date.now() - t0;
 
   // The deposit address, three ways: our TypeScript twin, the vault's compiled circuit, and the
   // 00037 worked example (a fixed vector: coin key c6a35196… -> 0x5f89…3714).
   const rt = await loadVault(managedDir());
-  const twin = depositAddressFor(MPC_ROOT, VAULT, keys.coinPublicKeyHex);
-  const twinPath = bytesToHex(depositPathOf(walletRecipient(keys.coinPublicKeyHex)));
-  const compiledPath = bytesToHex(rt.pureCircuits.depositPath(walletRecipient(keys.coinPublicKeyHex)));
+  const twin = depositAddressFor(MPC_ROOT, VAULT, keys.coinPublicKey);
+  const twinPath = bytesToHex(depositPathOf(walletRecipient(keys.coinPublicKey)));
+  const compiledPath = bytesToHex(rt.pureCircuits.depositPath(walletRecipient(keys.coinPublicKey)));
   const helper = deriveEvmAddress(MPC_ROOT, VAULT, compiledPath);
   const vectorCpk = 'c6a35196428ac58a956e93e0c3c7c7df254e428a827291e9111fde7037cd34a1';
   const vector = {
@@ -449,9 +453,9 @@ async function cmdDerive() {
     vector.twin === vector.expected &&
     vector.compiled === vector.expected;
   s.temp = {
-    coinPublicKey: keys.coinPublicKeyHex,
-    encryptionPublicKey: keys.encryptionPublicKeyHex,
-    deterministic: keys.deterministic,
+    coinPublicKey: keys.coinPublicKey,
+    encryptionPublicKey: keys.encryptionPublicKey,
+    deterministic,
   };
   s.depositAddress = {
     address: twin,
@@ -471,12 +475,15 @@ async function cmdDerive() {
     token: t,
     amount: s.amount,
     typedData: s.typedData,
-    signedTwiceEqual: keys.deterministic,
+    signedTwiceEqual: deterministic,
+    signaturePrompts: prompts,
+    shieldedAddress: keys.shieldedAddress,
     deriveMs,
     temp: s.temp,
     depositAddress: s.depositAddress,
   };
   saveEvidence('b1-derive.json', out);
+  keys.clear();
   log(toJson(out));
   if (!ok) throw new Error('B.1 FAILED: the deposit address derivations disagree');
 }
@@ -802,15 +809,10 @@ async function cmdTempCheck() {
   await setNetwork();
   const s = loadState();
   const t = need(s.token, 'token');
-  const keys = await tempKeysFromSignature(s);
-  const temp = await openTempShielded(keys, ENDPOINTS, log);
+  const { keys } = await tempKeysFromSignature(s);
+  const temp = await openTemp(keys, ENDPOINTS, log);
   try {
-    const st: Any = await temp.state();
-    const coins = (st.availableCoins as Any[]).map((c: Any) => ({
-      color: strip0x(String(c.coin.type)),
-      value: String(c.coin.value),
-      nonce: strip0x(String(c.coin.nonce)),
-    }));
+    const coins = await temp.coins();
     const balance = await temp.balance(t.colour);
     const minted = (s.deposit?.completeTx as Any)?.mintedCoin;
     s.tempCheck = {
@@ -829,6 +831,7 @@ async function cmdTempCheck() {
     if (!s.tempCheck.pass) throw new Error('B.2.5 FAILED: the temporary wallet does not hold the minted coin');
   } finally {
     await temp.stop();
+    keys.clear();
   }
 }
 
@@ -858,11 +861,11 @@ async function cmdWithdrawBuild() {
   } finally {
     provider.destroy();
   }
-  const keys = await tempKeysFromSignature(s);
+  const { keys } = await tempKeysFromSignature(s);
   const rt = await loadVault(managedDir());
   const pdp = await publicDataProviderFor(ENDPOINTS);
   const proofProvider = await proofProviderFor(rt, PROOF_SERVER_URL);
-  const temp = await openTempShielded(keys, ENDPOINTS, log);
+  const temp = await openTemp(keys, ENDPOINTS, log);
   try {
     const bal = await temp.balance(t.colour);
     if (bal < amount) throw new Error(`the temporary wallet holds ${bal} of ${t.midnightName}, less than ${amount}`);
@@ -881,7 +884,7 @@ async function cmdWithdrawBuild() {
         dest: ethers.getBytes(USER),
         colour: ethers.getBytes(`0x${t.colour}`),
         coinNonce: new Uint8Array(randomBytes(32)),
-        refundRecipient: walletRecipient(keys.coinPublicKeyHex),
+        refundRecipient: walletRecipient(keys.coinPublicKey),
       },
       log,
     );
@@ -894,7 +897,7 @@ async function cmdWithdrawBuild() {
       evmNonce: evmNonce.toString(),
       gas: { ...gas },
       dest: USER,
-      refundRecipient: keys.coinPublicKeyHex,
+      refundRecipient: keys.coinPublicKey,
       destErc20Before: destBefore.toString(),
       vaultEvmEthBefore: ethers.formatEther(vaultEth),
       requestId: req.requestId,
@@ -918,6 +921,7 @@ async function cmdWithdrawBuild() {
     log(toJson(s.withdraw));
   } finally {
     await temp.stop();
+    keys.clear();
   }
 }
 
