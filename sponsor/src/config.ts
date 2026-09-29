@@ -1,6 +1,7 @@
 // The sponsor's configuration, from the environment. Copied from MN Bank's relay
 // (acedward/passport-evm-dapp @ 911647b, relay/src/config.ts) without its key volume and Passport
-// settings. TODO(P4.1): document every variable in the deploy bundle's env example.
+// settings; L-SPONSOR added the swap settings (data directory, vault key directory, sweep gas,
+// swap limits, the stale closer). Every variable is listed in sponsor/README.md.
 //
 // Secrets never come from plain env values in production: pass the PATH of a file
 // (SPONSOR_SEED_FILE, SEPOLIA_RPC_URL_FILE), which a deployment mounts read-only. Secrets are
@@ -21,6 +22,7 @@ import {
 } from '@evm-midnight-transparent/core';
 
 import { LOG_LEVELS, type LogLevel } from './log.js';
+import { parseSweepGasLimits } from './swaps/sweep-gas.js';
 
 export class ConfigError extends Error {
   override name = 'ConfigError';
@@ -55,15 +57,50 @@ export interface SponsorConfig {
     /** GET /health per client address; monitors poll about once a minute. */
     healthPerMinute: number;
     noncesPerMinute: number;
-    actionsPerMinute: number;
-    actionsPerOwnerPerMinute: number;
+    /** POST /v1/swaps per client address, and per signing EVM address. */
+    opensPerMinute: number;
+    opensPerOwnerPerMinute: number;
+    /** POST /v1/swaps/:id/prove per client address, and per swap. */
+    provesPerMinute: number;
+    provesPerSwapPerMinute: number;
+    /** POST /v1/swaps/:id/withdraw and /take per client address. */
+    writesPerMinute: number;
     authMaxTtlSeconds: number;
     nonceTtlSeconds: number;
     maxNonces: number;
-    jobTtlSeconds: number;
-    maxJobs: number;
     maxBodyBytes: number;
   };
+  swaps: {
+    /** Where the swaps are kept (`:memory:` keeps them in memory only: tests and smoke runs). */
+    dataDir: string;
+    /** Finished swaps are dropped this many days after their last change. */
+    retainDays: number;
+    /** A new swap's offer must expire at least this far ahead. */
+    minOfferTtlSeconds: number;
+    maxActivePerOwner: number;
+    /** Proofs per swap and purpose (take, withdraw). */
+    proofsPerSwap: number;
+    depositPollSeconds: number;
+    /** An awaiting_funds swap fails after this long without its funds (re-opening resumes it). */
+    fundsWaitSeconds: number;
+    maxDepositAttempts: number;
+    /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
+    sweepGasLimits: Record<string, bigint>;
+    /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
+    maxSweepWei: bigint;
+  };
+  staleCloser: {
+    enabled: boolean;
+    intervalSeconds: number;
+    staleAfterSeconds: number;
+    maxPerDay: number;
+    minSponsorDustSpecks: bigint;
+  };
+  /** The vault's compiled module and keys (deploy/vault-keys/ builds it); under the repository root. */
+  vaultManagedDir: string;
+  proofTimeoutSeconds: number;
+  /** The app's display name, served in /v1/config (plan Q10). */
+  appName: string;
   /** Health reports low gas when the vault's EVM account holds less than this (wei). */
   vaultGasLowWei: bigint;
   /** The Sepolia gas fields a withdrawal signs (the MPC signs them verbatim). A withdrawal's gas is
@@ -247,20 +284,44 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       readsPerMinute: int(env.RATE_LIMIT_READS_PER_MIN, 240, 'RATE_LIMIT_READS_PER_MIN', 1),
       healthPerMinute: int(env.RATE_LIMIT_HEALTH_PER_MIN, 60, 'RATE_LIMIT_HEALTH_PER_MIN', 1),
       noncesPerMinute: int(env.RATE_LIMIT_NONCES_PER_MIN, 30, 'RATE_LIMIT_NONCES_PER_MIN', 1),
-      actionsPerMinute: int(env.RATE_LIMIT_ACTIONS_PER_MIN, 10, 'RATE_LIMIT_ACTIONS_PER_MIN', 1),
-      actionsPerOwnerPerMinute: int(
-        env.RATE_LIMIT_ACTIONS_PER_OWNER_PER_MIN,
-        5,
-        'RATE_LIMIT_ACTIONS_PER_OWNER_PER_MIN',
-        1,
-      ),
+      opensPerMinute: int(env.RATE_LIMIT_OPENS_PER_MIN, 10, 'RATE_LIMIT_OPENS_PER_MIN', 1),
+      opensPerOwnerPerMinute: int(env.RATE_LIMIT_OPENS_PER_OWNER_PER_MIN, 5, 'RATE_LIMIT_OPENS_PER_OWNER_PER_MIN', 1),
+      provesPerMinute: int(env.RATE_LIMIT_PROVES_PER_MIN, 20, 'RATE_LIMIT_PROVES_PER_MIN', 1),
+      provesPerSwapPerMinute: int(env.RATE_LIMIT_PROVES_PER_SWAP_PER_MIN, 6, 'RATE_LIMIT_PROVES_PER_SWAP_PER_MIN', 1),
+      writesPerMinute: int(env.RATE_LIMIT_WRITES_PER_MIN, 20, 'RATE_LIMIT_WRITES_PER_MIN', 1),
       authMaxTtlSeconds: int(env.AUTH_MAX_TTL_SECONDS, 600, 'AUTH_MAX_TTL_SECONDS', 30, 3600),
       nonceTtlSeconds: int(env.AUTH_NONCE_TTL_SECONDS, 600, 'AUTH_NONCE_TTL_SECONDS', 30, 3600),
       maxNonces: int(env.AUTH_MAX_NONCES, 50_000, 'AUTH_MAX_NONCES', 100),
-      jobTtlSeconds: int(env.JOB_TTL_SECONDS, 86_400, 'JOB_TTL_SECONDS', 60),
-      maxJobs: int(env.JOB_MAX, 10_000, 'JOB_MAX', 10),
-      maxBodyBytes: int(env.SPONSOR_MAX_BODY_BYTES, 1_048_576, 'SPONSOR_MAX_BODY_BYTES', 1024),
+      maxBodyBytes: int(env.SPONSOR_MAX_BODY_BYTES, 2_097_152, 'SPONSOR_MAX_BODY_BYTES', 1024),
     },
+    swaps: {
+      dataDir: str(env.SPONSOR_DATA_DIR) ?? 'sponsor-data',
+      retainDays: int(env.SWAP_RETAIN_DAYS, 30, 'SWAP_RETAIN_DAYS', 1, 3650),
+      minOfferTtlSeconds: int(env.SWAP_MIN_OFFER_TTL_SECONDS, 1800, 'SWAP_MIN_OFFER_TTL_SECONDS', 0, 86_400),
+      maxActivePerOwner: int(env.SWAP_MAX_ACTIVE_PER_OWNER, 3, 'SWAP_MAX_ACTIVE_PER_OWNER', 1, 100),
+      proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
+      depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
+      fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_SECONDS', 60),
+      maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),
+      sweepGasLimits: (() => {
+        try {
+          return parseSweepGasLimits(str(env.SWEEP_GAS_LIMITS));
+        } catch (e) {
+          throw new ConfigError((e as Error).message);
+        }
+      })(),
+      maxSweepWei: big(env.SWEEP_MAX_WEI, 5_000_000_000_000_000n, 'SWEEP_MAX_WEI'),
+    },
+    staleCloser: {
+      enabled: bool(env.STALE_CLOSER_ENABLED, true, 'STALE_CLOSER_ENABLED'),
+      intervalSeconds: int(env.STALE_CLOSER_INTERVAL_SECONDS, 300, 'STALE_CLOSER_INTERVAL_SECONDS', 10),
+      staleAfterSeconds: int(env.STALE_AFTER_SECONDS, 900, 'STALE_AFTER_SECONDS', 60),
+      maxPerDay: int(env.STALE_CLOSER_MAX_PER_DAY, 48, 'STALE_CLOSER_MAX_PER_DAY', 0, 10_000),
+      minSponsorDustSpecks: big(env.STALE_CLOSER_MIN_DUST_SPECKS, 2n * dustLowSpecks, 'STALE_CLOSER_MIN_DUST_SPECKS'),
+    },
+    vaultManagedDir: str(env.VAULT_MANAGED_DIR) ?? 'vault-managed',
+    proofTimeoutSeconds: int(env.PROOF_TIMEOUT_SECONDS, 900, 'PROOF_TIMEOUT_SECONDS', 30, 3600),
+    appName: str(env.APP_NAME) ?? 'EVM Midnight Swap',
     vaultGasLowWei: big(env.VAULT_GAS_LOW_WEI, 2_000_000_000_000_000n, 'VAULT_GAS_LOW_WEI'),
     bridgeGas: {
       gasLimit: big(env.BRIDGE_EVM_GAS_LIMIT, DEFAULT_EVM_GAS.gasLimit, 'BRIDGE_EVM_GAS_LIMIT'),

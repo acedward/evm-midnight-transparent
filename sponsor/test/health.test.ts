@@ -6,7 +6,6 @@ import { describe, expect, it } from 'vitest';
 
 import { healthCollector, httpProbes, type ExternalProbes } from '../src/health.js';
 import { ProofServerClient } from '../src/prover/client.js';
-import { JobQueue } from '../src/queue/jobs.js';
 import { DisabledSponsorSession } from '../src/sponsor/session.js';
 import { FakeSponsor, silentLog } from './harness.js';
 
@@ -74,7 +73,7 @@ describe('health', () => {
       sponsor: new FakeSponsor(),
       dustLowSpecks: 10n ** 16n,
       prover: prover(),
-      queue: new JobQueue({ ttlSeconds: 60, maxJobs: 10, log: silentLog() }),
+      lanes: () => ({ prover: { running: 0, waiting: 0 }, withdrawal: { running: 0, waiting: 0 } }),
       probes: okProbes(),
       vaultEvmAddress: '0x648216975e722494bFF92E88FFc68C8F8d438FaA',
       vaultGasLowWei: 2n * 10n ** 15n,

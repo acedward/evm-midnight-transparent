@@ -5,7 +5,7 @@
 // packages/core/src/auth.ts) with its account field replaced by the swap's.
 //
 // A `SponsorAction` binds, in one signature:
-//   - the ACTION (for example "bridge-deposit") and the request body (`payloadHash`, keccak256 of
+//   - the ACTION (for example "open-swap") and the request body (`payloadHash`, keccak256 of
 //     the canonical JSON of the payload), so a signature cannot be reused with other arguments;
 //   - the Midnight NETWORK and the SWAP the action is for (32 bytes; zero for none);
 //   - the OWNER, the EVM address that must recover from the signature;
@@ -17,9 +17,11 @@
 // The domain names the sponsor and Sepolia's chain id; wallets check that the connected chain
 // matches, which the app switches to first.
 //
-// TODO(L-SPONSOR): the action list, what identifies a swap (for example the temporary wallet's
-// coin public key) and each action's body are the sponsor lane's to settle; the names below are
-// placeholders with the verification machinery around them.
+// L-SPONSOR (plan 00048, "Lane contracts"): ONE action, `open-swap`, signed once per swap. Its
+// `swap` is the swap id (the "start swap" salt) and its payload is ./swap-api.ts
+// `OpenSwapPayload`; every later call of that swap is authorised by the bearer token the sponsor
+// answers with. A message naming any other action still parses (so a signature made for something
+// else is refused as `wrong-action`, never mistaken for a malformed body).
 
 import { TypedDataEncoder, getAddress, keccak256, toUtf8Bytes, verifyTypedData } from 'ethers';
 import { z } from 'zod';
@@ -30,8 +32,8 @@ export const SPONSOR_DOMAIN_NAME = 'EVM Midnight Swap Sponsor';
 export const SPONSOR_DOMAIN_VERSION = '1';
 export const SPONSOR_PRIMARY_TYPE = 'SponsorAction';
 
-/** Every action the sponsor knows (placeholders until L-SPONSOR; see the header). */
-export const SPONSOR_ACTIONS = ['swap-open', 'bridge-deposit', 'bridge-withdraw', 'bridge-resume', 'prove'] as const;
+/** Every action the sponsor accepts a signature for (see the header). */
+export const SPONSOR_ACTIONS = ['open-swap'] as const;
 export type SponsorActionName = (typeof SPONSOR_ACTIONS)[number];
 
 export const SPONSOR_ACTION_FIELDS = [
@@ -54,7 +56,7 @@ const EIP712_DOMAIN_FIELDS = [
 
 /** The message as it travels in JSON: every value a string. */
 export const SponsorActionMessageSchema = z.object({
-  action: z.enum(SPONSOR_ACTIONS),
+  action: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/),
   network: z.string().min(1).max(32),
   owner: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   swap: z.string().regex(/^0x[0-9a-f]{64}$/),
@@ -124,7 +126,8 @@ export function payloadHash(payload: unknown): string {
 // ── Building and signing ─────────────────────────────────────────────────────
 
 export interface SponsorActionInput {
-  action: SponsorActionName;
+  /** One of SPONSOR_ACTIONS (any other name builds a message the sponsor refuses as wrong-action). */
+  action: SponsorActionName | (string & Record<never, never>);
   network: string;
   owner: string;
   /** The swap (64 hex, with or without 0x); omit for none. */

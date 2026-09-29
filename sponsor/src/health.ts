@@ -3,15 +3,13 @@
 // cached for a few seconds so /health cannot be used to flood the services behind it: ONE refresh
 // runs at a time and every concurrent request shares it; while it runs, a recent cached report is
 // served; app.ts rate-limits the route. Copied from MN Bank's relay (acedward/passport-evm-dapp @
-// 911647b, relay/src/health.ts) without its key-volume and Passport bridge sections.
-//
-// TODO(L-SPONSOR): the bridge's live facts (the MPC's recent behaviour, the stale closer).
+// 911647b, relay/src/health.ts) without its key-volume and Passport bridge sections; L-SPONSOR
+// added the bridge section (vault keys verified, swaps by state, the MPC, the stale closer).
 
 import type { HealthResponse } from '@evm-midnight-transparent/core';
 
 import type { Logger } from './log.js';
 import type { ProofServerClient } from './prover/client.js';
-import type { JobQueue } from './queue/jobs.js';
 import type { SponsorSession } from './sponsor/session.js';
 
 export interface ExternalProbes {
@@ -85,7 +83,10 @@ export interface HealthDeps {
   sponsor: SponsorSession;
   dustLowSpecks: bigint;
   prover: ProofServerClient;
-  queue: JobQueue;
+  /** The sponsor's lanes (running and waiting). */
+  lanes: () => Record<string, { running: number; waiting: number }>;
+  /** The bridge section, when the sponsor drives swaps. */
+  bridge?: () => NonNullable<HealthResponse['bridge']>;
   probes: ExternalProbes;
   vaultEvmAddress: string;
   vaultGasLowWei: bigint;
@@ -135,7 +136,8 @@ export function healthCollector(deps: HealthDeps): () => Promise<HealthResponse>
     const { proof, kernel, batcher, gas } = await current();
     const sponsor = deps.sponsor.status();
     const dustLow = sponsor.dustSpecks === null ? sponsor.configured : sponsor.dustSpecks < deps.dustLowSpecks;
-    const stats = deps.queue.stats();
+    const lanes = deps.lanes();
+    const bridge = deps.bridge?.();
     const gasLow = gas === null ? null : gas < deps.vaultGasLowWei;
     const down = !proof.reachable || sponsor.state === 'error';
     const degraded =
@@ -144,7 +146,8 @@ export function healthCollector(deps: HealthDeps): () => Promise<HealthResponse>
       !kernel.reachable ||
       !batcher.reachable ||
       gasLow === true ||
-      proof.versionMatches === false;
+      proof.versionMatches === false ||
+      (bridge !== undefined && !bridge.available);
     return {
       status: down ? 'down' : degraded ? 'degraded' : 'ok',
       network: deps.network,
@@ -162,10 +165,14 @@ export function healthCollector(deps: HealthDeps): () => Promise<HealthResponse>
         version: proof.version,
         jobCapacity: proof.jobCapacity,
       },
-      queue: { jobs: stats.jobs, lanes: stats.lanes },
+      queue: {
+        jobs: Object.values(lanes).reduce((n, l) => n + l.running + l.waiting, 0),
+        lanes,
+      },
       kernel,
       batcher,
       vaultGas: { address: deps.vaultEvmAddress, balanceWei: gas === null ? null : gas.toString(10), low: gasLow },
+      ...(bridge ? { bridge } : {}),
     };
   };
 }

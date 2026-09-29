@@ -21,3 +21,7 @@ test-results/
 # OS and logs
 .DS_Store
 *.log
+
+# The sponsor's local state and the vault key directory (built by deploy/vault-keys/; never committed)
+sponsor-data/
+vault-managed/
