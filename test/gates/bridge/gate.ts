@@ -151,6 +151,7 @@ interface State {
   fund?: Json;
   deposit?: Json & { requestId?: string; relay?: Json[]; relayResult?: Json; startTx?: Json; completeTx?: Json };
   tempCheck?: Json;
+  finalCheck?: Json;
   withdraw?: Json & { requestId?: string; relay?: Json[]; relayResult?: Json; submitTx?: Json; completeTx?: Json };
   dust?: Record<string, string>;
   history?: Json[];
@@ -805,30 +806,39 @@ async function cmdDepositComplete() {
 
 // ── B.2.5 temp-check ──────────────────────────────────────────────────────────
 
+/** `temp-check` (B.2.5): the temporary wallet's own sync holds the minted coin. `temp-check --final`
+ *  (after the withdrawal): it holds nothing any more (spec SC-003: the temporary wallet ends empty). */
 async function cmdTempCheck() {
   await setNetwork();
   const s = loadState();
   const t = need(s.token, 'token');
+  const final = process.argv.includes('--final');
+  const expected = final ? 0n : BigInt(need(s.amount, 'amount'));
   const { keys } = await tempKeysFromSignature(s);
   const temp = await openTemp(keys, ENDPOINTS, log);
   try {
     const coins = await temp.coins();
     const balance = await temp.balance(t.colour);
     const minted = (s.deposit?.completeTx as Any)?.mintedCoin;
-    s.tempCheck = {
+    const check = {
       atUtc: nowUtc(),
       syncSeconds: secs(temp.syncMs),
       colour: t.colour,
       balance: balance.toString(),
-      expected: need(s.amount, 'amount'),
+      expected: expected.toString(),
       availableCoins: coins,
       mintedCoinSeen: minted ? coins.some((c) => c.nonce === strip0x(minted.nonce) && c.value === minted.value) : null,
-      pass: balance === BigInt(need(s.amount, 'amount')),
+      pass: balance === expected && (!final || coins.length === 0),
     };
+    if (final) s.finalCheck = check;
+    else s.tempCheck = check;
     saveState(s);
-    saveEvidence('b2-5-temp-check.json', { step: 'B.2.5', tempCheck: s.tempCheck });
-    log(toJson(s.tempCheck));
-    if (!s.tempCheck.pass) throw new Error('B.2.5 FAILED: the temporary wallet does not hold the minted coin');
+    saveEvidence(final ? 'b3-5-temp-final.json' : 'b2-5-temp-check.json', {
+      step: final ? 'B.3 (after)' : 'B.2.5',
+      [final ? 'finalCheck' : 'tempCheck']: check,
+    });
+    log(toJson(check));
+    if (!check.pass) throw new Error(`temp-check FAILED: the temporary wallet holds ${balance}, expected ${expected}`);
   } finally {
     await temp.stop();
     keys.clear();
@@ -1032,6 +1042,74 @@ async function cmdWithdrawComplete() {
   }
 }
 
+// ── B.4 summary ───────────────────────────────────────────────────────────────
+
+/** B.4: timings, DUST per leg, Sepolia gas and the ETH stranded at the deposit address, from the state. */
+async function cmdSummary() {
+  const s = loadState();
+  const d = need(s.deposit, 'deposit') as Any;
+  const w = need(s.withdraw, 'withdraw') as Any;
+  const f = need(s.fund, 'fund') as Any;
+  const stage = (rec: Any, name: string) =>
+    (rec.relay as Any[] | undefined)?.find((r) => r.stage === name)?.atUtc ?? null;
+  const wei = (v: unknown) => BigInt(String(v ?? '0'));
+  const userFees = wei(f.erc20Tx.feeWei) + wei(f.ethTx.feeWei);
+  const sweepSent = wei(f.ethTx.wei);
+  const out = {
+    step: 'B.4',
+    at: nowUtc(),
+    token: s.token,
+    amount: s.amount,
+    timings: {
+      fundSeconds: f.seconds,
+      depositStartSeconds: d.startTx?.seconds,
+      depositSignedAt: stage(d, 'signed'),
+      depositBroadcastAt: stage(d, 'broadcast'),
+      depositFinalizedAt: stage(d, 'finalized'),
+      depositAttestedAt: stage(d, 'attested'),
+      depositSignatureAfterS: d.relayResult?.signatureAfterS,
+      depositAttestationAfterS: d.relayResult?.attestationAfterS,
+      depositCompleteSeconds: d.completeTx?.seconds,
+      tempSyncSeconds: (s.tempCheck as Any)?.syncSeconds,
+      withdrawBuild: w.build,
+      withdrawSubmitSeconds: w.submitTx?.seconds,
+      withdrawSignedAt: stage(w, 'signed'),
+      withdrawBroadcastAt: stage(w, 'broadcast'),
+      withdrawFinalizedAt: stage(w, 'finalized'),
+      withdrawAttestedAt: stage(w, 'attested'),
+      withdrawSignatureAfterS: w.relayResult?.signatureAfterS,
+      withdrawAttestationAfterS: w.relayResult?.attestationAfterS,
+      withdrawCompleteSeconds: w.completeTx?.seconds,
+      fundToWithdrawCompleteSeconds:
+        f.atUtc && w.completeTx?.atUtc
+          ? secs(Date.parse(w.completeTx.atUtc) - Date.parse(f.atUtc) + f.seconds * 1000)
+          : null,
+    },
+    dustPerLeg: s.dust,
+    dustTotal: Object.values(s.dust ?? {})
+      .map(Number)
+      .reduce((a, b) => a + b, 0),
+    sepolia: {
+      userErc20TransferGas: f.erc20Tx.gasUsed,
+      userEthTransferGas: f.ethTx.gasUsed,
+      userFeesWei: userFees.toString(),
+      sweepEthSentWei: sweepSent.toString(),
+      userEthSpentWei: (userFees + sweepSent).toString(),
+      sweep: d.sweepReceipt,
+      strandedAtDepositAddressWei: String(d.sweepReceipt?.strandedWei ?? ''),
+      vaultTransfer: w.transferReceipt,
+    },
+    balances: {
+      userErc20BeforeWithdraw: w.destErc20Before,
+      userErc20AfterWithdraw: w.destErc20After ?? w.destErc20AfterTransfer,
+      userErc20Delta: w.destErc20Delta,
+      temporaryWalletFinal: (s.finalCheck as Any)?.balance ?? null,
+    },
+  };
+  saveEvidence('b4-summary.json', out);
+  log(toJson(out));
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 async function cmdStatus() {
@@ -1071,6 +1149,7 @@ const COMMANDS: Record<string, () => Promise<void>> = {
   'withdraw-build': cmdWithdrawBuild,
   'withdraw-submit': cmdWithdrawSubmit,
   'withdraw-complete': cmdWithdrawComplete,
+  summary: cmdSummary,
   status: cmdStatus,
 };
 

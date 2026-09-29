@@ -81,7 +81,7 @@ export async function openTemp(
   const unsub = opened.onProgress((p) => {
     if (Date.now() - last > 15_000) {
       last = Date.now();
-      log(`      temporary wallet sync: ${p.appliedIndex} / ${p.highestIndex}`);
+      log(`      temporary wallet sync: ${p.appliedIndex} / ${p.latestIndex}`);
     }
   });
   await Rx.firstValueFrom(

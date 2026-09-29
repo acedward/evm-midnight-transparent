@@ -13,6 +13,8 @@
 #   test/gates/bridge/run-gate.sh withdraw-submit           # Midnight spend: the sponsor adds DUST (locked)
 #   test/gates/bridge/run-gate.sh relay --kind withdraw
 #   test/gates/bridge/run-gate.sh withdraw-complete         # Midnight spend (the sponsor, locked)
+#   test/gates/bridge/run-gate.sh temp-check --final        # after the withdrawal: the temporary wallet is empty
+#   test/gates/bridge/run-gate.sh summary                   # B.4, from the state
 #   test/gates/bridge/run-gate.sh status
 #
 # Per step:
@@ -63,7 +65,7 @@ case "$CMD" in
   withdraw-build) NEEDS_PROOF=1; NEEDS_WALLET=0; NEEDS_SEPOLIA=1; SENDS_SEPOLIA=0 ;;
   derive|temp-check) NEEDS_PROOF=0; NEEDS_WALLET=0; NEEDS_SEPOLIA=1; SENDS_SEPOLIA=0 ;;
   fund) NEEDS_PROOF=0; NEEDS_WALLET=0; NEEDS_SEPOLIA=1; SENDS_SEPOLIA=1 ;;
-  preflight|relay|status) NEEDS_PROOF=0; NEEDS_WALLET=0; NEEDS_SEPOLIA=0; SENDS_SEPOLIA=0 ;;
+  preflight|relay|status|summary) NEEDS_PROOF=0; NEEDS_WALLET=0; NEEDS_SEPOLIA=0; SENDS_SEPOLIA=0 ;;
   *) echo "unknown command $CMD" >&2; exit 2 ;;
 esac
 

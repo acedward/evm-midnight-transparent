@@ -50,6 +50,8 @@ $G withdraw-build             # B.3.1: the temporary wallet builds, balances shi
 $G withdraw-submit            # B.3.2: the sponsor adds DUST and submits (locked)
 $G relay --kind withdraw      # B.3.3: the MPC transfer to the user
 $G withdraw-complete          # B.3.4: the sponsor (locked)
+$G temp-check --final        # after: the temporary wallet holds nothing
+$G summary                    # B.4: timings, DUST per leg, gas, stranded ETH (from the state)
 $G status
 ```
 
