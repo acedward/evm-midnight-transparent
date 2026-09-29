@@ -2,6 +2,8 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    projects: ['packages/core', 'packages/wallet', 'sponsor', 'web'],
+    name: 'wallet',
+    environment: 'node',
+    include: ['test/**/*.test.ts'],
   },
 });

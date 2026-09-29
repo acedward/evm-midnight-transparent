@@ -9,4 +9,6 @@ export * from './hex.js';
 export * from './market/index.js';
 export * from './network.js';
 export * from './shielded-address.js';
+export * from './swap-key.js';
 export * from './tokens/registry.js';
+export * from './unshielded-address.js';
