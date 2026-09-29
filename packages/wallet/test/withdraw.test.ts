@@ -10,6 +10,7 @@ import {
   dustSpendCount,
   finalizeWithdraw,
   jsonRpcRequest,
+  parseWithdrawParams,
   provenFromHex,
   readVaultEvmNonce,
   shieldedImbalances,
@@ -66,6 +67,7 @@ describe('buildWithdraw: the temporary wallet builds startWithdraw on the vault 
       vault: VAULT,
       singleton: SINGLETON,
     });
+    expect(draft.coinNonce).toMatch(/^[0-9a-f]{64}$/);
     // One block for everything: the vault's state and Zswap tree, then the callee's state.
     expect(reader.calls).toEqual(['block', `zswap+contract:${VAULT}`, `contract:${SINGLETON}`]);
     await draft.release();
@@ -101,6 +103,27 @@ describe('buildWithdraw: the temporary wallet builds startWithdraw on the vault 
     await wallet.close();
   });
 
+  it("takes the sponsor's withdraw-params as they come", async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: B31.amount }]);
+    const params = parseWithdrawParams(
+      {
+        kind: 'swap',
+        colour: WSTKA,
+        amount: '1000000',
+        erc20Address: STKA_ERC20,
+        dest: B31.dest,
+        refundRecipient: { left: wallet.coinPk },
+        gas: { gasLimit: '100000', maxFeePerGas: '10000000000', maxPriorityFeePerGas: '1000000000', keyVersion: '1' },
+        evmNonce: '9',
+      },
+      'swap',
+    );
+    const draft = await buildWithdraw(wallet, params, { reader: fixtureReader(VAULT_AT_679357) });
+    expect(draft.requestId).toBe(B31.requestId);
+    await draft.release();
+    await wallet.close();
+  });
+
   it('keeps the change when it withdraws part of a coin', async () => {
     const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: 5_000_000n }]);
     const draft = await buildWithdraw(
@@ -126,6 +149,8 @@ describe('buildWithdraw: the temporary wallet builds startWithdraw on the vault 
       [{ dest: '0x1234' }, 'bad-input'],
       [{ dest: `0x${'0'.repeat(40)}` }, 'bad-input'],
       [{ evmNonce: -1n }, 'bad-input'],
+      [{ erc20Address: '0x0000000000000000000000000000000000000001' } as never, 'bad-input'],
+      [{ refundRecipient: 'ab'.repeat(32) } as never, 'bad-input'],
     ];
     for (const [change, code] of cases) {
       await expect(buildWithdraw(wallet, { ...base, ...change }, { reader }), code).rejects.toMatchObject({ code });

@@ -1,20 +1,27 @@
-// The two sponsor calls the wallet makes (plan "Lane contracts", the sponsor API 4 and 5), with the
-// swap's bearer token:
+// The sponsor calls the wallet makes (plan "Lane contracts": the sponsor API 4 and 5, and L-SPONSOR's
+// answer 7-10), with the swap's bearer token:
 //
-//   POST {base}/v1/swaps/:id/prove     {purpose: "take" | "withdraw", tx: <unproven hex>} → {tx: <proven hex>}
-//   POST {base}/v1/swaps/:id/withdraw  {tx: <proven, bound startWithdraw hex>}           → {swap: SwapView}
+//   GET  {base}/v1/swaps/:id/withdraw-params?kind=swap|bridge-back   → what startWithdraw needs but the coin
+//   POST {base}/v1/swaps/:id/prove    {purpose: "take", tx}                            → {tx: <proven hex>}
+//                                     {purpose: "withdraw", tx, coinNonce, evmNonce}   → {tx: <proven hex>}
+//   POST {base}/v1/swaps/:id/withdraw {tx: <proven, BOUND startWithdraw hex>}          → 202 {swap}
+//   POST {base}/v1/swaps/:id/take     {outcome: "taken", takeTx} | {outcome: "not-available"}
 //
-// The sponsor proves with ITS proof server and key directory, so the browser downloads no key
-// material; the proof request carries the temporary wallet's spend witnesses to our own server
-// (spec Q3 A). Errors are core's `ApiError` (`{error: {code, message, detail?}}`).
+// `tx` sent to `/prove` is the unproven transaction's hex; the answer is the proven, pre-binding one
+// (`finalizeTake` / `finalizeWithdraw` bind it). The sponsor proves with ITS proof server and key
+// directory, so the browser downloads no key material; the proof request carries the temporary
+// wallet's spend witnesses to our own server (spec Q3 A). Errors are core's `ApiError`
+// (`{error: {code, message, detail?}}`): `stale-vault-state` and `stale-evm-nonce` (409) mean
+// "rebuild the withdrawal and prove again".
 // The swap token is a bearer credential: it lives in memory only, like the key.
 
-import { type ApiError, ApiErrorSchema } from '@evm-midnight-transparent/core';
+import { type ApiError, ApiErrorSchema, type EvmGasPolicy } from '@evm-midnight-transparent/core';
 
-import { type UnprovenTx, provenUnboundFromHex, txToHex } from './tx.js';
 import { type ProvingService } from './prover.js';
+import { type UnprovenTx, provenUnboundFromHex, txToHex } from './tx.js';
 
 export type ProvePurpose = 'take' | 'withdraw';
+export type WithdrawKind = 'swap' | 'bridge-back';
 
 export class SponsorApiError extends Error {
   override name = 'SponsorApiError';
@@ -25,6 +32,11 @@ export class SponsorApiError extends Error {
     readonly detail?: string,
   ) {
     super(message);
+  }
+
+  /** The withdrawal must be rebuilt on fresh state and proven again. */
+  get rebuild(): boolean {
+    return this.code === 'stale-vault-state' || this.code === 'stale-evm-nonce';
   }
 }
 
@@ -40,14 +52,41 @@ export interface SponsorClientOptions {
   timeoutMs?: number;
 }
 
+/** The sponsor's `withdraw-params`, typed: `buildWithdraw` takes it as its input. */
+export interface WithdrawParams {
+  kind: WithdrawKind;
+  colour: string;
+  amount: bigint;
+  erc20Address: string;
+  dest: string;
+  refundRecipient: string;
+  gas: EvmGasPolicy;
+  evmNonce: bigint;
+}
+
+/** `/prove`'s withdraw hints: public values the sponsor rebuilds the call from. */
+export interface WithdrawHints {
+  /** The nonce of the coin the call hands to the vault (`WithdrawDraft.coinNonce`), 64 hex. */
+  coinNonce: string;
+  evmNonce: bigint;
+}
+
+export type TakeReport = { outcome: 'taken'; takeTx: string } | { outcome: 'not-available' };
+
 export interface SponsorClient {
-  /** `/prove`: the proven transaction, hex (normally pre-binding; `finalizeTake`/`finalizeWithdraw` bind it). */
-  prove(purpose: ProvePurpose, unprovenHex: string): Promise<string>;
+  /** `/prove`: the proven transaction, hex (normally pre-binding; `finalizeTake`/`finalizeWithdraw` bind it).
+   *  `withdraw` needs `hints`. */
+  prove(purpose: ProvePurpose, unprovenHex: string, hints?: WithdrawHints): Promise<string>;
   /** `/withdraw`: the sponsor adds DUST and submits in its withdrawal lane. Returns its answer (`{swap}`). */
   withdraw(finalizedHex: string): Promise<unknown>;
+  /** `withdraw-params`: the colour, amount, destination, gas and the lane's EVM nonce. */
+  withdrawParams(kind: WithdrawKind): Promise<WithdrawParams>;
+  /** `/take`: tell the sponsor how the take ended. */
+  reportTake(report: TakeReport): Promise<unknown>;
 }
 
 const HEX = /^[0-9a-f]+$/;
+const DECIMAL = /^[0-9]{1,40}$/;
 
 function parseJson(text: string): unknown {
   if (text === '') return undefined;
@@ -56,6 +95,50 @@ function parseJson(text: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+const bad = (message: string) => new SponsorApiError(200, 'bad-response', message);
+
+function big(v: unknown, label: string): bigint {
+  if (typeof v === 'bigint') return v;
+  if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
+  if (typeof v === 'string' && DECIMAL.test(v)) return BigInt(v);
+  throw bad(`withdraw-params: ${label} is not a whole number`);
+}
+
+function str(v: unknown, label: string, re: RegExp): string {
+  if (typeof v !== 'string' || !re.test(v)) throw bad(`withdraw-params: ${label} is malformed`);
+  return v;
+}
+
+/** Parse the sponsor's `withdraw-params` answer (whole numbers as decimal strings or numbers). */
+export function parseWithdrawParams(raw: unknown, kind: WithdrawKind): WithdrawParams {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const g = (o.gas ?? {}) as Record<string, unknown>;
+  const hex64 = /^(0x)?[0-9a-fA-F]{64}$/;
+  const evm = /^0x[0-9a-fA-F]{40}$/;
+  const refund = o.refundRecipient;
+  const refundHex =
+    typeof refund === 'object' && refund !== null && 'left' in refund
+      ? String((refund as { left: unknown }).left)
+      : String(refund ?? '');
+  const k = o.kind === undefined ? kind : o.kind;
+  if (k !== kind) throw bad(`withdraw-params: asked for ${kind}, got ${String(k)}`);
+  return {
+    kind,
+    colour: str(o.colour, 'colour', hex64).replace(/^0x/, '').toLowerCase(),
+    amount: big(o.amount, 'amount'),
+    erc20Address: str(o.erc20Address, 'erc20Address', evm),
+    dest: str(o.dest, 'dest', evm),
+    refundRecipient: str(refundHex, 'refundRecipient', hex64).replace(/^0x/, '').toLowerCase(),
+    gas: {
+      gasLimit: big(g.gasLimit, 'gas.gasLimit'),
+      maxFeePerGas: big(g.maxFeePerGas, 'gas.maxFeePerGas'),
+      maxPriorityFeePerGas: big(g.maxPriorityFeePerGas, 'gas.maxPriorityFeePerGas'),
+      keyVersion: big(g.keyVersion, 'gas.keyVersion'),
+    },
+    evmNonce: big(o.evmNonce, 'evmNonce'),
+  };
 }
 
 export function sponsorClient(o: SponsorClientOptions): SponsorClient {
@@ -67,11 +150,14 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
   const timeoutMs = o.timeoutMs ?? 600_000;
   const url = (tail: string) => `${base}/v1/swaps/${encodeURIComponent(o.swapId.toLowerCase())}/${tail}`;
 
-  async function post(tail: string, body: unknown): Promise<unknown> {
+  async function call(method: 'GET' | 'POST', tail: string, body?: unknown): Promise<unknown> {
     const res = await f(url(tail), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${o.swapToken}` },
-      body: JSON.stringify(body),
+      method,
+      headers: {
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        authorization: `Bearer ${o.swapToken}`,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
@@ -93,20 +179,41 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
   };
 
   return {
-    async prove(purpose, unprovenHex) {
-      const out = (await post('prove', { purpose, tx: hexOf(unprovenHex, 'transaction') })) as
-        { tx?: unknown } | undefined;
-      if (!out || typeof out.tx !== 'string')
-        throw new SponsorApiError(200, 'bad-response', 'the sponsor returned no transaction');
+    async prove(purpose, unprovenHex, hints) {
+      const body: Record<string, unknown> = { purpose, tx: hexOf(unprovenHex, 'transaction') };
+      if (purpose === 'withdraw') {
+        if (!hints) throw new SponsorApiError(0, 'bad-request', 'a withdrawal proof needs the coin and EVM nonces');
+        const coinNonce = hexOf(hints.coinNonce, 'coin nonce');
+        if (coinNonce.length !== 64) throw new SponsorApiError(0, 'bad-request', 'the coin nonce must be 32 bytes');
+        body.coinNonce = coinNonce;
+        body.evmNonce = hints.evmNonce.toString(10);
+      }
+      const out = (await call('POST', 'prove', body)) as { tx?: unknown } | undefined;
+      if (!out || typeof out.tx !== 'string') throw bad('the sponsor returned no transaction');
       return hexOf(out.tx, 'proven transaction');
     },
     async withdraw(finalizedHex) {
-      return post('withdraw', { tx: hexOf(finalizedHex, 'transaction') });
+      return call('POST', 'withdraw', { tx: hexOf(finalizedHex, 'transaction') });
+    },
+    async withdrawParams(kind) {
+      return parseWithdrawParams(await call('GET', `withdraw-params?kind=${kind}`), kind);
+    },
+    async reportTake(report) {
+      if (report.outcome === 'taken' && !/^(0x)?[0-9a-fA-F]{64}$/.test(report.takeTx)) {
+        throw new SponsorApiError(0, 'bad-request', 'the take transaction hash must be 32 bytes of hex');
+      }
+      return call(
+        'POST',
+        'take',
+        report.outcome === 'taken'
+          ? { outcome: 'taken', takeTx: report.takeTx.replace(/^0x/, '').toLowerCase() }
+          : { outcome: 'not-available' },
+      );
     },
   };
 }
 
-/** A `ProvingService` over the sponsor's `/prove` (for code written against the SDK's proving service). */
-export function sponsorProvingService(client: SponsorClient, purpose: ProvePurpose): ProvingService {
+/** A `ProvingService` over the sponsor's `/prove` for takes (code written against the SDK's service). */
+export function sponsorProvingService(client: SponsorClient, purpose: 'take'): ProvingService {
   return { prove: async (tx: UnprovenTx) => provenUnboundFromHex(await client.prove(purpose, txToHex(tx))) };
 }

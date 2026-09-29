@@ -26,6 +26,7 @@ import {
   type EvmGasPolicy,
   registryFor,
   type TokenRegistry,
+  bytesToHex,
   hexToBytes,
   walletRecipient,
 } from '@evm-midnight-transparent/core';
@@ -162,10 +163,16 @@ export interface WithdrawInput {
   amount: bigint;
   /** The Sepolia address that receives the ERC20 (the connected EVM account). */
   dest: string;
-  /** The vault EVM account's pending nonce, read right before building (`readVaultEvmNonce`). */
+  /** The vault EVM account's pending nonce: the sponsor's `withdraw-params` (it holds the withdrawal
+   *  lane), or `readVaultEvmNonce` right before building. */
   evmNonce: bigint;
-  /** The MPC-signed transfer's gas (default: core's DEFAULT_EVM_GAS, the G-BRIDGE values). */
+  /** The MPC-signed transfer's gas (default: core's DEFAULT_EVM_GAS, the G-BRIDGE values and the
+   *  sponsor's policy). */
   gas?: EvmGasPolicy;
+  /** Cross-checks of the sponsor's `withdraw-params`, when given: the ERC20 must be the registry's for
+   *  `colour`, and the refund recipient must be this wallet's coin public key. */
+  erc20Address?: string;
+  refundRecipient?: string;
 }
 
 export interface WithdrawDeps {
@@ -179,6 +186,8 @@ export interface WithdrawDraft {
   /** The merged unproven `startWithdraw` (the call and the wallet's shielded balancing), hex: what
    *  `/prove` receives for `purpose: "withdraw"`. */
   readonly tx: string;
+  /** The nonce of the coin the call hands to the vault (random, 64 hex): `/prove`'s `coinNonce` hint. */
+  readonly coinNonce: string;
   /** The request this call creates (the vault's `withdrawEventMap` key), 64 hex. */
   readonly requestId: string;
   readonly requestNonce: bigint;
@@ -252,6 +261,12 @@ export async function buildWithdraw(
   const token = registry.byColour(input.colour);
   if (!token || !registry.isBridgeable(token.midnightColour) || norm(token.vault) !== vault) {
     throw new WithdrawError('unknown-token', `${input.colour} is not a token this vault bridges`);
+  }
+  if (input.erc20Address !== undefined && input.erc20Address.toLowerCase() !== token.sepoliaAddress.toLowerCase()) {
+    throw new WithdrawError('bad-input', `the ERC20 ${input.erc20Address} is not ${token.symbol}'s`);
+  }
+  if (input.refundRecipient !== undefined && norm(input.refundRecipient) !== norm(keys.coinPublicKey)) {
+    throw new WithdrawError('bad-input', "the refund recipient is not this wallet's coin public key");
   }
   const held = (await opened.balances())[token.midnightColour] ?? 0n;
   if (held < input.amount) {
@@ -334,6 +349,7 @@ export async function buildWithdraw(
     assertWithdrawShape(merged, vault, singleton);
     return {
       tx: txToHex(merged),
+      coinNonce: bytesToHex(coinNonce),
       requestId: ours[0]!,
       requestNonce,
       colour: token.midnightColour,
