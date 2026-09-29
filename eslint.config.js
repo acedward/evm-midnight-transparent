@@ -14,6 +14,7 @@ export default defineConfig([
     'playwright-report/**',
     'test-results/**',
     'packages/core/src/vendor/**',
+    'sponsor/src/bridge/vendor/relayer.ts',
   ]),
   js.configs.recommended,
   tseslint.configs.recommended,

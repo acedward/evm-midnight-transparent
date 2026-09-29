@@ -7,6 +7,8 @@ bun.lock
 # Vendored byte-for-byte from acedward/passport; never reformat
 packages/core/src/tokens/deployments/*.json
 packages/core/src/vendor/
+# Vendored byte-for-byte from the vault (acedward/passport PR #4); a test checks its sha256
+sponsor/src/bridge/vendor/relayer.ts
 # Prose and tables are formatted by hand
 *.md
 # Kernel responses captured verbatim from the staging exchange; never reformat
