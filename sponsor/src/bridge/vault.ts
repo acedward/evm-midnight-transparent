@@ -20,9 +20,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import type { OpenedWallet } from '../sponsor/facade.js';
+import { depositPathOf, hexToBytes, walletRecipient } from '@evm-midnight-transparent/core';
 
-import { hexBytes } from './deposit-address.js';
+import type { OpenedWallet } from '../sponsor/facade.js';
 
 // ── Types kept loose on purpose: the SDK's types are deep generics; the gate proves the shapes ──
 
@@ -284,7 +284,6 @@ export async function startDeposit(
   vault: string,
   input: { evmNonce: bigint; gas: EvmGas; erc20: string; amount: bigint; recipientCoinPublicKeyHex: string },
 ): Promise<CallOutcome & { requestId: string; requestNonce: bigint }> {
-  const { walletRecipient, depositPathOf } = await import('./deposit-address.js');
   const recipient = walletRecipient(input.recipientCoinPublicKeyHex);
   const out = await callVault(providers, rt, vault, 'startDeposit', [
     input.evmNonce,
@@ -292,7 +291,7 @@ export async function startDeposit(
     input.gas.maxFeePerGas,
     input.gas.maxPriorityFeePerGas,
     input.gas.keyVersion,
-    hexBytes(input.erc20, 20),
+    hexToBytes(input.erc20, 20),
     input.amount,
     recipient,
   ]);
@@ -334,7 +333,7 @@ export async function settle(
     rt,
     vault,
     circuitId,
-    [hexBytes(input.requestId, 32), input.event, input.serializedOutput, randomMintNonce()],
+    [hexToBytes(input.requestId, 32), input.event, input.serializedOutput, randomMintNonce()],
     {
       additionalCoinEncPublicKeyMappings: encryptionKeyMapping(
         input.recipientCoinPublicKeyHex,

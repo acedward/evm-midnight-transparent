@@ -5,6 +5,7 @@ export * from './api.js';
 export * from './auth.js';
 export * from './batcher.js';
 export * from './bridge.js';
+export * from './deposit-address.js';
 export * from './hex.js';
 export * from './market/index.js';
 export * from './network.js';

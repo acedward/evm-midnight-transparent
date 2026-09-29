@@ -21,7 +21,7 @@ The two mechanisms it proves:
 | `gate.ts` | The live driver: one command per step, state outside the repository, resumable by request id. |
 | `temp-wallet.ts` | The temporary wallet as the gate drives it: T.1's derivation (`deriveSwapSeed`, `temporaryWalletKeys`), the shielded-only wallet (`openShieldedWallet`), and its `startWithdraw` builder (L-WALLET moves it into `packages/wallet`). |
 | `run-gate.sh` | The Docker wrapper: the code from the `docker-check.sh` volume, the pinned proof server, the shared funding-wallet lock, read-only secret mounts. |
-| `../../../sponsor/src/bridge/` | The reusable parts: `vault.ts` (the vault runtime, the sponsor's legs, the DUST top-up), `deposit-address.ts` (the deposit address computed offline), `vendor/relayer.ts` (the vault's relayer, verbatim) and `vendor/signet-sdk.ts`. |
+| `../../../sponsor/src/bridge/` | The reusable parts: `vault.ts` (the vault runtime, the sponsor's legs, the DUST top-up), `vendor/relayer.ts` (the vault's relayer, verbatim) and `vendor/signet-sdk.ts`. The deposit address computed offline is `packages/core/src/deposit-address.ts` (moved there by L-WALLET). |
 
 ## Inputs
 
