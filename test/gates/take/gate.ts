@@ -119,6 +119,8 @@ interface GateState {
   /** The one offer this gate funds and takes. */
   offerId?: string;
   fundingTx?: { identifier: string; hash?: string };
+  /** Funding attempts that never reached the chain (checked again before every new attempt). */
+  abandonedFunding?: { identifier: string; reason: string }[];
   takeTx?: string;
 }
 function loadState(): GateState {
@@ -247,8 +249,8 @@ async function gql(query: string, variables: Record<string, unknown>): Promise<a
   return r.body.data;
 }
 
-const TX_FIELDS = `hash identifiers block { height timestamp }
-  ... on RegularTransaction { fee transactionResult { status } }`;
+const TX_FIELDS = `hash block { height timestamp }
+  ... on RegularTransaction { identifiers fee transactionResult { status } }`;
 
 async function txBy(offset: { hash?: string; identifier?: string }, timeoutMs = 300_000): Promise<any> {
   const deadline = Date.now() + timeoutMs;
@@ -271,6 +273,13 @@ async function cmdFund(offerId: string): Promise<void> {
     throw new Error(`this gate already funded offer ${state.offerId}; one offer per gate`);
   }
   if (state.fundingTx) throw new Error('the temporary wallet was already funded; refusing to fund twice');
+  for (const a of state.abandonedFunding ?? []) {
+    const landed = await gql(`query($o: TransactionOffset!) { transactions(offset: $o) { hash } }`, {
+      o: { identifier: a.identifier },
+    });
+    if ((landed?.transactions ?? []).length > 0)
+      throw new Error(`an abandoned funding attempt landed: ${a.identifier}`);
+  }
   const d = await deriveTemporaryWallet();
   if (!d.deterministic) throw new Error('the test signer is not deterministic');
   const status = await offerStatus(offerId);
@@ -296,7 +305,7 @@ async function cmdFund(offerId: string): Promise<void> {
     },
     { feeBlocksMargin: FEE_BLOCKS_MARGIN },
   );
-  const h = opened.handle as { wallet: any; shieldedSecretKeys: any; dustSecretKey: any };
+  const h = opened.handle as { wallet: any; shieldedSecretKeys: any; dustSecretKey: any; unshieldedKeystore: any };
   try {
     const synced = await h.wallet.waitForSyncedState();
     const syncSeconds = secondsSince(t0);
@@ -307,24 +316,44 @@ async function cmdFund(offerId: string): Promise<void> {
     say('funding wallet synced', { seconds: syncSeconds, holds: before.colour, dustSpecks: before.dust });
     if (before.colour < leg.amount) throw new Error('the funding wallet does not hold the wanted amount');
 
-    const { MidnightBech32m, ShieldedAddress } = await import('@midnightntwrk/wallet-sdk-address-format');
-    const receiver = MidnightBech32m.parse(d.keys.shieldedAddress).decode(ShieldedAddress, NETWORK_ID as never);
+    // Built from the two public keys, not parsed: the SDK's `MidnightBech32m.parse` refuses a shielded
+    // address (133 characters) under @scure/base 2.4's default 90-character bech32 limit.
+    const { ShieldedAddress, ShieldedCoinPublicKey, ShieldedEncryptionPublicKey } =
+      await import('@midnightntwrk/wallet-sdk-address-format');
+    const receiver = new ShieldedAddress(
+      ShieldedCoinPublicKey.fromHexString(d.keys.coinPublicKey),
+      ShieldedEncryptionPublicKey.fromHexString(d.keys.encryptionPublicKey),
+    );
     const ttl = new Date(Date.now() + 30 * 60_000);
     const recipe = await h.wallet.transferTransaction(
       [{ type: 'shielded', outputs: [{ type: leg.colour, receiverAddress: receiver, amount: leg.amount }] }],
       { shieldedSecretKeys: h.shieldedSecretKeys, dustSecretKey: h.dustSecretKey },
       { ttl, payFees: true },
     );
+    // Sign (a no-op for a shielded transfer, kept for parity with the funding tools), then prove.
+    const signed = await h.wallet.signRecipe(recipe, async (data: Uint8Array) => h.unshieldedKeystore.signData(data));
     const t1 = performance.now();
-    const finalized = await h.wallet.finalizeRecipe(recipe);
+    const finalized = await h.wallet.finalizeRecipe(signed);
     const provingSeconds = secondsSince(t1);
-    const t2 = performance.now();
-    const identifier = String(await h.wallet.submitTransaction(finalized));
+    const identifier = String(finalized.identifiers().at(-1));
     state.offerId = offerId;
     state.fundingTx = { identifier };
     saveState(state);
-    say('funding transaction submitted', { identifier, provingSeconds });
-    const tx = await txBy({ identifier });
+    say('funding transaction proven; submitting', { identifier, provingSeconds });
+    const t2 = performance.now();
+    // The node's Finalized notice can go missing although the transaction is included (the ladder
+    // tools' P12 note): whichever comes first, the submission or the indexer's record, wins.
+    const submitted: Promise<unknown> = h.wallet.submitTransaction(finalized);
+    const viaSubmit = submitted.then(() => txBy({ identifier }));
+    // The indexer branch can only resolve: a failed lookup never ends the race early.
+    const viaIndexer = txBy({ identifier }, 15 * 60_000).catch(() => new Promise<never>(() => undefined));
+    let tx: any;
+    try {
+      tx = await Promise.race([viaSubmit, viaIndexer]);
+    } catch (e) {
+      writeEvidence('t2-fund-refused', { offerId, identifier, error: errorChain(e) });
+      throw new Error(`REFUSED: the node refused the funding transfer: ${errorChain(e)}`, { cause: e });
+    }
     const submitSeconds = secondsSince(t2);
     state.fundingTx.hash = String(tx.hash);
     saveState(state);
@@ -384,7 +413,7 @@ async function openTemporary(d: Derived) {
   const unsub = w.onProgress((p) => {
     if (performance.now() - last > 15_000) {
       last = performance.now();
-      say('sync', { appliedIndex: p.appliedIndex, highestIndex: p.highestIndex });
+      say('sync', { appliedIndex: p.appliedIndex, latestIndex: p.latestIndex });
     }
   });
   await w.waitSynced();
@@ -552,7 +581,7 @@ async function cmdMeasureSync(): Promise<void> {
     runtime: `bun ${process.versions.bun ?? '?'}`,
     freshSeedSyncSeconds: seconds,
     appliedIndex: Number(s.progress.appliedIndex),
-    highestIndex: Number(s.progress.highestIndex),
+    latestIndex: Number(s.progress.highestRelevantWalletIndex),
   };
   writeEvidence('t4-fresh-sync-bun', result);
   say('T.4 fresh-seed sync', result);
