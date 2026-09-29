@@ -75,6 +75,20 @@ export const askRow = (page: Page) =>
 
 export const stage = (page: Page, key: string) => page.locator(`[data-testid=swap-stage][data-stage=${key}]`);
 
+/** The mock sponsor's step time: a long one freezes the swap where it is (for layout checks on a
+ *  slow machine), a short one lets it run on. */
+export const setMockStep = (page: Page, ms: number) =>
+  page.evaluate(
+    (m) => (window as unknown as { __emtMock: { setStepMs(ms: number): void } }).__emtMock.setStepMs(m),
+    ms,
+  );
+
+/** Wait until the bridge-in shows at least `n` of the sponsor's stages. */
+export const bridgeInStagesAtLeast = (page: Page, n: number) =>
+  expect
+    .poll(() => page.getByTestId('bridge-in-stages').locator('li').count(), { timeout: 15_000 })
+    .toBeGreaterThanOrEqual(n);
+
 /** Open the review of the 1.04 USDC → 100 stkA offer and start the swap: to the funding step. */
 export async function startAskSwap(page: Page): Promise<void> {
   await expect(page.getByTestId('feed-status')).toHaveAttribute('data-status', 'ready');

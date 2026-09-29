@@ -15,7 +15,9 @@ import { getAddress } from 'ethers';
 
 import {
   USDC,
+  bridgeInStagesAtLeast,
   connect,
+  setMockStep,
   fundSwap,
   richWallet,
   serveApp,
@@ -34,7 +36,7 @@ const transfer = (to: string, amount: bigint) =>
 test('the whole swap (happy path), with every stage and hash', async ({ page }) => {
   const external = watchExternal(page);
   const wallet = await withWallet(page);
-  await serveApp(page);
+  await serveApp(page, { stepMs: 400 });
   await page.goto('/#swap');
   await connect(page);
   await startAskSwap(page);
@@ -60,9 +62,12 @@ test('the whole swap (happy path), with every stage and hash', async ({ page }) 
   await expect(page.getByTestId('funding-eth')).toContainText('0.0001625 ETH');
   await expect(page.getByTestId('funding-token')).toContainText('confirmed');
 
-  // Stage 3: bridge-in, its estimate and its stages.
+  // Stage 3: bridge-in, its estimate and its stages (the mock clock held while it is checked).
+  await expect(page.getByTestId('swap-page')).toHaveAttribute('data-phase', 'bridging-in');
+  await setMockStep(page, 600_000);
   await expect(stage(page, 'bridge-in')).toHaveAttribute('data-state', 'current');
   await expect(stage(page, 'bridge-in')).toContainText('About 18 minutes');
+  await setMockStep(page, 100);
   await expect(page.getByTestId('bridge-in-stages').locator('li')).toHaveCount(7);
 
   // Stages 4–6: take, bridge out, done.
@@ -176,7 +181,7 @@ test('resume: the tab closes mid-bridge-in; a new tab signs once and finishes th
   await startAskSwap(first);
   await fundSwap(first);
   await expect(first.getByTestId('swap-page')).toHaveAttribute('data-phase', 'bridging-in');
-  await expect(first.getByTestId('bridge-in-stages').locator('li')).toHaveCount(2);
+  await bridgeInStagesAtLeast(first, 2);
   await first.close({ runBeforeUnload: false });
 
   // A new tab, the same wallet: the swap is in Your swaps, not running.

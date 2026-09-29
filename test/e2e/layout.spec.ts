@@ -8,9 +8,11 @@ import { expect, test, type Page } from '@playwright/test';
 import {
   assertContrast,
   assertLayout,
+  bridgeInStagesAtLeast,
   connect,
   fundSwap,
   serveApp,
+  setMockStep,
   shot,
   stage,
   startAskSwap,
@@ -50,8 +52,11 @@ for (const vp of VIEWPORTS) {
       await expect(page.getByTestId('send-funds')).toBeVisible();
       await check(page, vp.touch, `${vp.name}-swap-fund`);
       await fundSwap(page);
-      await expect(page.getByTestId('bridge-in-stages').locator('li')).toHaveCount(4);
+      await bridgeInStagesAtLeast(page, 3);
+      await setMockStep(page, 600_000); // hold the swap mid-bridge-in while the page is checked
+      await expect(page.getByTestId('swap-page')).toHaveAttribute('data-phase', 'bridging-in');
       await check(page, vp.touch, `${vp.name}-swap-bridging-in`);
+      await setMockStep(page, 100);
       await expect(page.getByTestId('swap-page')).toHaveAttribute('data-phase', 'done', { timeout: 40_000 });
       await check(page, vp.touch, `${vp.name}-swap-done`);
 
