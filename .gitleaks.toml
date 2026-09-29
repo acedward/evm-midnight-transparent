@@ -72,3 +72,12 @@ condition = "AND"
 paths = ['''(^|/)packages/wallet/src/vendor/vault/Erc20Vault/contract/index\.js$''']
 regexTarget = "match"
 regexes = ['''^publishTokenMetadata': '[0-9a-f]{64}'$''']
+
+# The test that pins that same map against the chain (packages/wallet/test/vendor-vault.test.ts):
+# the same PUBLIC verifier-key SHA-256, keyed by the circuit's name. Scoped to that rule, that file
+# AND that one entry's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/wallet/test/vendor-vault\.test\.ts$''']
+regexTarget = "match"
+regexes = ['''^publishTokenMetadata: '[0-9a-f]{64}'$''']
