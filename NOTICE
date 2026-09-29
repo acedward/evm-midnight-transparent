@@ -1,0 +1,18 @@
+evm-midnight-transparent
+Copyright 2026 Input Output Global, Inc.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software copied from MN Bank
+(https://github.com/acedward/passport-evm-dapp) at commit
+911647b685b5e5472490cb1d628b73ef4451c921, licensed under the Apache License, Version 2.0.
+It is a copy, not a fork: only the parts that do not depend on the Passport account contract
+were taken (network profiles, the token registry, amount maths, the exchange client, the bridge's
+wire types, the sponsor wallet and its service skeleton, the browser store, the wallet connection
+and the design system), then changed for this app. Later changes to MN Bank are ported by hand.
+
+This product includes deployment records and one pure helper of the witness-free ERC20 vault from
+https://github.com/acedward/passport at commit 6c7505a4d2ec223fce5eb10266c331576805465a
+(repository licensed under the Apache License, Version 2.0; the vault package is a fork of
+Sig Network's MIT-licensed midnight-examples erc20-vault). The copied files and their SHA-256
+values are listed in packages/core/src/tokens/deployments/PROVENANCE.md.
