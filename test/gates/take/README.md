@@ -15,7 +15,7 @@ fee. Result: PASS on 2026-09-29 (plan 00048, G-TAKE).
 | `browser-run.ts` | The T.5 driver: headless Chromium (the Playwright image) on the gate's network; shielded-only sync + one proof request to the proof server (CORS) |
 
 The reusable parts live in the packages: `packages/core/src/swap-key.ts` (the derivation spec) and
-`packages/wallet` (keys, the shielded-only wallet, server proving, `buildTake`, `ensureBufferGlobal`).
+`packages/wallet` (keys, the shielded-only wallet, server proving, `buildTakeWithProver` (named `buildTake` at the gate's run), `ensureBufferGlobal`).
 
 ## Running it
 

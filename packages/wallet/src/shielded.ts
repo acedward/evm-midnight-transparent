@@ -20,7 +20,7 @@ export interface ShieldedEndpoints {
 }
 
 /** No transaction history is kept: the swap record lives in the app's own local data. */
-const NoHistory = {
+export const NO_TX_HISTORY = {
   gotPending: async () => undefined,
   gotFinalized: async () => undefined,
   gotRejected: async () => undefined,
@@ -56,10 +56,15 @@ export async function openShieldedWallet(
   const configuration = {
     networkId: endpoints.networkId,
     indexerClientConnection: { indexerHttpUrl: endpoints.indexerUrl, indexerWsUrl: endpoints.indexerWsUrl },
-    txHistoryStorage: NoHistory,
+    txHistoryStorage: NO_TX_HISTORY,
   };
   const wallet = ShieldedWallet(configuration as never).startWithSecretKeys(secretKeys);
   await wallet.start(secretKeys);
+  return wrapShieldedWallet(wallet);
+}
+
+/** The helpers around an SDK shielded wallet (started, or restored from a state in tests). */
+export function wrapShieldedWallet(wallet: ShieldedWalletAPI): OpenedShieldedWallet {
   return {
     wallet,
     waitSynced: () => wallet.waitForSyncedState(),
