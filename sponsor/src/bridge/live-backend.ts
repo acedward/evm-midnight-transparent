@@ -12,7 +12,13 @@
 //   - the relayer options of test/gates/bridge/gate.ts `runRelay` (request paths [0] and [2], the
 //     vault's response key and schema, the MPC output cache).
 
-import type { NetworkProfile } from '@evm-midnight-transparent/core';
+import {
+  depositAddressFor,
+  depositPathOf,
+  hexToBytes,
+  walletRecipient,
+  type NetworkProfile,
+} from '@evm-midnight-transparent/core';
 
 import type { Logger } from '../log.js';
 import type { SponsorSession } from '../sponsor/session.js';
@@ -27,16 +33,14 @@ import type {
   SwapProver,
   WithdrawCallArgs,
 } from '../swaps/backend.js';
-import { summarise } from '../validate/inspect.js';
 import { jsonRpcEvmReader } from './evm.js';
-import { depositAddressFor, depositPathOf, hexBytes, walletRecipient } from './deposit-address.js';
+import { rebuildStartWithdraw } from './rebuild.js';
 import {
   addDustAndSubmit,
   callVault,
   loadVault,
   openRequests as vaultOpenRequests,
   publicDataProviderFor,
-  requestOfCall,
   settle as vaultSettle,
   sponsorWalletProvider,
   startDeposit as vaultStartDeposit,
@@ -78,12 +82,11 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   if (!b.vaultAddress || !b.vaultEvmAddress || !b.signetSingleton || !b.mpcRootPublicKey || !b.mpcOutputCacheUrl) {
     throw new BridgeConfigError('the network profile names no complete bridge (vault, singleton, MPC key, cache)');
   }
-  const [{ setNetworkId }, ledger, relayer, sdk, contracts, { streamingProver }] = await Promise.all([
+  const [{ setNetworkId }, ledger, relayer, sdk, { streamingProver }] = await Promise.all([
     import('@midnight-ntwrk/midnight-js-network-id'),
     import('@midnightntwrk/ledger-v9'),
     import('./vendor/relayer.js'),
     import('./vendor/signet-sdk.js'),
-    import('@midnight-ntwrk/midnight-js-contracts'),
     import('../prover/sponsor-prover.js'),
   ]);
   setNetworkId(o.network.midnightNetworkId as never);
@@ -112,7 +115,6 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   }
 
   const prover = await streamingProver(o.proofServerUrl, o.managedDir, { timeout: o.proofTimeoutMs, log: o.log });
-  const vaultPathHex = sdk.bytesToHex(rt.pureCircuits.vaultPath());
   const responseKey = sdk.deriveMidnightResponseKey(root as never, vault) as Any;
   const responseSchema: Uint8Array = rt.pureCircuits.vaultResponseSchema();
   const evm = jsonRpcEvmReader(o.evmRpcUrl);
@@ -251,7 +253,7 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
     abandonDeposit: (i) =>
       withProviders(async (providers) => {
         const out = await callVault(providers, rt, vault, 'abandonDeposit', [
-          hexBytes(i.requestId, 32),
+          hexToBytes(i.requestId, 32),
           i.attestation.event,
           i.attestation.serializedOutput,
         ]);
@@ -259,33 +261,8 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
       }),
 
     async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
-      const unsubmitted: Any = await (contracts.createUnprovenCallTx as Any)(
-        {
-          publicDataProvider: pdp,
-          zkConfigProvider: rt.zkConfigProvider,
-          walletProvider: { getCoinPublicKey: () => a.tempCoinPk, getEncryptionPublicKey: () => a.tempEncPk },
-        },
-        {
-          compiledContract: rt.compiledContract,
-          contractAddress: vault,
-          circuitId: 'startWithdraw',
-          args: [
-            a.evmNonce,
-            a.gas.gasLimit,
-            a.gas.maxFeePerGas,
-            a.gas.maxPriorityFeePerGas,
-            a.gas.keyVersion,
-            hexBytes(a.erc20, 20),
-            a.amount,
-            hexBytes(a.dest, 20),
-            { nonce: hexBytes(a.coinNonce, 32), color: hexBytes(a.colour, 32), value: a.amount },
-            walletRecipient(a.refundCoinPk),
-          ],
-        },
-      );
-      const s = summarise(unsubmitted.private.unprovenTx);
-      const req = await requestOfCall(rt, unsubmitted.public.nextContractState, 'withdraw', vaultPathHex);
-      return { calls: s.calls, callsDigest: s.callsDigest, requestId: req.requestId };
+      const r = await rebuildStartWithdraw({ compiledContract: rt.compiledContract, ledger: rt.ledger }, pdp, vault, a);
+      return { calls: r.calls, callsDigest: r.callsDigest, requestId: r.requestId };
     },
 
     submitWithdraw: (finalTx) =>

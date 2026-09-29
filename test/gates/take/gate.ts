@@ -36,7 +36,7 @@ import {
   type StartSwapSigner,
 } from '../../../packages/core/src/index.js';
 import {
-  buildTake,
+  buildTakeWithProver,
   decodeMakerTransaction,
   openShieldedWallet,
   serverProvingService,
@@ -450,7 +450,7 @@ async function cmdTake(offerId: string): Promise<void> {
       writeEvidence('t3-take-offer-gone', { offerId, status: statusBefore });
       throw new Error(`offer ${offerId} is ${statusBefore} before the take`);
     }
-    const build = await buildTake({
+    const build = await buildTakeWithProver({
       makerTx,
       wallet: w.wallet,
       secretKeys: d.keys.shieldedSecretKeys,

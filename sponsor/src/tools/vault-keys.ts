@@ -25,15 +25,9 @@ import {
   type NetworkOverrides,
 } from '@evm-midnight-transparent/core';
 
-import { hexBytes, walletRecipient } from '../bridge/deposit-address.js';
-import {
-  artefactFingerprints,
-  loadVault,
-  publicDataProviderFor,
-  requestOfCall,
-  verifyVaultKeys,
-} from '../bridge/vault.js';
-import { summarise } from '../validate/inspect.js';
+import { rebuildStartWithdraw } from '../bridge/rebuild.js';
+import { artefactFingerprints, loadVault, publicDataProviderFor, verifyVaultKeys } from '../bridge/vault.js';
+import type { WithdrawCallArgs } from '../swaps/backend.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Any = any;
@@ -93,63 +87,38 @@ async function verify(dir: string): Promise<boolean> {
 
 async function rebuildCheck(dir: string): Promise<boolean> {
   const { n, rt, pdp } = await open(dir);
-  const { createUnprovenCallTx } = await import('@midnight-ntwrk/midnight-js-contracts');
   const vault = n.bridge.vaultAddress;
-  const vaultPathHex = Buffer.from(rt.pureCircuits.vaultPath()).toString('hex');
   // stkA as the vault bridges it (the circuit asserts the coin's colour is the vault's for the ERC20).
   const token = stagenetRegistry().bySymbol('stkA')!;
-  const stkA = token.sepoliaAddress;
-  const colour = token.midnightColour;
-  const base = {
+  const base: WithdrawCallArgs = {
     evmNonce: 9n,
-    erc20: stkA,
+    gas: DEFAULT_EVM_GAS,
+    erc20: token.sepoliaAddress,
     amount: 1_000_000n,
     dest: '0x484738A67858305Edfc139B194Ed430Fe4D8e56b',
+    colour: token.midnightColour,
     coinNonce: '11'.repeat(32),
-    refund: '6ba8a1ae'.padEnd(64, '0'),
-    gasLimit: DEFAULT_EVM_GAS.gasLimit,
+    refundCoinPk: '6ba8a1ae'.padEnd(64, '0'),
+    tempCoinPk: '6ba8a1ae'.padEnd(64, '0'),
+    tempEncPk: '22'.repeat(32),
   };
-  const build = async (a: typeof base) => {
+  const build = async (a: WithdrawCallArgs) => {
     const t0 = Date.now();
-    const unsubmitted: Any = await (createUnprovenCallTx as Any)(
-      {
-        publicDataProvider: pdp,
-        zkConfigProvider: rt.zkConfigProvider,
-        walletProvider: { getCoinPublicKey: () => a.refund, getEncryptionPublicKey: () => '22'.repeat(32) },
-      },
-      {
-        compiledContract: rt.compiledContract,
-        contractAddress: vault,
-        circuitId: 'startWithdraw',
-        args: [
-          a.evmNonce,
-          a.gasLimit,
-          DEFAULT_EVM_GAS.maxFeePerGas,
-          DEFAULT_EVM_GAS.maxPriorityFeePerGas,
-          DEFAULT_EVM_GAS.keyVersion,
-          hexBytes(a.erc20, 20),
-          a.amount,
-          hexBytes(a.dest, 20),
-          { nonce: hexBytes(a.coinNonce, 32), color: hexBytes(colour, 32), value: a.amount },
-          walletRecipient(a.refund),
-        ],
-      },
-    );
-    const s = summarise(unsubmitted.private.unprovenTx);
-    const req = await requestOfCall(rt, unsubmitted.public.nextContractState, 'withdraw', vaultPathHex);
-    return { calls: s.calls, callsDigest: s.callsDigest, requestId: req.requestId, ms: Date.now() - t0 };
+    const r = await rebuildStartWithdraw({ compiledContract: rt.compiledContract, ledger: rt.ledger }, pdp, vault, a);
+    return { ...r, ms: Date.now() - t0 };
   };
   const a1 = await build(base);
   const a2 = await build(base);
-  const variants: Record<string, Partial<typeof base>> = {
+  const variants: Record<string, Partial<WithdrawCallArgs>> = {
     amount: { amount: 2_000_000n },
     dest: { dest: '0x000000000000000000000000000000000000dEaD' },
     evmNonce: { evmNonce: 10n },
     coinNonce: { coinNonce: '33'.repeat(32) },
-    refund: { refund: '77'.repeat(32) },
-    gas: { gasLimit: 90_000n },
+    refund: { refundCoinPk: '77'.repeat(32) },
+    gas: { gas: { ...DEFAULT_EVM_GAS, gasLimit: 90_000n } },
   };
   const out: Record<string, unknown> = {
+    block: a1.block,
     calls: a1.calls.map((c) => ({ address: c.address, entryPoint: c.entryPoint })),
     deterministic: a1.callsDigest === a2.callsDigest,
     sameRequestId: a1.requestId === a2.requestId,

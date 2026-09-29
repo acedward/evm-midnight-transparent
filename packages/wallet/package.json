@@ -3,22 +3,28 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "The swap's temporary Midnight wallet, browser-safe: keys from the start-swap signature's seed, a shielded-only wallet, a proving service, and the take builder (merge the maker's offer, balance the shielded side, prove).",
+  "description": "The swap's temporary Midnight wallet, browser-safe: keys from the start-swap signature's seed, a shielded-only wallet, the take builder (balance the maker's offer; the sponsor proves; merge; submit to the batcher), the vault startWithdraw builder (built on the vault's live state from the vendored compiled contract), and the sponsor client for /prove and /withdraw.",
   "license": "Apache-2.0",
   "exports": {
     ".": "./src/index.ts"
   },
   "dependencies": {
     "@evm-midnight-transparent/core": "workspace:*",
+    "@midnight-ntwrk/compact-js": "2.5.5-rc.8",
+    "@midnight-ntwrk/compact-runtime": "0.19.0",
+    "@midnight-ntwrk/midnight-js-contracts": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
     "@midnightntwrk/ledger-v9": "1.0.0-rc.3",
     "@midnightntwrk/wallet-sdk-capabilities": "4.0.0-beta.2",
     "@midnightntwrk/wallet-sdk-hd": "3.1.0-beta.1",
     "@midnightntwrk/wallet-sdk-shielded": "4.0.0-beta.2",
     "buffer": "6.0.3",
+    "ethers": "6.17.0",
     "rxjs": "7.8.2"
   },
   "devDependencies": {
-    "@midnightntwrk/wallet-sdk-address-format": "4.0.0-beta.2",
-    "ethers": "6.17.0"
+    "@midnight-ntwrk/midnight-js-utils": "5.0.0-beta.7",
+    "@midnightntwrk/wallet-sdk-address-format": "4.0.0-beta.2"
   }
 }

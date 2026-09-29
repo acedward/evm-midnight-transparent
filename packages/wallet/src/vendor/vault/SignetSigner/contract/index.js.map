@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "file": "index.js",
+  "sourceRoot": "../../../",
+  "sources": ["src/vendor/signet-contract.compact"],
+  "names": [],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;EAsBA;;;;;;;;;;MA8BA,AAAA,iBAaC;;;;;cAZK,WAAoB;cACpB,cAAgD;;;;;;;;;;;;;;;;;;;;;;;;;yCADhD,WAAoB,+BACpB,cAAgD;;;;;;;;;yDADhD,WAAoB;yDACpB,cAAgD;;;;OAWrD;MAQD,AAAA,OAeC;;;;;cAdG,WAAoB;cACpB,yBAAgD;;;;;;;;;;;;;;;;;;;;;;;;;yCADhD,WAAoB,+BACpB,yBAAgD;;;;;;;;;+CADhD,WAAoB;+CACpB,yBAAgD;;;;OAanD;MAWD,AAAA,oBAeC;;;;;cAdG,WAAoB;cACpB,2BAAoD;;;;;;;;;;;;;;;;;;;;;;;;;yCADpD,WAAoB,+BACpB,2BAAoD;;;;;;;;;4DADpD,WAAoB;4DACpB,2BAAoD;;;;OAavD;;;;;;;;;;;;GACA;EA7FD;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;GA6FC;EA/DD,AAAA,0BAaC;;6BAZK,WAAoB;6BACpB,cAAgD;;QAElD,GAQE;;;;;;;;;;;uVALe,cAAY;qWACT,WAAS;;qWACT,cAAY;;;;;2VALhC,GAQE;;2VARF,GAQE;;;;;;;GACL;EAQD,AAAA,gBAeC;;mBAdG,WAAoB;mBACpB,yBAAgD;;QAEhD,GAUE;;;;;;;;;;;qWAPkB,WAAS;;qWACT,yBAAuB;;qWACvB,yBAAuB;;qWACvB,yBAAuB;;uVAC1B,yBAAuB;;;;2VAPxC,GAUE;;2VAVF,GAUE;;;;;;;GACL;EAWD,AAAA,6BAeC;;gCAdG,WAAoB;gCACpB,2BAAoD;;QAEpD,GAUE;;;;;;;;;;;qWAPkB,WAAS;;qWACT,2BAAyB;;qWACzB,2BAAyB;;qWACzB,2BAAyB;;uVAC5B,2BAAyB;;;;2VAP1C,GAUE;;2VAVF,GAUE;;;;;;;GACL;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"
+}

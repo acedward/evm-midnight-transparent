@@ -18,7 +18,7 @@
 // vault EVM account's single nonce, so withdrawals go through one lane (plan Q9).
 //
 // TODO(L-SPONSOR): the deposit and withdraw request bodies, the job results and the stage list
-// the swap page shows; TODO(L-WALLET): the deposit-address derivation (vault `depositPath`).
+// the swap page shows. The deposit-address derivation (vault `depositPath`) is deposit-address.ts.
 
 import { z } from 'zod';
 

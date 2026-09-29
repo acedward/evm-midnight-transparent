@@ -6,7 +6,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { offerIdOf } from '@evm-midnight-transparent/core';
 
 import { type ProvingService } from '../src/prover.js';
-import { TakeError, buildTake, decodeMakerTransaction, shieldedImbalances, takeTerms } from '../src/take.js';
+import { TakeError, buildTakeWithProver, decodeMakerTransaction, takeTerms } from '../src/take.js';
+import { shieldedImbalances } from '../src/tx.js';
 
 // A live stagenet ladder bid, captured from the kernel (public data): the maker gives 1 wUSDC and
 // wants 104.166667 wStkA.
@@ -52,7 +53,7 @@ describe('building a take (offline paths)', () => {
 
   it('refuses before touching the wallet when it cannot pay the wanted leg', async () => {
     const wallet = { balanceTransaction: vi.fn(), revertTransaction: vi.fn() };
-    const err = await buildTake({
+    const err = await buildTakeWithProver({
       makerTx,
       wallet: wallet as unknown as ShieldedWalletAPI,
       secretKeys: {} as never,
@@ -67,7 +68,7 @@ describe('building a take (offline paths)', () => {
   it('refuses when the wallet has nothing to balance', async () => {
     const wallet = { balanceTransaction: vi.fn(async () => undefined), revertTransaction: vi.fn() };
     await expect(
-      buildTake({
+      buildTakeWithProver({
         makerTx,
         wallet: wallet as unknown as ShieldedWalletAPI,
         secretKeys: {} as never,
@@ -89,7 +90,7 @@ describe('building a take (offline paths)', () => {
       }),
     };
     await expect(
-      buildTake({
+      buildTakeWithProver({
         makerTx,
         wallet: wallet as unknown as ShieldedWalletAPI,
         secretKeys: {} as never,
@@ -107,7 +108,7 @@ describe('building a take (offline paths)', () => {
       revertTransaction: vi.fn(async () => undefined),
     };
     await expect(
-      buildTake({
+      buildTakeWithProver({
         makerTx,
         wallet: wallet as unknown as ShieldedWalletAPI,
         secretKeys: {} as never,

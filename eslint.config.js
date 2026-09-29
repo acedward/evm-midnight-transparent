@@ -15,6 +15,7 @@ export default defineConfig([
     'test-results/**',
     'packages/core/src/vendor/**',
     'sponsor/src/bridge/vendor/relayer.ts',
+    'packages/wallet/src/vendor/**',
   ]),
   js.configs.recommended,
   tseslint.configs.recommended,

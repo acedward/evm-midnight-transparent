@@ -62,3 +62,22 @@ condition = "AND"
 paths = ['''(^|/)packages/core/test/fixtures/kernel/staging-[0-9-]+/known-tokens\.json$''']
 regexTarget = "match"
 regexes = ['''^token_color"''']
+
+# The vault's generated contract module, vendored byte for byte (packages/wallet/src/vendor/vault/
+# PROVENANCE.md): its `expectedVk` map holds the SHA-256 of each circuit's PUBLIC verifier key, and the
+# rule reads the circuit name `publishTokenMetadata` as a token label. Scoped to that rule, that file
+# AND that one entry's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/wallet/src/vendor/vault/Erc20Vault/contract/index\.js$''']
+regexTarget = "match"
+regexes = ['''^publishTokenMetadata': '[0-9a-f]{64}'$''']
+
+# The test that pins that same map against the chain (packages/wallet/test/vendor-vault.test.ts):
+# the same PUBLIC verifier-key SHA-256, keyed by the circuit's name. Scoped to that rule, that file
+# AND that one entry's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/wallet/test/vendor-vault\.test\.ts$''']
+regexTarget = "match"
+regexes = ['''^publishTokenMetadata: '[0-9a-f]{64}'$''']

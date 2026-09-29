@@ -35,16 +35,18 @@ import {
   DEFAULT_EVM_GAS,
   STAGENET,
   SWAP_KEY_DERIVATION_VERSION,
+  depositAddressFor,
+  depositPathOf,
   depositPreflight,
   newSwapSalt,
   stagenetRegistry,
   startSwapTypedData,
+  walletRecipient,
 } from '@evm-midnight-transparent/core';
 import { type TemporaryWalletKeys } from '@evm-midnight-transparent/wallet';
 import vaultRecord from '../../../packages/core/src/tokens/deployments/stagenet-vault.json';
 import { parseSponsorSeed } from '../../../sponsor/src/config.js';
 import { openFacadeWallet, type OpenedWallet } from '../../../sponsor/src/sponsor/facade.js';
-import { depositAddressFor, depositPathOf, walletRecipient } from '../../../sponsor/src/bridge/deposit-address.js';
 import {
   addDustAndSubmit,
   artefactFingerprints,
