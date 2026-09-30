@@ -118,6 +118,8 @@ export const HealthResponseSchema = z.object({
             signed: z.boolean(),
             mined: z.boolean(),
             stuck: z.boolean(),
+            /** A submission whose outcome is unknown (audit R5): kept until the request id settles it. */
+            uncertain: z.boolean().optional(),
             sinceSeconds: z.number().int(),
           }),
         )
