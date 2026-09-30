@@ -104,6 +104,17 @@ seed_mounted_elsewhere() {
     grep -v "^/$P-" | grep -F "/Offer Files/.stagenet" >/dev/null
 }
 
+# Another process or container (not ours) that may send from the test EVM user (`.sepolia`): two
+# senders on one account collide on its nonce (and a delegated account has one pending transaction).
+sepolia_in_use() {
+  local ids
+  if ps -axo command | grep -E 'Offer Files/\.sepolia|deposit-fund|gates/bridge/gate\.ts fund' | grep -v grep >/dev/null; then return 0; fi
+  ids="$(docker ps -q)"
+  [[ -n "$ids" ]] || return 1
+  docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' $ids 2>/dev/null |
+    grep -v "^/$P-" | grep -F "/Offer Files/.sepolia" >/dev/null
+}
+
 lock_take() {
   mkdir -p "$(dirname "$LOCK")"
   if [[ -s "$STATE/lock-holder.pid" ]] && grep -q "\"pid\":$(cat "$STATE/lock-holder.pid")," "$LOCK" 2>/dev/null; then
@@ -284,9 +295,9 @@ PY
     import="${3:-}" # e2 only: a swap record export file in the state directory (continue that swap)
     [[ -s "$STATE/lock-holder.pid" ]] || { say "the funding lock is not held: run 'up' first"; exit 2; }
     for i in $(seq 1 16); do
-      if ! ps -axo command | grep -E 'run-stagenet|deposit-fund|stagenet\.ts|gates/bridge/gate\.ts fund|run-live\.sh phase' | grep -v grep | grep -v "phase $name" >/dev/null; then break; fi
+      if ! sepolia_in_use; then break; fi
       [[ "$i" == 16 ]] && { say "another sender from the test EVM user is still active after 30 min"; exit 75; }
-      say "another driver sends from the test EVM user; waiting 120 s ($i/15)"; sleep 120
+      say "another process uses the test EVM user's key; waiting 120 s ($i/15)"; sleep 120
     done
     sync_tree >/dev/null
     rm -f "$STATE/e3-ready.json"
