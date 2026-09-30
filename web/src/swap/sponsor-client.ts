@@ -38,7 +38,7 @@ import { sponsorClient } from '@evm-midnight-transparent/wallet/sponsor-client';
 import { getAddress, getBytes } from 'ethers';
 import { z } from 'zod';
 
-import type { TypedDataSigner, WithdrawParams } from './ports.js';
+import type { TypedDataSigner, WalletOutput, WithdrawParams } from './ports.js';
 
 /** The SponsorAction name for opening a swap: core's (L-SPONSOR 1). */
 export { OPEN_SWAP_ACTION };
@@ -124,6 +124,9 @@ const SwapViewShape = z.object({
   message: z.string().max(500).optional(),
   /** On `failed`: a re-open (resume) revives the swap (P4.2-fix C5). */
   recoverable: z.boolean().optional(),
+  /** On a recoverable `failed`: unix seconds from which a re-open revives it (FS2's re-arm cooldown,
+   *  P4.2-fix2 R3). Seen once core's schema carries it. */
+  retryAt: z.number().int().nonnegative().optional(),
 });
 export type SwapView = z.infer<typeof SwapViewShape>;
 export const SwapViewSchema = z.preprocess(dropNulls, SwapViewShape);
@@ -160,8 +163,10 @@ export interface OpenSwapRequest {
  *  and `rebuild` for the stale answers that mean "rebuild the withdrawal and prove again"). */
 export { SponsorApiError as SponsorError };
 
+/** `walletOutputs`: every coin the transaction pays back to the temporary wallet (P4.2-fix2 R1). */
 export type ProveRequest =
-  { purpose: 'take'; tx: string } | { purpose: 'withdraw'; tx: string; coinNonce: string; evmNonce: string };
+  | { purpose: 'take'; tx: string; walletOutputs?: readonly WalletOutput[] }
+  | { purpose: 'withdraw'; tx: string; coinNonce: string; evmNonce: string; walletOutputs?: readonly WalletOutput[] };
 
 export type TakeReport = { outcome: 'taken'; takeTx: string } | { outcome: 'not-available' };
 
@@ -283,6 +288,7 @@ export class HttpSponsorApi implements SponsorApi {
         body.purpose,
         body.tx,
         body.purpose === 'withdraw' ? { coinNonce: body.coinNonce, evmNonce: BigInt(body.evmNonce) } : undefined,
+        body.walletOutputs !== undefined ? { walletOutputs: body.walletOutputs } : undefined,
       ),
     }));
   }

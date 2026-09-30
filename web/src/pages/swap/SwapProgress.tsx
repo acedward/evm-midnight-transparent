@@ -506,7 +506,11 @@ export function SwapProgress({ swapId }: { swapId: string }) {
         <Notice
           tone="warning"
           title={
-            finished ? 'This swap failed, and the sponsor can revive it.' : 'This swap is not running in this tab.'
+            !finished
+              ? 'This swap is not running in this tab.'
+              : record.recoverable === true
+                ? 'This swap failed, and the sponsor can revive it.'
+                : 'This swap failed. Resume it to ask the sponsor whether it can revive it.'
           }
           className="panel-intro"
           data-testid="resume-here"

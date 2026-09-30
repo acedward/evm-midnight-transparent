@@ -49,6 +49,9 @@ export interface MockControls {
   setScenario(patch: Partial<MockScenario>): void;
   /** Fail every swap still waiting for its funds (`funds-not-received`), recoverable or not (C5). */
   failAwaitingFunds(recoverable: boolean): void;
+  /** Fail every swap waiting for or running its deposit as a failed sweep (`deposit-attempts`: the
+   *  tokens stay at the deposit address), recoverable or not (P4.2-fix2 R7). */
+  failDeposit(recoverable: boolean): void;
   /** Double the sweep gas of every swap still waiting for its funds (the base fee rose). */
   raiseSweepGas(): void;
   setStepMs(ms: number): void;
@@ -142,6 +145,10 @@ export function createMockEnvironment(input: {
     setScenario: (patch) => Object.assign(settings.scenario, patch),
     failAwaitingFunds: (recoverable) => {
       sponsor.failAwaitingFunds(recoverable);
+      persist();
+    },
+    failDeposit: (recoverable) => {
+      sponsor.failDeposit(recoverable);
       persist();
     },
     raiseSweepGas: () => {

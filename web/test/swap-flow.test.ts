@@ -13,6 +13,7 @@ import {
   stageStates,
   stageTitle,
   withdrawalStatus,
+  revivalNote,
 } from '../src/swap/flow.js';
 import {
   MIN_TIME_TO_EXPIRY_MS,
@@ -324,14 +325,42 @@ describe('a recoverable failure (P4.2-fix C5)', () => {
     const failed = applyView(record(), view('failed', { reason: 'funds-not-received', recoverable: true }), 1);
     expect(failed).toMatchObject({ phase: 'failed', recoverable: true, error: 'funds-not-received' });
     expect(isResumable(failed)).toBe(true);
+    // A view that does not say (a sponsor before P4.2-fix) is the sponsor's "no" (P4.2-fix2 R3: the
+    // record keeps it as `false`; only a record that does not say at all is asked again).
     const terminal = applyView(record(), view('failed', { reason: 'deposit-returned-false' }), 1);
-    expect(terminal.recoverable).toBeUndefined();
+    expect(terminal.recoverable).toBe(false);
     expect(isResumable(terminal)).toBe(false);
     const revived = applyView(failed, view('awaiting_funds'), 2);
     expect(revived.phase).toBe('funding');
     expect(revived.recoverable).toBeUndefined();
     expect(revived.error).toBeUndefined();
     expect(isResumable(revived)).toBe(true);
+  });
+});
+
+// P4.2-fix2 R3 (the audit's F-B25, the page's part): a failed record that does not say whether it is
+// recoverable (written before P4.2-fix, or by the page that dropped a sponsor's "no") is not final:
+// only the sponsor can tell, per its migration, so the page offers Resume (a re-open asks it). The
+// sponsor's "no" is now kept as `false`, so it is asked once, not forever.
+describe('a failed record that does not say whether it is recoverable (P4.2-fix2 R3, F-B25)', () => {
+  it("keeps the sponsor's no as false: final, no Resume", () => {
+    const no = applyView(record(), view('failed', { reason: 'deposit-attempts', recoverable: false }), 1);
+    expect(no).toMatchObject({ phase: 'failed', recoverable: false });
+    expect(isResumable(no)).toBe(false);
+  });
+
+  it('offers Resume for a legacy failed record (no `recoverable`): the re-open asks the sponsor', () => {
+    const legacy = record({ phase: 'failed', error: 'The deposit sweep did not execute.' });
+    expect(legacy.recoverable).toBeUndefined();
+    expect(isResumable(legacy)).toBe(true);
+    // A version-1 record (before P4.2-fix) that failed: the same.
+    const { salt: _salt, ...v1 } = { ...legacy, v: 1, swapId: SALT, derivation: 1 };
+    const parsed = SwapRecordSchema.parse(v1);
+    expect(isResumable(parsed)).toBe(true);
+    // The re-open's answer settles it: revived (any other state), or failed with the sponsor's word.
+    expect(isResumable(applyView(legacy, view('failed', { recoverable: false }), 2))).toBe(false);
+    expect(applyView(legacy, view('awaiting_funds'), 2)).toMatchObject({ phase: 'funding' });
+    expect(applyView(legacy, view('awaiting_funds'), 2).recoverable).toBeUndefined();
   });
 });
 
@@ -383,5 +412,21 @@ describe('the six stages', () => {
     expect(stageTitle('withdraw', 'settled')).toBe('Withdrawal closed on Midnight');
     expect(stageTitle('withdraw', 'evm-broadcast')).toBe('Tokens sent to you on Sepolia');
     expect(stageTitle('deposit', 'something-new')).toBe('something-new');
+    // FS2's new stage ids (P4.2-fix2 R4, R5, R6).
+    expect(stageTitle('deposit', 'budget-wait')).toMatch(/daily budget/);
+    expect(stageTitle('deposit', 'completed-foreign')).toMatch(/Another request/);
+    expect(stageTitle('withdraw', 'submission-uncertain')).toMatch(/Checking whether/);
+    expect(stageTitle('withdraw', 'adopted')).toBe('Withdrawal found on Midnight');
+  });
+
+  it("says from when a Resume revives a recoverable failure in its cooldown (FS2's retryAt, P4.2-fix2 R3)", () => {
+    const at = Date.UTC(2026, 8, 30, 14, 6, 9);
+    const failed = view('failed', { recoverable: true, retryAt: at / 1000 });
+    expect(revivalNote(failed, at - 60_000)).toBe(
+      'The sponsor can revive this swap from 14:06:09 UTC: resume it then.',
+    );
+    expect(revivalNote(failed, at + 1)).toBeNull();
+    expect(revivalNote(view('failed', { recoverable: false, retryAt: at / 1000 }), 0)).toBeNull();
+    expect(revivalNote(view('failed', { recoverable: true }), 0)).toBeNull();
   });
 });

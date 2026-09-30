@@ -14,7 +14,7 @@ import {
   type PillStatus,
 } from '../../design/index.js';
 import { dateText, legText } from '../../swap/display.js';
-import { type SwapRecord, isRecoverable, isResumable } from '../../swap/record-shape.js';
+import { type SwapRecord, isRecoverable, isRecoverableUnknown, isResumable } from '../../swap/record-shape.js';
 import { useSwap } from '../../swap/SwapContext.js';
 
 const PHASE_TEXT: Record<SwapRecord['phase'], string> = {
@@ -56,7 +56,9 @@ export function YourSwaps() {
               ? 'Bridged back'
               : isRecoverable(r)
                 ? 'Failed: can be resumed'
-                : PHASE_TEXT[r.phase];
+                : isRecoverableUnknown(r)
+                  ? 'Failed: resume to ask the sponsor'
+                  : PHASE_TEXT[r.phase];
           return (
             <tr key={r.swapId} data-testid="swap-record" data-swap-id={r.swapId} data-phase={r.phase}>
               <Cell block>

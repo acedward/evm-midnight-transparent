@@ -2,8 +2,8 @@
 // answer 7-10), with the swap's bearer token:
 //
 //   GET  {base}/v1/swaps/:id/withdraw-params?kind=swap|bridge-back   → what startWithdraw needs but the coin
-//   POST {base}/v1/swaps/:id/prove    {purpose: "take", tx}                            → {tx: <proven hex>}
-//                                     {purpose: "withdraw", tx, coinNonce, evmNonce}   → {tx: <proven hex>}
+//   POST {base}/v1/swaps/:id/prove    {purpose: "take", tx, walletOutputs}                            → {tx: <proven hex>}
+//                                     {purpose: "withdraw", tx, coinNonce, evmNonce, walletOutputs}   → {tx: <proven hex>}
 //   POST {base}/v1/swaps/:id/withdraw {tx: <proven, BOUND startWithdraw hex>}          → 202 {swap}
 //   POST {base}/v1/swaps/:id/take     {outcome: "taken", takeTx} | {outcome: "not-available"}
 //
@@ -13,6 +13,10 @@
 // wallet's spend witnesses to our own server (spec Q3 A). Errors are core's `ApiError`
 // (`{error: {code, message, detail?}}`): `stale-vault-state` and `stale-evm-nonce` (409) mean
 // "rebuild the withdrawal and prove again".
+// `walletOutputs` (P4.2-fix2 R1): every coin the transaction pays back to the temporary wallet, as
+// `{nonce, colour, value}` (./outputs.ts), so the sponsor can account for every output it proves. A
+// sponsor from before that change refuses the unknown field (its schema is strict: 400
+// `bad-request`); the proof is then asked once more without it (transitional).
 // The swap token is a bearer credential: it lives in memory only, like the key.
 //
 // This module imports core only (no WASM): the web app loads it with its first bundle, as
@@ -59,10 +63,30 @@ export interface WithdrawHints {
 
 export type TakeReport = { outcome: 'taken'; takeTx: string } | { outcome: 'not-available' };
 
+/** A coin the transaction pays to the temporary wallet (P4.2-fix2 R1): public values only. */
+export interface WalletOutput {
+  /** 64 lowercase hex. */
+  nonce: string;
+  /** The shielded colour, 64 lowercase hex. */
+  colour: string;
+  /** Base units. */
+  value: bigint;
+}
+
+/** What `/prove` discloses besides the transaction (P4.2-fix2 R1). */
+export interface ProveDisclosure {
+  walletOutputs?: readonly WalletOutput[];
+}
+
 export interface SponsorClient {
   /** `/prove`: the proven transaction, hex (normally pre-binding; `finalizeTake`/`finalizeWithdraw` bind it).
-   *  `withdraw` needs `hints`. */
-  prove(purpose: ProvePurpose, unprovenHex: string, hints?: WithdrawHints): Promise<string>;
+   *  `withdraw` needs `hints`; `disclosure.walletOutputs` are the draft's (P4.2-fix2 R1). */
+  prove(
+    purpose: ProvePurpose,
+    unprovenHex: string,
+    hints?: WithdrawHints,
+    disclosure?: ProveDisclosure,
+  ): Promise<string>;
   /** `/withdraw`: the sponsor adds DUST and submits in its withdrawal lane. Returns its answer (`{swap}`). */
   withdraw(finalizedHex: string): Promise<unknown>;
   /** `withdraw-params`: the colour, amount, destination, gas and the lane's EVM nonce. */
@@ -166,8 +190,16 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
     return h;
   };
 
+  const outputOf = (o: WalletOutput) => {
+    const nonce = hexOf(o.nonce, 'output nonce');
+    const colour = hexOf(o.colour, 'output colour');
+    if (nonce.length !== 64 || colour.length !== 64 || o.value < 0n)
+      throw new SponsorApiError(0, 'bad-request', 'a disclosed output must be 32-byte nonce and colour and a value');
+    return { nonce, colour, value: o.value.toString(10) };
+  };
+
   return {
-    async prove(purpose, unprovenHex, hints) {
+    async prove(purpose, unprovenHex, hints, disclosure) {
       const body: Record<string, unknown> = { purpose, tx: hexOf(unprovenHex, 'transaction') };
       if (purpose === 'withdraw') {
         if (!hints) throw new SponsorApiError(0, 'bad-request', 'a withdrawal proof needs the coin and EVM nonces');
@@ -176,7 +208,23 @@ export function sponsorClient(o: SponsorClientOptions): SponsorClient {
         body.coinNonce = coinNonce;
         body.evmNonce = hints.evmNonce.toString(10);
       }
-      const out = (await call('POST', 'prove', body)) as { tx?: unknown } | undefined;
+      if (disclosure?.walletOutputs !== undefined) body.walletOutputs = disclosure.walletOutputs.map(outputOf);
+      let out: { tx?: unknown } | undefined;
+      try {
+        out = (await call('POST', 'prove', body)) as { tx?: unknown } | undefined;
+      } catch (e) {
+        // A sponsor from before P4.2-fix2 refuses the unknown `walletOutputs` (400 bad-request): ask
+        // once more without it. A current sponsor never answers a well-formed request so.
+        if (
+          !('walletOutputs' in body) ||
+          !(e instanceof SponsorApiError) ||
+          e.status !== 400 ||
+          e.code !== 'bad-request'
+        )
+          throw e;
+        delete body.walletOutputs;
+        out = (await call('POST', 'prove', body)) as { tx?: unknown } | undefined;
+      }
       if (!out || typeof out.tx !== 'string') throw bad('the sponsor returned no transaction');
       return hexOf(out.tx, 'proven transaction');
     },
