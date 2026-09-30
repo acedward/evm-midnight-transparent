@@ -12,8 +12,10 @@
 // this page could have written (./store/record-schemas.ts).
 //
 // Version 2 (P4.2-fix): `salt` next to the public `swapId`, derivation 2 (the warning prompt), and
-// `recoverable` on a failed swap the sponsor can revive (C5). A version-1 record (written before:
-// its id IS its salt, derivation 1) is read as a legacy version 2 and still resumes.
+// `recoverable` on a failed swap: the sponsor's word, true or false (C5; `false` kept since
+// P4.2-fix2 R3). A version-1 record (written before: its id IS its salt, derivation 1) is read as a
+// legacy version 2 and still resumes; a failed one without `recoverable` is offered for Resume, and
+// the sponsor's answer to the re-open decides.
 
 import { publicSwapId } from '@evm-midnight-transparent/core';
 import { z } from 'zod';
@@ -158,7 +160,9 @@ const SwapRecordV2 = z
     outcome: z.enum(['swapped', 'bridged-back']).optional(),
     /** Why the swap failed or stopped, as shown to the user. */
     error: z.string().max(500).optional(),
-    /** A failed swap the sponsor says a re-open revives (P4.2-fix C5): the page offers Resume. */
+    /** On a failed swap, the sponsor's word on whether a re-open revives it (P4.2-fix C5): true, the
+     *  page offers Resume; false, final. Absent on a failed record written before the page kept the
+     *  sponsor's "no" (P4.2-fix2 R3): only the sponsor can tell, so the page offers Resume. */
     recoverable: z.boolean().optional(),
     createdAt: ms,
     updatedAt: ms,
@@ -184,9 +188,16 @@ export type SwapRecord = z.output<typeof SwapRecordV2>;
 /** Terminal phases: nothing more will happen (unless a failed swap is `recoverable`: `isResumable`). */
 export const isFinished = (r: Pick<SwapRecord, 'phase'>) => r.phase === 'done' || r.phase === 'failed';
 
-/** A failed swap the sponsor can revive by a re-open (P4.2-fix C5). */
+/** A failed swap the sponsor said it can revive by a re-open (P4.2-fix C5). */
 export const isRecoverable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
   r.phase === 'failed' && r.recoverable === true;
 
-/** What the page offers Resume for: not finished, or failed and recoverable. */
-export const isResumable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) => !isFinished(r) || isRecoverable(r);
+/** A failed swap whose record does not say whether the sponsor can revive it: written before the
+ *  sponsor said so (P4.2-fix) or before the page kept its "no" (P4.2-fix2 R3, the audit's F-B25).
+ *  The sponsor decides, per its migration of such swaps: a re-open (Resume) asks it. */
+export const isRecoverableUnknown = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
+  r.phase === 'failed' && r.recoverable === undefined;
+
+/** What the page offers Resume for: not finished; failed and recoverable; or failed and not known. */
+export const isResumable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
+  !isFinished(r) || isRecoverable(r) || isRecoverableUnknown(r);

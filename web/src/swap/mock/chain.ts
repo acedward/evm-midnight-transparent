@@ -168,6 +168,20 @@ export class MockChain {
     else m.set(colour, have - amount);
   }
 
+  /** The drafts whose coin a landed transaction spent (a take the batcher took, a withdrawal the
+   *  sponsor started): the mock wallet's sync then drops their booking, as the real wallet drops a
+   *  pending spend once it sees the coin's nullifier on chain (P4.2-fix2 R3, F-B24). In memory only:
+   *  a reload makes new wallets, which book nothing. */
+  private readonly spentDrafts = new Set<string>();
+
+  markSpent(draftId: string | undefined): void {
+    if (draftId) this.spentDrafts.add(draftId);
+  }
+
+  isSpent(draftId: string): boolean {
+    return this.spentDrafts.has(draftId);
+  }
+
   private readonly takes = new Map<string, string>();
 
   /** The take a temporary wallet landed (the mock sponsor reports it as `takeTx`). */

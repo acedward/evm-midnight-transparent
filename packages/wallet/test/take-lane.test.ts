@@ -109,6 +109,19 @@ describe('finalizeTake: bind the proven complement and merge it into the offer',
     await wallet.close();
   });
 
+  it('keeps the coin booked after finalizing, until release or the spend lands: the lifecycle the web mock follows (P4.2-fix2 R3, F-B24)', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: WANTED }]);
+    const draft = await buildTake(wallet, OFFER.offerBech32);
+    finalizeTake(draft, mockProven(draft.tx));
+    // Finalized and handed on, not landed: nothing is given back (the same SDK booking as a
+    // withdrawal's: `balanceTransaction` books, only `revertTransaction` or the landed spend frees).
+    expect((await wallet.balances())[WSTKA] ?? 0n).toBe(0n);
+    await expect(buildTake(wallet, OFFER.offerBech32)).rejects.toMatchObject({ code: 'insufficient-funds' });
+    await draft.release();
+    expect((await wallet.balances())[WSTKA]).toBe(WANTED);
+    await wallet.close();
+  });
+
   it('the offer id is sha256 of the maker bytes AS SERVED (P4.2-fix C10)', async () => {
     const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: WANTED }]);
     const draft = await buildTake(wallet, OFFER.offerBech32);

@@ -431,15 +431,19 @@ export class MockSponsor {
       return fail(409, 'stale-vault-state', 'the vault state moved on: rebuild the withdrawal');
     }
     if (tx.evmNonce !== String(this.evmNonce)) return fail(409, 'stale-evm-nonce', 'the vault account moved on');
-    this.evmNonce++;
-    try {
-      this.o.chain.burn(s.payload.tempCoinPk, tx.colour!, BigInt(tx.amount!));
-    } catch {
-      return fail(409, 'conflict', 'the temporary wallet does not hold that coin');
-    }
     const back = tx.colour === s.payload.pay.colour;
     const refund = !!this.o.scenario.refundFirstWithdrawal && s.withdrawals === 0;
     const failStart = !!this.o.scenario.failFirstStart && s.withdrawals === 0;
+    if ((this.o.chain.balances(s.payload.tempCoinPk).get(tx.colour!) ?? 0n) < BigInt(tx.amount!))
+      return fail(409, 'conflict', 'the temporary wallet does not hold that coin');
+    if (!failStart) {
+      // The start lands: the coin is spent into the vault (the wallet's next sync sees it spent). A
+      // start that fails in the lane never lands: its coin is never spent, and stays booked in the
+      // wallet until the page releases the draft (P4.2-fix2 R3, F-B24).
+      this.evmNonce++;
+      this.o.chain.burn(s.payload.tempCoinPk, tx.colour!, BigInt(tx.amount!));
+      this.o.chain.markSpent(tx.draft);
+    }
     s.withdrawals++;
     s.lastEnding = null;
     if (s.view.withdraw) (s.earlier ??= []).push(structuredClone(s.view.withdraw));
@@ -482,6 +486,22 @@ export class MockSponsor {
       s.view.reason = 'funds-not-received';
       s.view.message = 'The funds did not reach the deposit address in time.';
       s.recoverable = recoverable;
+    }
+  }
+
+  /** Fail every swap waiting for or running its deposit the way a failed sweep does (the real
+   *  sponsor's `deposit-attempts`: the tokens stay at the deposit address), recoverable or not: a
+   *  re-open re-arms it, and it waits for the funds (the sweep ETH) again (P4.2-fix2 R7). */
+  failDeposit(recoverable: boolean): void {
+    for (const s of this.swaps.values()) {
+      if (s.view.state !== 'awaiting_funds' && s.view.state !== 'depositing') continue;
+      s.view.state = 'failed';
+      s.view.reason = 'deposit-attempts';
+      s.view.message = 'The deposit sweep did not execute.';
+      s.recoverable = recoverable;
+      s.script = null;
+      s.step = 0;
+      delete s.view.deposit;
     }
   }
 
@@ -567,14 +587,15 @@ export class MockSponsor {
       const w = v.withdraw;
       if (next === undefined) {
         if (s.script === 'refund' || s.script === 'failStart') {
-          // Refunded to the temporary wallet, or the start never landed (the coin was never spent):
-          // back to `minted` with `withdrawal.retry`; the app rebuilds and retries. A refund counts
-          // itself in `refunds`; a failed start is no refund.
-          chain.mint(
-            s.payload.tempCoinPk,
-            w.colour!,
-            BigInt(w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount),
-          );
+          // Refunded to the temporary wallet (a NEW coin), or the start never landed (the coin was
+          // never spent, nothing to mint): back to `minted` with `withdrawal.retry`; the app rebuilds
+          // and retries. A refund counts itself in `refunds`; a failed start is no refund.
+          if (s.script === 'refund')
+            chain.mint(
+              s.payload.tempCoinPk,
+              w.colour!,
+              BigInt(w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount),
+            );
           if (s.script === 'refund') {
             s.refunded = (s.refunded ?? 0) + 1;
             w.refunds = s.refunded;

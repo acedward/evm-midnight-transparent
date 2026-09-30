@@ -819,3 +819,189 @@ describe('P4.2-fix change 4: /prove answers 409 stale-vault-state', () => {
     expect(env.controls.walletStats()).toEqual({ drafts: 3, released: 1 });
   });
 });
+
+// ── P4.2-fix2 (the security audit's round-2 rows R3 and R7, the page and wallet side) ─────────────
+
+describe('P4.2-fix2 R3 (F-B24): a withdrawal the sponsor accepted, whose start then failed', () => {
+  it('releases its booked coin, so the retry builds at once (the mock books like the real wallet)', async () => {
+    env = mockEnv({ scenario: { failFirstStart: true } });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const s = track(SwapSession.begin(offer, deps(signer, new FakeSepolia(signer.address))));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 15_000, 'the swap after a failed start');
+    expect(s.getSnapshot().record).toMatchObject({ outcome: 'swapped', bridgeOut: { attempts: 2, refunds: 1 } });
+    // The take and two withdrawals were built; the one whose start failed was released (the page
+    // kept it after /withdraw accepted it), the other two landed.
+    expect(env.controls.walletStats()).toEqual({ drafts: 3, released: 1 });
+    expect(env.sponsor.requests.filter((q) => q.path.endsWith('/withdraw')).length).toBe(2);
+  });
+
+  it('the mock wallet keeps a finalized draft booked until it is released or its coin is spent', async () => {
+    env = mockEnv();
+    const w = env.wallet;
+    const wallet = await w.createTempWallet('ab'.repeat(32));
+    const colour = registry.byMidnightName('wStkA')!.midnightColour;
+    env.chain.mint(wallet.coinPk, colour, 5n);
+    await wallet.sync();
+    const params = {
+      kind: 'swap' as const,
+      colour,
+      amount: 5n,
+      erc20Address: registry.byMidnightName('wStkA')!.sepoliaAddress,
+      dest: `0x${'12'.repeat(20)}`,
+      refundRecipient: wallet.coinPk,
+      gas: { gasLimit: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, keyVersion: 1n },
+      evmNonce: 9n,
+    };
+    const draft = await w.buildWithdraw(wallet, params);
+    const { encodeMockTx, decodeMockTx } = await import('../src/swap/mock/tx.js');
+    w.finalizeWithdraw(draft, encodeMockTx({ ...decodeMockTx(draft.tx)!, proven: true }));
+    await wallet.sync();
+    // Finalized, not landed: still booked, as the real wallet's pending spend.
+    expect((await wallet.balances())[colour]).toBeUndefined();
+    await expect(w.buildWithdraw(wallet, params)).rejects.toThrow(/booked/);
+    await draft.release();
+    expect((await wallet.balances())[colour]).toBe(5n);
+    // Spent on the chain (the start landed): the next sync drops the booking.
+    const again = await w.buildWithdraw(wallet, params);
+    env.chain.burn(wallet.coinPk, colour, 5n);
+    env.chain.markSpent((decodeMockTx(again.tx) as { draft?: string }).draft);
+    await wallet.sync();
+    expect(await wallet.balances()).toEqual({});
+    env.chain.mint(wallet.coinPk, colour, 5n); // a refund: a new coin, spendable at once
+    await wallet.sync();
+    expect((await wallet.balances())[colour]).toBe(5n);
+  });
+});
+
+describe('P4.2-fix2 R3 (F-B25, the page part): a legacy failed record without `recoverable`', () => {
+  /** A failed swap, closed, and its stored record made legacy (as a page before P4.2-fix wrote it). */
+  async function legacyFailed(recoverable: boolean) {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    env.controls.failAwaitingFunds(recoverable);
+    await waitFor(() => statusOf(s).kind === 'error', 5_000, 'the failure');
+    await s.close();
+    const [stored] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    const { recoverable: _r, ...legacy } = stored!;
+    saveSwapRecord(store, legacy);
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    expect(record!.recoverable).toBeUndefined();
+    return { signer, evm, record: record! };
+  }
+
+  it('is offered for Resume; the re-open asks the sponsor, which revives it (its migration), and it finishes', async () => {
+    const { signer, evm, record } = await legacyFailed(true);
+    const { inProgress } = await import('../src/swap/records.js');
+    expect(inProgress([record])).toHaveLength(1);
+    const before = signer.prompts.length;
+    const r = track(SwapSession.resume(record, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'fund', 5_000, 'the funding step again');
+    expect(signer.prompts.slice(before).map((p) => p.primaryType)).toEqual(['StartSwap', 'SponsorAction']);
+    await r.sendFunds();
+    await waitFor(() => statusOf(r).kind === 'done', 10_000, 'the revived swap');
+    expect(r.getSnapshot().record!.outcome).toBe('swapped');
+  });
+
+  it("the sponsor's no is asked once, then kept: the record says false and stays final", async () => {
+    const { signer, evm, record } = await legacyFailed(false);
+    const r = track(SwapSession.resume(record, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'error', 5_000, 'the answer');
+    expect(statusOf(r)).not.toMatchObject({ canResume: true });
+    await r.close();
+    const [after] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    expect(after).toMatchObject({ phase: 'failed', recoverable: false });
+    const { inProgress } = await import('../src/swap/records.js');
+    expect(inProgress([after!])).toHaveLength(0);
+    const prompts = signer.prompts.length;
+    const again = track(SwapSession.resume(after!, deps(signer, evm)));
+    await waitFor(() => statusOf(again).kind === 'error', 5_000);
+    expect(signer.prompts.length).toBe(prompts);
+  });
+});
+
+describe('P4.2-fix2 R7 (F-B23): the sweep ETH top-up survives a resume', () => {
+  const depositEth = (evm: FakeSepolia, address: string) => evm.eth.get(address.toLowerCase()) ?? 0n;
+
+  it('resumed after the sponsor raised the sweep gas: Send funds comes back and sends only the missing ETH', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    // The sponsor has not seen the funds yet when the tab closes.
+    env.setEvmReader({ ethBalance: async () => 0n, erc20Balance: async () => 0n });
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    await s.sendFunds();
+    await waitFor(() => s.getSnapshot().record!.funding.token?.status === 'confirmed', 5_000, 'the receipts');
+    await s.close();
+    // Then the base fee rose: the sponsor raises the sweep gas; the deposit address holds the old one.
+    env.controls.raiseSweepGas();
+
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    const r = track(SwapSession.resume(record!, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'fund', 5_000, 'the funding step for the top-up');
+    expect(r.getSnapshot().record!.deposit.sweepGas.ethWei).toBe((first * 2n).toString());
+    expect(r.getSnapshot().notice).toMatch(/top it up/);
+    await r.sendFunds();
+    // Only the missing ETH: the token is not sent again.
+    expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([first, 'token', first]);
+    expect(depositEth(evm, record!.deposit.address)).toBe(first * 2n);
+    await waitFor(() => statusOf(r).kind === 'done', 10_000, 'the swap');
+  });
+
+  it('a re-armed deposit whose sweep used the ETH: resume offers the ETH top-up only, never the token again', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const need = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    await s.sendFunds();
+    await waitFor(() => env.sponsor.views()[0]?.state === 'depositing', 5_000, 'the bridge-in');
+    // The sweep reverted on Sepolia (its gas spent) and the sponsor gave up on it, recoverable: the
+    // tokens are still at the deposit address, the ETH is gone.
+    const address = s.getSnapshot().record!.deposit.address;
+    evm.eth.set(address.toLowerCase(), 0n);
+    env.controls.failDeposit(true);
+    await waitFor(() => statusOf(s).kind === 'error', 5_000, 'the failure');
+    await s.close();
+
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    expect(record).toMatchObject({ phase: 'failed', recoverable: true });
+    const r = track(SwapSession.resume(record!, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'fund', 5_000, 'the funding step for the sweep ETH');
+    expect(r.getSnapshot().notice).toMatch(/top it up/);
+    await r.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([need, 'token', need]);
+    await waitFor(() => statusOf(r).kind === 'done', 10_000, 'the re-armed swap');
+  });
+
+  it('never sends the token twice: a confirmed token transfer whose tokens left the address is not re-sent', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    env.setEvmReader({ ethBalance: async () => 0n, erc20Balance: async () => 0n });
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    await s.sendFunds();
+    await waitFor(() => s.getSnapshot().record!.funding.token?.status === 'confirmed', 5_000, 'the receipts');
+    // Someone swept the tokens off the deposit address (a foreign vault request), then gas rose.
+    const r0 = s.getSnapshot().record!;
+    evm.erc20.set(`${r0.deposit.erc20Address.toLowerCase()}:${r0.deposit.address.toLowerCase()}`, 0n);
+    env.controls.raiseSweepGas();
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000, 'the top-up');
+    await s.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([first, 'token', first]);
+  });
+});

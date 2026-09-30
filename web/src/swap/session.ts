@@ -9,15 +9,20 @@
 //           is sent comes ONLY from the sponsor's open-swap answer, checked against this page's own
 //           derivation and the registry, and the offer is checked live first; never from the stored
 //           (or imported) record (P4.2-fix C8). Every send first checks the wallet is still on
-//           Sepolia with the swap's account, and funding stops while it is not (C9);
+//           Sepolia with the swap's account, and funding stops while it is not (C9). While the
+//           sponsor waits for the funds, the page reads what the deposit address still LACKS and
+//           offers "Send funds" for that shortfall only, also after a resume or a re-armed deposit
+//           (P4.2-fix2 R7); the token is never sent again once its transfer is confirmed;
 //   loop    the sponsor's state, every `pollMs`: bridge-in progress; once minted, the take (offer
 //           still live → build → prove at the sponsor → still live → batcher) or "Swap is not
 //           available"; then the withdrawal of the received token (or, after Bridge back, of the
 //           paid one) → prove → the sponsor's withdrawal lane; a refund or a failed start rebuilds it
-//           when the sponsor's view says `withdrawal.retry` (Q9 A; P4.2-fix C1);
+//           when the sponsor's view says `withdrawal.retry` (Q9 A; P4.2-fix C1), after releasing the
+//           draft the sponsor accepted, whose coin a failed start left booked (P4.2-fix2 R3);
 //   resume  "start swap" signed ONCE: the re-derived coin key must equal the record's; then the swap
 //           is re-opened with the sponsor for a new token, and the loop continues from its state. A
-//           failed swap the sponsor marked `recoverable` is resumed the same way (P4.2-fix C5).
+//           failed swap the sponsor marked `recoverable` is resumed the same way (P4.2-fix C5), and so
+//           is one whose record does not say (written before), for the sponsor to decide (P4.2-fix2 R3).
 //
 // The swap's PUBLIC id is keccak256(tag ‖ salt) (P4.2-fix C14): the sponsor, URLs and the snapshot
 // see it; the salt stays in this tab and the local record. Secrets stay in memory only: the sponsor's
@@ -38,11 +43,19 @@ import {
 } from '@evm-midnight-transparent/core';
 import { getAddress } from 'ethers';
 
+import { ethText } from './display.js';
 import { EvmError, type EvmPort, transferData } from './evm.js';
 import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
-import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner } from './ports.js';
-import { SWAP_RECORD_VERSION, type SwapRecord, isFinished, isRecoverable, swapIdOf } from './record-shape.js';
+import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner, WithdrawDraft } from './ports.js';
+import {
+  SWAP_RECORD_VERSION,
+  type SwapRecord,
+  isFinished,
+  isRecoverable,
+  isResumable,
+  swapIdOf,
+} from './record-shape.js';
 import {
   type OpenSwapPayload,
   type OpenSwapResponse,
@@ -60,6 +73,18 @@ export const MAX_SWEEP_WEI = 3n * 10n ** 15n;
  *  transfer (then the user presses Send funds again: the sweep is not sent twice). */
 export const SWEEP_RECEIPT_WAIT_MS = 5 * 60_000;
 const RECEIPT_POLL_MS = 3_000;
+
+/** While the sponsor waits for the funds, the page reads the deposit address's balances at most this
+ *  often (and at once when the requirement or a funding transfer changed): P4.2-fix2 R7. */
+export const FUNDING_CHECK_MS = 15_000;
+
+const WAITING_FOR_FUNDS = 'Waiting for your funds to reach the deposit address';
+
+/** What the deposit address still lacks of the verified funding, in wei and token base units. */
+interface Shortfall {
+  eth: bigint;
+  token: bigint;
+}
 
 export type SessionStatus =
   | { kind: 'signing'; prompt: 'start-1' | 'start-2' | 'sponsor' | 'resume' }
@@ -158,8 +183,12 @@ export class SwapSession {
   private token: string | null = null;
   /** What "Send funds" may send (P4.2-fix C8). */
   private funding: VerifiedFunding | null = null;
-  /** The sponsor raised the sweep gas after the funds were sent: "Send funds" tops the ETH up. */
-  private topUp = false;
+  /** The deposit address's latest shortfall reading (P4.2-fix2 R7), and what it was read against. */
+  private lack: { key: string; at: number; value: Shortfall | null } | null = null;
+  /** The withdrawal draft the sponsor accepted (`/withdraw` 202). Its coin stays booked in the wallet
+   *  until the start lands or the draft is released: released when the sponsor says the withdrawal
+   *  must be rebuilt (its start failed or it was refunded; P4.2-fix2 R3, the audit's F-B24). */
+  private submitted: WithdrawDraft | null = null;
   private wallet: TempWallet | null = null;
   private looping = false;
   private closed = false;
@@ -416,7 +445,9 @@ export class SwapSession {
     try {
       if (getAddress(signer.address) !== getAddress(record.evmAddress))
         throw new SessionError('Connect the wallet that started this swap to resume it.');
-      if (isFinished(record) && !isRecoverable(record)) {
+      // A failed swap resumes when the sponsor said it can revive it, or when the record does not
+      // say (written before): the re-open asks the sponsor (P4.2-fix2 R3).
+      if (isFinished(record) && !isResumable(record)) {
         this.status(
           record.phase === 'done'
             ? { kind: 'done' }
@@ -447,7 +478,8 @@ export class SwapSession {
       }
       this.wallet = wallet;
       void wallet.sync().catch(() => undefined);
-      // A re-open: the same terms and keys; a failed swap the sponsor marked recoverable revives.
+      // A re-open: the same terms and keys; a failed swap the sponsor can revive revives (its answer
+      // says `failed` otherwise, and the loop shows it).
       const opened = await this.open(record);
       // The record's funding block is replaced by the verified values (an imported record cannot
       // steer "Send funds": C8).
@@ -489,12 +521,17 @@ export class SwapSession {
       ]);
       const pendingEth = r.funding.eth?.status === 'sent';
       const pendingToken = r.funding.token?.status === 'sent';
-      if (this.topUp && pendingEth && ethThere < ethWei)
+      // The token goes at most once: once this page's transfer is confirmed, the deposit address held
+      // the amount, and only the vault's sweep moves it (P4.2-fix2 R7).
+      const tokenDelivered = r.funding.token?.status === 'confirmed';
+      // Only what the deposit address lacks NOW, against the sponsor's current requirement (a raised
+      // sweep gas, a re-armed deposit whose sweep used the ETH: P4.2-fix2 R7).
+      const needEth = !pendingEth && ethThere < ethWei ? ethWei - ethThere : 0n;
+      const needToken = !pendingToken && !tokenDelivered && tokenThere < amount ? amount - tokenThere : 0n;
+      if (pendingEth && ethThere < ethWei && needToken === 0n)
         throw new SessionError(
           'Your sweep gas transfer is still pending on Sepolia. Press Send funds again once it is confirmed to top it up.',
         );
-      const needEth = !pendingEth && ethThere < ethWei ? ethWei - ethThere : 0n;
-      const needToken = !pendingToken && tokenThere < amount ? amount - tokenThere : 0n;
       // C8: before any of the token goes, the offer must still be live with this swap's terms (once
       // some of it is at the deposit address, the rest follows so the funds can bridge in and back).
       if (needToken > 0n && tokenThere === 0n) await this.assertOfferStillOn(r);
@@ -548,8 +585,8 @@ export class SwapSession {
           updatedAt: this.deps.now(),
         });
       }
-      this.topUp = false;
-      this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
+      this.lack = null;
+      this.status({ kind: 'working', what: WAITING_FOR_FUNDS });
       void this.loop();
     } catch (e) {
       this.set({ status: { kind: 'fund', sending: null }, notice: describe(e) });
@@ -557,7 +594,8 @@ export class SwapSession {
   }
 
   /** The sponsor RAISED the sweep gas while the swap waits for its funds (the live base fee outgrew
-   *  it; never lowered): adopt it, checked as at open (C8), and have "Send funds" top the ETH up. */
+   *  it; never lowered): adopt it, checked as at open (C8). The funding step then reads what the
+   *  deposit address lacks against it, and "Send funds" tops the ETH up (P4.2-fix2 R7). */
   private adoptRaisedSweep(g: SweepGas): void {
     const f = this.funding;
     if (!f) return;
@@ -568,11 +606,70 @@ export class SwapSession {
       return;
     }
     this.funding = { ...f, sweepGas: { gasLimit: g.gasLimit, maxFeePerGas: g.maxFeePerGas, ethWei: g.ethWei }, ethWei };
-    this.topUp = true;
     this.saveRecord({ ...this.record, deposit: this.depositOf(), updatedAt: this.deps.now() });
-    this.set({
-      notice:
-        'The Sepolia gas price rose, so the bridge needs more sweep gas at the deposit address. Press Send funds to top it up.',
+  }
+
+  /** What the deposit address lacks of the verified funding now, read through the connected wallet:
+   *  at most every FUNDING_CHECK_MS, at once when the requirement or a funding transfer changed. Null
+   *  when it cannot be read (no verified funding, funding paused, a failed read). */
+  private async shortfall(): Promise<Shortfall | null> {
+    const f = this.funding;
+    if (!f || this.fundingRefusal()) return null;
+    const r = this.record;
+    const key = [f.address, f.erc20Address, f.amount, f.ethWei, r.funding.eth?.status, r.funding.token?.status].join(
+      '|',
+    );
+    const now = this.deps.now();
+    if (this.lack && this.lack.key === key && now - this.lack.at < FUNDING_CHECK_MS) return this.lack.value;
+    let value: Shortfall | null;
+    try {
+      const [eth, token] = await Promise.all([
+        this.deps.evm.ethBalance(f.address),
+        this.deps.evm.erc20Balance(f.erc20Address, f.address),
+      ]);
+      value = { eth: eth < f.ethWei ? f.ethWei - eth : 0n, token: token < f.amount ? f.amount - token : 0n };
+    } catch {
+      value = null;
+    }
+    this.lack = { key, at: now, value };
+    return value;
+  }
+
+  /** The sponsor waits for the funds: offer "Send funds" when the deposit address lacks something no
+   *  pending transfer of this page will bring (the first funding; after a resume, a raised sweep gas
+   *  or a re-armed deposit whose sweep used the ETH: P4.2-fix2 R7, the audit's F-B23), else wait.
+   *  Decided from the balances at the deposit address, not from whether the funds were sent once. */
+  private async fundingStep(): Promise<void> {
+    const st = this.snap.status;
+    if (st.kind === 'fund' && st.sending !== null) return; // "Send funds" is running
+    const r = this.record;
+    const lack = await this.shortfall();
+    if (this.closed) return;
+    if (lack === null) {
+      // Unreadable (or funding paused): as before, the funding step until the transfers are sent.
+      if (this.fundingSent(r)) this.status({ kind: 'working', what: WAITING_FOR_FUNDS });
+      else if (this.snap.status.kind !== 'fund') this.status({ kind: 'fund', sending: null });
+      return;
+    }
+    const ethMissing = lack.eth > 0n && r.funding.eth?.status !== 'sent';
+    const tokenMissing =
+      lack.token > 0n && r.funding.token?.status !== 'sent' && r.funding.token?.status !== 'confirmed';
+    if (ethMissing || tokenMissing) {
+      if (this.snap.status.kind === 'fund') return;
+      this.status({ kind: 'fund', sending: null });
+      // A top-up after the funds were sent (not the first funding): say what is missing and why.
+      if (this.fundingSent(r) && !tokenMissing)
+        this.set({
+          notice: `The deposit address holds ${ethText(lack.eth)} less sweep gas than the bridge needs now (the Sepolia gas price rose, or an earlier sweep used it). Press Send funds to top it up: only the missing ETH is sent.`,
+        });
+      return;
+    }
+    this.status({
+      kind: 'working',
+      what:
+        lack.token > 0n && r.funding.token?.status === 'confirmed'
+          ? `Your ${r.offer.pay.symbol} transfer is confirmed, but the deposit address does not hold it now: waiting for the sponsor`
+          : WAITING_FOR_FUNDS,
     });
   }
 
@@ -719,9 +816,7 @@ export class SwapSession {
           return;
         }
         if (act === 'fund') {
-          if (this.fundingSent(this.record) && !this.topUp)
-            this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
-          else if (this.snap.status.kind !== 'fund') this.status({ kind: 'fund', sending: null });
+          await this.fundingStep();
         } else if (act === 'wait') {
           this.status({
             kind: 'working',
@@ -751,7 +846,17 @@ export class SwapSession {
     try {
       this.status({ kind: 'working', what: 'Syncing the temporary Midnight wallet' });
       await wallet.sync();
-      const act = afterMint(this.record, await wallet.balances(), withdrawalStatus(view));
+      const signal = withdrawalStatus(view);
+      // The sponsor says the withdrawal it accepted ended without a transfer and must be rebuilt: give
+      // its coin back to the wallet first. A start that never landed left it booked (the wallet never
+      // frees a pending spend by itself); after a refund the spend has landed, and the release is a
+      // no-op. After the sync, so a landed spend is already applied (P4.2-fix2 R3, F-B24).
+      if (signal.rebuild && this.submitted) {
+        const d = this.submitted;
+        this.submitted = null;
+        await d.release().catch(() => undefined);
+      }
+      const act = afterMint(this.record, await wallet.balances(), signal);
       switch (act) {
         case 'take':
           await this.take();
@@ -887,6 +992,9 @@ export class SwapSession {
         const bound = backends.wallet.finalizeWithdraw(draft, proven.tx);
         this.status({ kind: 'working', what: 'Submitting the withdrawal to the sponsor' });
         view = await sponsor.withdraw(this.snap.swapId, this.token!, { tx: bound.tx });
+        // Accepted: its coin stays booked until the start lands, or until the sponsor says it must be
+        // rebuilt, when `onMinted` releases it (P4.2-fix2 R3).
+        this.submitted = draft;
       } catch (e) {
         await draft.release();
         if (e instanceof SponsorError && e.rebuild && attempt < 3) {
@@ -940,6 +1048,8 @@ export class SwapSession {
     this.closed = true;
     this.token = null;
     this.funding = null;
+    this.submitted = null;
+    this.lack = null;
     const w = this.wallet;
     this.wallet = null;
     await w?.close().catch(() => undefined);

@@ -147,9 +147,10 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
     next.outcome = view.outcome ?? (record.choice === 'bridge-back' ? 'bridged-back' : 'swapped');
   if (view.state === 'failed') {
     next.error = (view.message ?? view.reason ?? 'The sponsor stopped this swap.').slice(0, 500);
-    // P4.2-fix C5: a failure the sponsor can revive by a re-open; the page offers Resume.
-    if (view.recoverable === true) next.recoverable = true;
-    else delete next.recoverable;
+    // P4.2-fix C5: a failure the sponsor can revive by a re-open; the page offers Resume. Its "no" is
+    // kept as `false` (P4.2-fix2 R3): a record without the field is one the sponsor was not asked
+    // about yet (written before), and the page offers Resume for it.
+    next.recoverable = view.recoverable === true;
   } else if (record.phase === 'failed') {
     // Revived by a re-open: the failure is over.
     delete next.error;
