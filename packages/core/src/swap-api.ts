@@ -288,7 +288,9 @@ const txHex = z
 
 /** A coin the transaction pays to the temporary wallet, disclosed so the sponsor can recompute its
  *  commitment with the temporary coin public key (plan 00048 P4.2-fix2, audit R1 / F-B21). */
-export const WalletOutputSchema = z.object({ nonce: hex64, colour: hex64, value: decimal }).strict();
+export const WalletOutputSchema = z
+  .object({ nonce: hex64, colour: hex64, value: z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units') })
+  .strict();
 export type WalletOutput = z.infer<typeof WalletOutputSchema>;
 
 /** At most this many disclosed wallet outputs (a transaction has at most 4 coins in and out). */

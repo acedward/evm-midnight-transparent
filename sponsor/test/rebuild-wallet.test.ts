@@ -306,6 +306,8 @@ describe('R1 on the real ledger: the outputs the wallet discloses, recomputed by
     );
     const all = new Set(outs.map((o) => commitment(o, wallet.coinPk)));
     expect([...all].sort()).toEqual(summary.shielded.outputs.map((x) => x.commitment.toLowerCase()).sort());
+    // FW2's draft discloses exactly these (packages/wallet/src/outputs.ts, the same recipe).
+    expect(new Set(draft.walletOutputs.map((o) => commitment(o, wallet.coinPk)))).toEqual(all);
     expect(detailOf(() => validateTake(summary, terms, { walletOutputs: all }))).toBe('accepted');
     const noChange = new Set(outs.filter((o) => o.colour === WUSDC).map((o) => commitment(o, wallet.coinPk)));
     expect(detailOf(() => validateTake(summary, terms, { walletOutputs: noChange }))).toBe('undisclosed-output');
@@ -336,6 +338,7 @@ describe('R1 on the real ledger: the outputs the wallet discloses, recomputed by
     const outs = walletOutputsOf(draft.tx);
     expect(outs.map((o) => [o.colour, o.value])).toEqual([[WSTKA, 2_000_000n]]);
     const change = new Set(outs.map((o) => commitment(o, wallet.coinPk)));
+    expect(new Set(draft.walletOutputs.map((o) => commitment(o, wallet.coinPk)))).toEqual(change);
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA, { walletOutputs: change }))).toBe('accepted');
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA, { walletOutputs: new Set() }))).toBe(
       'undisclosed-output',
