@@ -28,7 +28,7 @@ import { requestDetail } from '../src/bridge/live-backend.js';
 import { rebuildStartWithdraw } from '../src/bridge/rebuild.js';
 import type { WithdrawCallArgs } from '../src/swaps/backend.js';
 import { inspectTransaction, makerImbalances, summarise } from '../src/validate/inspect.js';
-import { InvalidTxError, validateTake, validateWithdraw } from '../src/validate/rules.js';
+import { InvalidTxError, gasClose, validateTake, validateWithdraw } from '../src/validate/rules.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const AT_679357 = fixture<VaultFixture>('stagenet-vault-679357.json');
@@ -111,7 +111,11 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
     });
     expect(requestDetail({ txParams: { to: 'x' } })).toBeUndefined();
     expect(rebuilt.calls.map((c) => c.entryPoint)).toEqual(['startWithdraw', 'signBidirectional']);
-    expect(summary.calls).toEqual(rebuilt.calls);
+    // The calls are identical but for their declared gas, which the callee's random commitment moves
+    // a little (compared with a tolerance by the rule).
+    const bare = (cs: typeof summary.calls) => cs.map(({ gas: _gas, ...c }) => c);
+    expect(bare(summary.calls)).toEqual(bare(rebuilt.calls));
+    summary.calls.forEach((c, i) => expect(gasClose(c.gas, rebuilt.calls[i]!.gas)).toBe(true));
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');
     // Audit C4: the coin the wallet hands to the vault is exactly the rebuild's (same commitment,
     // owned by the vault), and the transaction's structure digest (calls, segments, every coin) is
@@ -123,6 +127,62 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
     const tx = l.Transaction.deserialize('signature', 'pre-proof', 'pre-binding', hexToBytes(draft.tx)) as any;
     expect(summarise(tx.eraseProofs()).structureDigest).toBe(summary.structureDigest);
     expect(summarise(tx.bind()).structureDigest).toBe(summary.structureDigest);
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('agrees over many fresh builds: the random callee commitment moves the declared gas a little, never the calls (found in P4.2-fix CI)', async () => {
+    // About 1 build in 40 declared a slightly different compute time (the commitment's encoded
+    // length); the digests used to include it, so a valid withdrawal was refused as wrong-call.
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: B31.amount }]);
+    for (let i = 0; i < 60; i++) {
+      const draft = await buildWithdraw(
+        wallet,
+        { colour: WSTKA, amount: B31.amount, dest: B31.dest, evmNonce: B31.evmNonce },
+        { reader: fixtureReader(AT_679357) },
+      );
+      const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+      const rebuilt = await rebuildStartWithdraw(
+        runtime,
+        fixtureReader(AT_679357),
+        VAULT,
+        argsFor(wallet, draft.coinNonce),
+      );
+      expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');
+      await draft.release();
+    }
+    await wallet.close();
+  }, 120_000);
+
+  it('refuses a withdrawal whose calls declare more gas than the rebuild (the sponsor’s DUST pays for it)', async () => {
+    const { wallet, draft } = await walletDraft();
+    const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+    const rebuilt = await rebuildStartWithdraw(
+      runtime,
+      fixtureReader(AT_679357),
+      VAULT,
+      argsFor(wallet, draft.coinNonce),
+    );
+    const g = summary.calls[0]!.gas!.guaranteed!;
+    expect(Object.keys(g).length).toBeGreaterThan(0);
+    const inflate = (pct: bigint) => ({
+      ...summary,
+      calls: summary.calls.map((c, i) =>
+        i === 0
+          ? {
+              ...c,
+              gas: {
+                ...c.gas!,
+                guaranteed: Object.fromEntries(
+                  Object.entries(g).map(([k, v]) => [k, ((BigInt(v) * (1000n + pct)) / 1000n).toString()]),
+                ),
+              },
+            }
+          : c,
+      ),
+    });
+    expect(detailOf(() => validateWithdraw(inflate(20n), rebuilt, WSTKA))).toBe('wrong-call'); // +2%
+    expect(detailOf(() => validateWithdraw(inflate(5n), rebuilt, WSTKA))).toBe('accepted'); // +0.5%
     await draft.release();
     await wallet.close();
   });

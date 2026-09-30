@@ -13,6 +13,7 @@ import {
   callDigest,
   callsDigestOf,
   entryPointText,
+  gasOf,
   normaliseAddress,
   structureDigestOf,
   type CallSummary,
@@ -81,6 +82,7 @@ export function summarise(tx: Any): TxSummary {
             guaranteedTranscript: action.guaranteedTranscript,
             fallibleTranscript: action.fallibleTranscript,
           }),
+          gas: { guaranteed: gasOf(action.guaranteedTranscript), fallible: gasOf(action.fallibleTranscript) },
         });
       } else if (action instanceof ledger.ContractDeploy) deploys++;
       else maintenanceUpdates++;
@@ -120,7 +122,7 @@ export function summarise(tx: Any): TxSummary {
     callsDigest,
     segments,
     shielded,
-    structureDigest: structureDigestOf({ callsDigest, segments, shielded }),
+    structureDigest: structureDigestOf({ callsDigest, segments, shielded, calls }),
   };
 }
 

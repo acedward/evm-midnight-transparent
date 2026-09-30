@@ -142,6 +142,33 @@ export interface ExpectedCalls {
   outputs?: readonly { commitment: string; contract: string | null }[];
 }
 
+/** The most a call's declared gas may differ from the sponsor's rebuild, in percent. The callee's
+ *  random commitment moves it by far less (about 0.002% measured); a larger gap is another call, or
+ *  a declared cost inflated to make the sponsor's DUST pay more. */
+export const GAS_TOLERANCE_PERCENT = 1n;
+
+/** Every declared cost of `got` within GAS_TOLERANCE_PERCENT of `want`'s (the same cost names). */
+export function gasClose(got: CallSummary['gas'], want: CallSummary['gas']): boolean {
+  if (!got || !want) return got === want || (!got && !want);
+  for (const part of ['guaranteed', 'fallible'] as const) {
+    const a = got[part];
+    const b = want[part];
+    if (a === null || b === null) {
+      if (a !== b) return false;
+      continue;
+    }
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const k of keys) {
+      if (a[k] === undefined || b[k] === undefined) return false;
+      const x = BigInt(a[k]!);
+      const y = BigInt(b[k]!);
+      const diff = x > y ? x - y : y - x;
+      if (diff * 100n > GAS_TOLERANCE_PERCENT * (y > 0n ? y : 1n)) return false;
+    }
+  }
+  return true;
+}
+
 export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: string): void {
   commonShape(s, true);
   if (s.intents !== 1) fail('extra-calls', 'a withdrawal is exactly one intent');
@@ -165,6 +192,7 @@ export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: 
         'the startWithdraw is not this swap’s (its amount, colour, destination, refund recipient, gas or nonce differ)',
       );
     }
+    if (!gasClose(got.gas, want.gas)) fail('wrong-call', 'the call declares another cost than the sponsor’s rebuild');
   }
   if (s.callsDigest !== expected.callsDigest) fail('wrong-call', 'the calls differ from the expected startWithdraw');
   if (expected.outputs) withdrawCoins(s, expected.outputs);
