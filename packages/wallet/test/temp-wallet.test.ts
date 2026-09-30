@@ -1,7 +1,14 @@
 import { Wallet, keccak256, toUtf8Bytes } from 'ethers';
 import { describe, expect, it, vi } from 'vitest';
 
-import { STAGENET, UNDEPLOYED, swapDepositAddress, swapSeedFromSignature } from '@evm-midnight-transparent/core';
+import {
+  START_SWAP_PURPOSE,
+  START_SWAP_PURPOSE_V2,
+  STAGENET,
+  UNDEPLOYED,
+  swapDepositAddress,
+  swapSeedFromSignature,
+} from '@evm-midnight-transparent/core';
 
 import {
   TempWalletError,
@@ -30,6 +37,8 @@ const VECTOR = {
   otherSignature:
     '0x751ce9d84fff861bb00e95399ffa024a04adf4726e8bcc1be134a184a8e171f65d6025a66a02081aedea3d1565ea554792bf16c9f68be70577449ec013b898441b',
 };
+/** core's derivation-2 vector (the warning purpose, P4.2-fix C14): what new swaps sign. */
+const SEED_V2 = 'a4ccf5b9124011052b553a154f60370ff7afa8463dbeb1c5a6ebd50f61964ce1';
 
 const localSigner = (w: Wallet): SwapSigner => ({
   address: w.address,
@@ -40,12 +49,22 @@ const localSigner = (w: Wallet): SwapSigner => ({
 });
 
 describe('deriveSwapSeed', () => {
-  it("signs the profile's start-swap message twice and returns the first signature's seed (core's vector)", async () => {
+  it("signs derivation 2 by default: the warning purpose, core's version-2 vector (P4.2-fix C14)", async () => {
     const signer = localSigner(EVM);
     const spy = vi.spyOn(signer, 'signTypedData');
     const out = await deriveSwapSeed(signer, SALT);
     expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[0]![0].message.purpose).toBe(START_SWAP_PURPOSE_V2);
+    expect(out).toEqual({ seed: SEED_V2, deterministic: true, signer: VECTOR.address });
+  });
+
+  it("signs the profile's start-swap message twice and returns the first signature's seed (core's vector)", async () => {
+    const signer = localSigner(EVM);
+    const spy = vi.spyOn(signer, 'signTypedData');
+    const out = await deriveSwapSeed(signer, SALT, { derivation: 1 });
+    expect(spy).toHaveBeenCalledTimes(2);
     const td = spy.mock.calls[0]![0];
+    expect(td.message.purpose).toBe(START_SWAP_PURPOSE);
     expect(td.message.network).toBe('stagenet');
     expect(td.message.vault).toBe(`0x${STAGENET.bridge.vaultAddress}`);
     expect(td.message.salt).toBe(SALT);
@@ -56,7 +75,9 @@ describe('deriveSwapSeed', () => {
 
   it('reports a non-deterministic signer and keeps the first seed', async () => {
     const answers = [VECTOR.signature, VECTOR.otherSignature];
-    const out = await deriveSwapSeed({ address: VECTOR.address, signTypedData: async () => answers.shift()! }, SALT);
+    const out = await deriveSwapSeed({ address: VECTOR.address, signTypedData: async () => answers.shift()! }, SALT, {
+      derivation: 1,
+    });
     expect(out).toEqual({ seed: VECTOR.seed, deterministic: false, signer: VECTOR.address });
   });
 

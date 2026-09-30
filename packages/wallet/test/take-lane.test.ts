@@ -1,6 +1,7 @@
+import { firstValueFrom } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { MAX_INPUT_CHARS, offerIdOf } from '@evm-midnight-transparent/core';
+import { MAX_INPUT_CHARS, decodeOffer, offerIdOf } from '@evm-midnight-transparent/core';
 
 import {
   TakeError,
@@ -8,11 +9,13 @@ import {
   decodeMakerTransaction,
   dustSpendCount,
   finalizeTake,
+  servedOfferId,
   shieldedImbalances,
   submitTake,
   txToHex,
   unprovenFromHex,
 } from '../src/index.js';
+import { internalsOf, type TempWallet } from '../src/temp-wallet.js';
 
 import { TEST_SEED_A, TEST_SEED_B, WSTKA, WUSDC, fixture, walletWithCoins } from './helpers.js';
 
@@ -26,6 +29,14 @@ const WANTED = 104_166_667n;
 
 /** What the sponsor's `/prove` would answer, for the offline tests: a proven-typed hex. */
 const mockProven = (unprovenHex: string) => txToHex(unprovenFromHex(unprovenHex).mockProve());
+
+/** A separately balanced shielded transfer from `wallet` (to itself): what a prover could add to a
+ *  draft without changing any colour's imbalance (the audit's F-B9). */
+async function balancedTransfer(wallet: TempWallet, colour: string, amount: bigint) {
+  const { opened, keys } = internalsOf(wallet);
+  const self = (await firstValueFrom(opened.wallet.state)).address;
+  return opened.wallet.transferTransaction(keys.shieldedSecretKeys, [{ type: colour, receiverAddress: self, amount }]);
+}
 
 describe('buildTake: the unproven, shielded-balanced complement of an offer', () => {
   it("balances exactly the maker's legs from the wallet's coin, with no DUST", async () => {
@@ -96,6 +107,30 @@ describe('finalizeTake: bind the proven complement and merge it into the offer',
     for (const id of tx.identifiers()) expect(ids.has(String(id))).toBe(true);
     expect(offerIdOf(tx.serialize())).toBe(OFFER.offerId);
     await wallet.close();
+  });
+
+  it('the offer id is sha256 of the maker bytes AS SERVED (P4.2-fix C10)', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: WANTED }]);
+    const draft = await buildTake(wallet, OFFER.offerBech32);
+    expect(servedOfferId(OFFER.offerBech32)).toBe(OFFER.offerId);
+    expect(draft.offerId).toBe(offerIdOf(decodeOffer(OFFER.offerBech32)));
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('refuses a proven answer that adds a separately balanced transfer (P4.2-fix C10, F-B9)', async () => {
+    const a = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: WANTED }]);
+    const b = await walletWithCoins(TEST_SEED_B, [{ colour: WUSDC, value: 5_000_000n }]);
+    const draft = await buildTake(a, OFFER.offerBech32);
+    const extra = await balancedTransfer(b, WUSDC, 1_000_000n);
+    // Every identifier of the draft is still there, and every colour still balances against the offer.
+    const tampered = unprovenFromHex(draft.tx).merge(extra).mockProve();
+    const ids = new Set(tampered.identifiers().map(String));
+    expect(draft.identifiers.every((id) => ids.has(id))).toBe(true);
+    expect(() => finalizeTake(draft, txToHex(tampered))).toThrow(expect.objectContaining({ code: 'proof-mismatch' }));
+    // The honest answer still passes.
+    expect(finalizeTake(draft, mockProven(draft.tx)).offerId).toBe(OFFER.offerId);
+    await Promise.all([a.close(), b.close()]);
   });
 
   it("refuses a proven transaction that is not this take's (another wallet's complement)", async () => {

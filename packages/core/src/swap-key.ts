@@ -28,8 +28,25 @@
 //
 // Binding the vault and the network into the message keeps a stagenet swap's key different from
 // any other deployment's; binding the chain id makes the wallet refuse to sign on another chain.
+//
+// VERSION 2 (P4.2-fix C14, the audit's F-A11): the same message with another `purpose`, a warning
+// (START_SWAP_PURPOSE_V2): EIP-712 cannot bind the site that asks, and whoever holds the signature
+// holds the swap's funds, so the prompt itself says where to sign it and what it gives away. New
+// swaps use version 2; version 1 stays for the swaps started before (their records say which), and
+// the gates' re-derivations. The salt is no longer the swap's public id either: the sponsor, the
+// page's URL and every log see `swapIdFromSalt(salt)` = keccak256("evm-midnight-swap/id" ‖ salt),
+// and the salt stays in the browser's own record (Resume needs it to ask for the same signature).
 
-import { TypedDataEncoder, getAddress, getBytes, hexlify, keccak256, verifyTypedData } from 'ethers';
+import {
+  TypedDataEncoder,
+  concat,
+  getAddress,
+  getBytes,
+  hexlify,
+  keccak256,
+  toUtf8Bytes,
+  verifyTypedData,
+} from 'ethers';
 
 import { bytesToHex } from './hex.js';
 import { SEPOLIA_CHAIN_ID } from './network.js';
@@ -39,12 +56,29 @@ import { SEPOLIA_CHAIN_ID } from './network.js';
 export const SWAP_KEY_DOMAIN_NAME = 'EVM Midnight Swap';
 export const SWAP_KEY_DOMAIN_VERSION = '1';
 export const START_SWAP_PRIMARY_TYPE = 'StartSwap';
-/** The derivation spec's version (this file's header). */
+/** The derivation spec's version 1 (this file's header): the swaps started before P4.2-fix. */
 export const SWAP_KEY_DERIVATION_VERSION = 1;
+/** The version new swaps use (the warning purpose, P4.2-fix C14). */
+export const SWAP_KEY_DERIVATION_LATEST = 2;
+export type SwapKeyDerivation = 1 | 2;
 
-/** What the user reads in the wallet's signing prompt. Part of the key: never edit it. */
+/** What the user reads in the wallet's signing prompt (version 1). Part of the key: never edit it. */
 export const START_SWAP_PURPOSE =
   "Start a swap. This signature creates the swap's temporary Midnight wallet; sign it again to recover the swap.";
+
+/** Version 2's purpose: a warning in the prompt itself. Part of the key: never edit it. */
+export const START_SWAP_PURPOSE_V2 =
+  "Start or resume a swap. WARNING: this signature is the key to the swap's temporary Midnight wallet and the tokens in it. Only sign it in the swap app where you started this swap, never on another site: whoever gets this signature can take the swap's tokens.";
+
+/** The purpose text of a derivation version. */
+export function startSwapPurpose(derivation: SwapKeyDerivation = SWAP_KEY_DERIVATION_VERSION): string {
+  if (derivation === 1) return START_SWAP_PURPOSE;
+  if (derivation === 2) return START_SWAP_PURPOSE_V2;
+  throw new SwapKeyError('unknown derivation version');
+}
+
+/** The tag of the public swap id (P4.2-fix C14). */
+export const SWAP_ID_TAG = 'evm-midnight-swap/id';
 
 export const START_SWAP_TYPES = {
   [START_SWAP_PRIMARY_TYPE]: [
@@ -73,6 +107,8 @@ export interface StartSwapParams {
   /** The swap's salt (64 hex, optional 0x). */
   salt: string;
   chainId?: number;
+  /** The derivation version (default 1; new swaps use SWAP_KEY_DERIVATION_LATEST). */
+  derivation?: SwapKeyDerivation;
 }
 
 export interface StartSwapMessage {
@@ -97,7 +133,7 @@ export function startSwapDomain(chainId: number = SEPOLIA_CHAIN_ID) {
 export function startSwapMessage(p: StartSwapParams): StartSwapMessage {
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(p.network)) throw new SwapKeyError('the network name is not valid');
   return {
-    purpose: START_SWAP_PURPOSE,
+    purpose: startSwapPurpose(p.derivation),
     network: p.network,
     vault: hex32('vault', p.vault),
     salt: hex32('salt', p.salt),
@@ -122,6 +158,12 @@ export function startSwapDigest(p: StartSwapParams): string {
 /** The EVM address that signed, so the app can check it is the connected account. */
 export function recoverStartSwapSigner(p: StartSwapParams, signature: string): string {
   return getAddress(verifyTypedData(startSwapDomain(p.chainId), START_SWAP_TYPES, startSwapMessage(p), signature));
+}
+
+/** The swap's PUBLIC id: keccak256(utf8(SWAP_ID_TAG) ‖ the salt's 32 bytes), 0x + 64 lowercase hex.
+ *  What the sponsor, URLs and logs see; the salt itself stays in the browser (P4.2-fix C14). */
+export function swapIdFromSalt(salt: string): string {
+  return keccak256(concat([toUtf8Bytes(SWAP_ID_TAG), getBytes(hex32('salt', salt))])).toLowerCase();
 }
 
 /** A new swap's salt: 32 bytes from the platform's CSPRNG, 0x-prefixed hex. */
