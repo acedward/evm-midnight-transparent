@@ -76,7 +76,7 @@ export interface SwapSeed {
  * The swap's seed from the user's "start swap" signature, asked for TWICE (spec Q4; the derivation
  * spec is core's swap-key.ts). The message binds the profile's Midnight network and vault and this
  * swap's `salt` (32 bytes of hex, kept in the browser's swap record only: the sponsor and URLs see
- * `swapIdFromSalt(salt)`). New swaps use derivation 2, whose prompt carries the warning (P4.2-fix
+ * `publicSwapId(salt)`). New swaps use derivation 2, whose prompt carries the warning (P4.2-fix
  * C14); pass `derivation: 1` only to re-derive a swap started before it. Signatures from another
  * account than `signer.address` are refused. The seed of the FIRST signature is returned.
  */

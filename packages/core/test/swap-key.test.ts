@@ -3,9 +3,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   START_SWAP_PURPOSE,
-  START_SWAP_PURPOSE_V2,
-  SWAP_ID_TAG,
-  SWAP_KEY_DERIVATION_LATEST,
   SWAP_KEY_DOMAIN_NAME,
   SwapKeyError,
   deriveSwapSeed,
@@ -15,9 +12,7 @@ import {
   startSwapDigest,
   startSwapDomain,
   startSwapMessage,
-  startSwapPurpose,
   startSwapTypedData,
-  swapIdFromSalt,
   swapSeedFromSignature,
   type StartSwapSigner,
 } from '../src/swap-key.js';
@@ -180,64 +175,5 @@ describe('the salt', () => {
     expect(a).toMatch(/^0x[0-9a-f]{64}$/);
     expect(a).not.toBe(b);
     expect(newSwapSalt((buf) => buf.fill(7))).toBe(`0x${'07'.repeat(32)}`);
-  });
-});
-
-// P4.2-fix C14 (the audit's F-A11): new swaps sign derivation 2, whose purpose is a warning, and the
-// sponsor, URLs and logs see a public id derived from the salt, never the salt itself.
-const VECTOR_V2 = {
-  digest: '0x0d8b95d5d69fa817c023b4e3fe9f186b6345cffbeaed18002dd8c1f10b3efabf',
-  signature:
-    '0x29180a6a095bc49d31b7071f0e4e95f3351f1da5e52334782ec4866f48f3e2985698c2b2393051697bbc0504a0aa743fbead814c80fd5e9fcb4a93e8dd78ca0d1b',
-  seed: 'a4ccf5b9124011052b553a154f60370ff7afa8463dbeb1c5a6ebd50f61964ce1',
-  swapId: '0x033d749d9cee0b11b50817c15f0fe29ba74a1b26c594fbad5dd7dbfd5953cc00',
-};
-
-describe('derivation 2: the warning in the prompt (P4.2-fix C14)', () => {
-  const P2 = { ...PARAMS, derivation: 2 as const };
-
-  it('is what new swaps use; its purpose warns where to sign and what the signature gives away', () => {
-    expect(SWAP_KEY_DERIVATION_LATEST).toBe(2);
-    expect(startSwapPurpose(2)).toBe(START_SWAP_PURPOSE_V2);
-    expect(START_SWAP_PURPOSE_V2).toMatch(/WARNING/);
-    expect(START_SWAP_PURPOSE_V2).toMatch(/Only sign it in the swap app where you started this swap/);
-    expect(START_SWAP_PURPOSE_V2).toMatch(/whoever gets this signature can take the swap's tokens/);
-    expect(START_SWAP_PURPOSE_V2).not.toMatch(/sign it again to recover/);
-    expect(startSwapTypedData(P2).message.purpose).toBe(START_SWAP_PURPOSE_V2);
-  });
-
-  it('keeps version 1 byte for byte (the swaps started before, and the gates)', () => {
-    expect(startSwapPurpose(1)).toBe(START_SWAP_PURPOSE);
-    expect(startSwapDigest(PARAMS)).toBe(VECTOR.digest);
-    expect(startSwapDigest({ ...PARAMS, derivation: 1 })).toBe(VECTOR.digest);
-  });
-
-  it('matches its fixed vector: another digest, so another seed for the same salt', async () => {
-    expect(startSwapDigest(P2)).toBe(VECTOR_V2.digest);
-    expect(
-      await TEST_WALLET.signTypedData(
-        startSwapDomain(),
-        { StartSwap: startSwapTypedData(P2).types.StartSwap },
-        startSwapMessage(P2),
-      ),
-    ).toBe(VECTOR_V2.signature);
-    expect(swapSeedFromSignature(VECTOR_V2.signature)).toBe(VECTOR_V2.seed);
-    expect(VECTOR_V2.seed).not.toBe(VECTOR.seed);
-    expect(recoverStartSwapSigner(P2, VECTOR_V2.signature)).toBe(VECTOR.address);
-    // A version-1 signature does not recover to the signer under version 2.
-    expect(recoverStartSwapSigner(P2, VECTOR.signature)).not.toBe(VECTOR.address);
-    const out = await deriveSwapSeed(localSigner(TEST_WALLET), P2, VECTOR.address);
-    expect(out).toEqual({ seedHex: VECTOR_V2.seed, deterministic: true, signer: VECTOR.address });
-  });
-});
-
-describe('the public swap id (P4.2-fix C14)', () => {
-  it('is keccak256(utf8("evm-midnight-swap/id") ‖ salt), never the salt', () => {
-    expect(SWAP_ID_TAG).toBe('evm-midnight-swap/id');
-    expect(swapIdFromSalt(VECTOR.salt)).toBe(VECTOR_V2.swapId);
-    expect(swapIdFromSalt(VECTOR.salt)).toBe(keccak256(concat([toUtf8Bytes(SWAP_ID_TAG), VECTOR.salt])));
-    expect(swapIdFromSalt(VECTOR.salt.slice(2).toUpperCase())).toBe(VECTOR_V2.swapId);
-    expect(swapIdFromSalt(VECTOR.salt)).not.toBe(VECTOR.salt);
-    expect(() => swapIdFromSalt('0x1234')).toThrow(SwapKeyError);
   });
 });

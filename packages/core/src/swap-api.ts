@@ -42,7 +42,9 @@ export const OPEN_SWAP_ACTION = 'open-swap' as const;
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/, 'expected 64 lowercase hex characters (no 0x)');
 const decimal = z.string().regex(/^[1-9][0-9]{0,38}$/, 'expected a positive decimal integer string');
 const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'expected a 0x-prefixed 20-byte address');
-/** A swap id in a path or body: the "start swap" salt, 32 bytes, with or without 0x. */
+/** A swap id in a path or body: the swap's PUBLIC id, `publicSwapId(salt)` (./swap-key.ts), 32 bytes,
+ *  with or without 0x. Never the "start swap" salt itself: the salt stays in the browser's record
+ *  (plan 00048 P4.2-fix, audit C14). */
 export const SwapIdSchema = z
   .string()
   .regex(/^(0x)?[0-9a-fA-F]{64}$/, 'expected a 32-byte swap id')
@@ -74,7 +76,7 @@ export type OpenSwapPayload = z.infer<typeof OpenSwapPayloadSchema>;
 
 export const OpenSwapRequestSchema = z
   .object({
-    /** The swap id (the "start swap" salt). It must be the signature's `swap`. */
+    /** The swap's public id (`publicSwapId(salt)`, never the salt). It must be the signature's `swap`. */
     swap: SwapIdSchema,
     payload: OpenSwapPayloadSchema,
     auth: SignedSponsorActionSchema,
@@ -82,8 +84,12 @@ export const OpenSwapRequestSchema = z
   .strict();
 export type OpenSwapRequest = z.input<typeof OpenSwapRequestSchema>;
 
-/** The sweep's EIP-1559 fields, fixed when the swap opens (spec Q5 A): the user sends `ethWei`
- *  (= gasLimit × maxFeePerGas) to the deposit address with the token. Decimal strings. */
+/** The sweep's EIP-1559 fields, sized when the swap opens (spec Q5 A): the user sends `ethWei`
+ *  (= gasLimit × maxFeePerGas) to the deposit address with the token. Decimal strings.
+ *  While the swap is `awaiting_funds` the sponsor may RAISE them (never lower them) when the live
+ *  base fee outgrows them, in the swap view and in a re-open's answer: the page then tops the
+ *  deposit address up to the new `ethWei`. `startDeposit` signs the largest fee the ETH actually
+ *  at the address covers (plan 00048 P4.2-fix, audit C2). */
 export const SweepGasSchema = z.object({
   gasLimit: decimal,
   maxFeePerGas: decimal,
@@ -164,20 +170,32 @@ export const WithdrawViewSchema = z.object({
   completeTx: z.string().optional(),
   completeTxId: z.string().optional(),
   attested: z.enum(ATTESTED_KINDS).optional(),
-  /** How many withdrawals of this swap were refunded before this one. */
+  /** How many withdrawals of this swap were refunded, this one included (a refunded withdrawal
+   *  counts itself; plan 00048 P4.2-fix, audit C1). */
   refunds: z.number().int(),
   error: z.object({ code: z.string(), message: z.string() }).optional(),
 });
 export type WithdrawView = z.infer<typeof WithdrawViewSchema>;
 
-/** How a withdrawal ended when it ended without a transfer (P4.2-fix C1). */
-export const WITHDRAWAL_ENDINGS = ['refunded', 'start-failed', 'stale-vault'] as const;
-export const WithdrawalSignalSchema = z.object({
-  attempts: z.number().int().nonnegative(),
-  last: z.enum(WITHDRAWAL_ENDINGS).nullable(),
+/** Why the latest withdrawal ended without moving the funds (null: none yet, running, or completed).
+ *  - `refunded`: the vault's transfer did not happen (or the token returned false); the coin is back
+ *    in the temporary wallet;
+ *  - `start-failed`: the start never landed (a preflight, a restart, a stale EVM nonce or gas, a
+ *    submission failure): nothing moved;
+ *  - `stale-vault`: the vault moved between the proof and the head of the lane: nothing moved. */
+export const WITHDRAWAL_LAST = ['refunded', 'start-failed', 'stale-vault'] as const;
+export type WithdrawalLast = (typeof WITHDRAWAL_LAST)[number];
+
+/** The retry signal (plan 00048 P4.2-fix, shared contract change 1; audit C1). */
+export const WithdrawalStatusSchema = z.object({
+  /** Withdrawal attempts so far (every `/withdraw` the sponsor accepted). */
+  attempts: z.number().int(),
+  last: z.enum(WITHDRAWAL_LAST).nullable(),
+  /** True when the temporary wallet holds the funds again and the page should rebuild the
+   *  withdrawal (withdraw-params → build → /prove → /withdraw) and submit it again (plan Q9 A). */
   retry: z.boolean(),
 });
-export type WithdrawalSignal = z.infer<typeof WithdrawalSignalSchema>;
+export type WithdrawalStatus = z.infer<typeof WithdrawalStatusSchema>;
 
 export const SwapLegViewSchema = z.object({
   colour: z.string(),
@@ -206,15 +224,18 @@ export const SwapViewSchema = z.object({
   withdraw: WithdrawViewSchema.nullable(),
   /** Every withdrawal attempt, oldest first (refunded ones included). */
   withdrawals: z.array(WithdrawViewSchema),
-  /** P4.2-fix C1: the latest withdrawal's outcome and whether the page must rebuild it. */
-  withdrawal: WithdrawalSignalSchema.optional(),
-  /** P4.2-fix C5: on `failed`, whether a re-open (the same open-swap, a resume) revives it. */
-  recoverable: z.boolean().optional(),
+  /** Whether the page should rebuild and retry the withdrawal now (audit C1). This sponsor always
+   *  sends it; optional in the schema only so views recorded before the field still parse. */
+  withdrawal: WithdrawalStatusSchema.optional(),
   /** On `done`. */
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
   /** On `failed`: a stable code, and a sentence for the page. */
   reason: z.string().optional(),
   message: z.string().optional(),
+  /** On `failed` (always present then): true when the same open-swap (a resume: same swap id,
+   *  owner, terms and temporary keys) revives the swap, e.g. the funds reached the deposit address
+   *  late or the sponsor could not start the deposit; the page offers Resume for it (audit C5). */
+  recoverable: z.boolean().optional(),
   createdAt: z.number().int(),
   updatedAt: z.number().int(),
 });
@@ -314,7 +335,9 @@ export const SWAP_ERRORS = {
   invalidTx: 'invalid-tx',
   /** 409: the vault moved since the transaction was built: rebuild and prove again. */
   staleVaultState: 'stale-vault-state',
-  /** 409: the EVM nonce is not the vault account's pending nonce: rebuild and prove again. */
+  /** 409: the EVM nonce is not the one the sponsor's withdrawal lane expects next (the vault
+   *  account's pending nonce past this sponsor's live reservations), or the gas it signs no longer
+   *  covers the live base fee: rebuild and prove again. */
   staleEvmNonce: 'stale-evm-nonce',
   /** 409: `/withdraw` without a matching `/prove withdraw`. */
   notProven: 'not-proven',
@@ -322,8 +345,12 @@ export const SWAP_ERRORS = {
   withdrawalInProgress: 'withdrawal-in-progress',
   /** 429: the swap's proof budget is spent. */
   proofBudget: 'proof-budget',
-  /** 429: too many open swaps for this EVM address. */
+  /** 429: too many open swaps for this EVM address, or its daily swap allowance is used. */
   tooManySwaps: 'too-many-swaps',
+  /** 503: too many swaps are waiting for funds right now (all addresses together); try later. */
+  sponsorBusy: 'sponsor-busy',
+  /** 503: the sponsor's daily DUST budget is spent; new swaps wait for tomorrow's. */
+  sponsorBudget: 'sponsor-budget',
   /** 503: the sponsor cannot pay right now, or the bridge / prover is unavailable. */
   sponsorUnavailable: 'sponsor-unavailable',
   sponsorLow: 'sponsor-low',
