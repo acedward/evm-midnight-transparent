@@ -9,12 +9,20 @@
 #                                CIDRs): the reverse proxy in front, so the sponsor's rate limits key
 #                                on each user and not on the proxy
 #   WEB_DNS_RESOLVER             DNS for the sponsor's name (default 127.0.0.11, Docker's)
-#   WEB_CONTENT_SECURITY_POLICY  optional Content-Security-Policy header value
+#   WEB_CONTENT_SECURITY_POLICY  the Content-Security-Policy header: empty (the default) = the tested
+#                                default policy for WEB_NETWORK (./csp.sh, audit C15); "off" = no
+#                                header; anything else = that policy, verbatim
+#   WEB_CSP_CONNECT_EXTRA        https:// or wss:// origins (comma-separated) the default policy also
+#                                lets the page connect to, e.g. the hosts of a mounted config.json's
+#                                network overrides
 #
 # A full site configuration can be mounted at /etc/emt/config.json instead (for example with
 # network overrides or a Midnight explorer URL, questions Q11); it is then served as is.
 # Adapted from MN Bank (acedward/passport-evm-dapp @ 911647b, deploy/web/entrypoint.sh).
 set -eu
+
+# shellcheck source=csp.sh
+. /usr/local/lib/emt/csp.sh
 
 D=/tmp/emt
 fail() {
@@ -28,6 +36,7 @@ upstream="${WEB_SPONSOR_UPSTREAM:-sponsor:8080}"
 resolver="${WEB_DNS_RESOLVER:-127.0.0.11}"
 trusted="${WEB_TRUSTED_PROXIES:-}"
 csp="${WEB_CONTENT_SECURITY_POLICY:-}"
+csp_extra="${WEB_CSP_CONNECT_EXTRA:-}"
 
 case "$network" in stagenet | undeployed) ;; *) fail "WEB_NETWORK must be stagenet or undeployed" ;; esac
 case "$sponsor_url" in *'"'* | *'\'* | *' '*) fail "WEB_SPONSOR_URL must not contain quotes, backslashes or spaces" ;; esac
@@ -59,11 +68,14 @@ fi
   fi
 } >"$D/http.conf"
 
-if [ -n "$csp" ]; then
-  echo "add_header Content-Security-Policy \"$csp\" always;" >"$D/headers.conf"
-else
-  : >"$D/headers.conf"
-fi
+case "$csp" in
+  off) : >"$D/headers.conf" ;;
+  '')
+    policy="$(emt_default_csp "$network" "$sponsor_url" "$csp_extra")" || fail "cannot build the default Content-Security-Policy"
+    echo "add_header Content-Security-Policy \"$policy\" always;" >"$D/headers.conf"
+    ;;
+  *) echo "add_header Content-Security-Policy \"$csp\" always;" >"$D/headers.conf" ;;
+esac
 
-echo "emt-web: network $network, sponsor $sponsor_url (upstream $upstream), trusted proxies: ${trusted:-none}" >&2
+echo "emt-web: network $network, sponsor $sponsor_url (upstream $upstream), trusted proxies: ${trusted:-none}, CSP: ${csp:-default}" >&2
 exec nginx -g 'daemon off;'

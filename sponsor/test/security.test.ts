@@ -135,12 +135,13 @@ describe('configuration', () => {
 
   it('on a live network, a sponsor needs the shared lock or a declared dedicated seed', () => {
     const seed = hexlify(randomBytes(32)).slice(2);
-    const env = { SPONSOR_NETWORK: 'stagenet', SPONSOR_ENABLED: 'true', SPONSOR_SEED: seed };
-    expect(() => loadConfig(env, tokens)).toThrow(/SPONSOR_FUNDING_LOCK_FILE/);
+    const env = { SPONSOR_NETWORK: 'stagenet', SPONSOR_ENABLED: 'true', SPONSOR_SEED_FILE: '/run/secrets/seed' };
+    const files = (f: string) => (f === '/run/secrets/seed' ? seed : tokens());
+    expect(() => loadConfig(env, files)).toThrow(/SPONSOR_FUNDING_LOCK_FILE/);
     expect(
-      loadConfig({ ...env, SPONSOR_FUNDING_LOCK_FILE: '/locks/funding.lock' }, tokens).config.sponsor.fundingLockFile,
+      loadConfig({ ...env, SPONSOR_FUNDING_LOCK_FILE: '/locks/funding.lock' }, files).config.sponsor.fundingLockFile,
     ).toBe('/locks/funding.lock');
-    expect(loadConfig({ ...env, SPONSOR_DEDICATED_WALLET: 'true' }, tokens).config.sponsor.dedicated).toBe(true);
+    expect(loadConfig({ ...env, SPONSOR_DEDICATED_WALLET: 'true' }, files).config.sponsor.dedicated).toBe(true);
     expect(() =>
       loadConfig({ SPONSOR_NETWORK: 'undeployed', TOKENS_FILE: '/t', SPONSOR_ENABLED: 'true' }, tokens),
     ).toThrow(/SPONSOR_SEED_FILE/);

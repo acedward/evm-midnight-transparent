@@ -35,10 +35,9 @@ keywords = ["private", "secret", "signing", "seed"]
 # ── Allowlists ───────────────────────────────────────────────────────────────
 
 [[allowlists]]
-description = "Not this repository's content: installs and the lockfile"
+description = "Not this repository's content: installed packages (never committed; CI scans the tree after an install)"
 paths = [
   '''(^|/)node_modules/''',
-  '''(^|/)bun\.lock$''',
 ]
 
 # The vendored vault deployment records (PROVENANCE.md): the values the default generic-api-key
@@ -49,6 +48,11 @@ paths = [
 # rule's own allowlist does.)
 [[rules]]
 id = "generic-api-key"
+# The lockfile IS this repository's content, so every custom rule scans it (audit F-A18); only this
+# generic rule, which can read its package integrity hashes as keys, skips it.
+[[rules.allowlists]]
+paths = ['''(^|/)bun\.lock$''']
+
 [[rules.allowlists]]
 condition = "AND"
 paths = ['''(^|/)packages/core/src/tokens/deployments/[a-z0-9-]+\.json$''']

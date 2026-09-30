@@ -24,10 +24,11 @@ import {
   walletWithCoins,
   type VaultFixture,
 } from '../../packages/wallet/test/helpers.js';
+import { requestDetail } from '../src/bridge/live-backend.js';
 import { rebuildStartWithdraw } from '../src/bridge/rebuild.js';
 import type { WithdrawCallArgs } from '../src/swaps/backend.js';
-import { inspectTransaction, makerImbalances } from '../src/validate/inspect.js';
-import { InvalidTxError, validateTake, validateWithdraw } from '../src/validate/rules.js';
+import { inspectTransaction, makerImbalances, summarise } from '../src/validate/inspect.js';
+import { InvalidTxError, gasClose, validateTake, validateWithdraw } from '../src/validate/rules.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const AT_679357 = fixture<VaultFixture>('stagenet-vault-679357.json');
@@ -99,9 +100,89 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
       argsFor(wallet, draft.coinNonce),
     );
     expect(rebuilt.requestId).toBe(B31.requestId);
+    // The request record as the vault stores it: its transaction fields, read by the live
+    // backend's requestDetail (the deposit adoption rule of audit C12 reads the same shape).
+    expect(requestDetail(rebuilt.request)).toEqual({
+      erc20: STKA_ERC20.toLowerCase(),
+      amount: B31.amount,
+      evmNonce: B31.evmNonce,
+      gasLimit: DEFAULT_EVM_GAS.gasLimit,
+      maxFeePerGas: DEFAULT_EVM_GAS.maxFeePerGas,
+    });
+    expect(requestDetail({ txParams: { to: 'x' } })).toBeUndefined();
     expect(rebuilt.calls.map((c) => c.entryPoint)).toEqual(['startWithdraw', 'signBidirectional']);
-    expect(summary.calls).toEqual(rebuilt.calls);
+    // The calls are identical but for their declared gas, which the callee's random commitment moves
+    // a little (compared with a tolerance by the rule).
+    const bare = (cs: typeof summary.calls) => cs.map(({ gas: _gas, ...c }) => c);
+    expect(bare(summary.calls)).toEqual(bare(rebuilt.calls));
+    summary.calls.forEach((c, i) => expect(gasClose(c.gas, rebuilt.calls[i]!.gas)).toBe(true));
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');
+    // Audit C4: the coin the wallet hands to the vault is exactly the rebuild's (same commitment,
+    // owned by the vault), and the transaction's structure digest (calls, segments, every coin) is
+    // what /withdraw must carry: erasing the proof material and binding keep it.
+    expect(rebuilt.outputs).toHaveLength(1);
+    expect(rebuilt.outputs[0]!.contract).toBe(VAULT);
+    expect(summary.shielded.outputs.filter((o) => o.contract !== null)).toEqual(rebuilt.outputs);
+    expect(summary.shielded.inputs).toHaveLength(1);
+    const tx = l.Transaction.deserialize('signature', 'pre-proof', 'pre-binding', hexToBytes(draft.tx)) as any;
+    expect(summarise(tx.eraseProofs()).structureDigest).toBe(summary.structureDigest);
+    expect(summarise(tx.bind()).structureDigest).toBe(summary.structureDigest);
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('agrees over many fresh builds: the random callee commitment moves the declared gas a little, never the calls (found in P4.2-fix CI)', async () => {
+    // About 1 build in 40 declared a slightly different compute time (the commitment's encoded
+    // length); the digests used to include it, so a valid withdrawal was refused as wrong-call.
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: B31.amount }]);
+    for (let i = 0; i < 60; i++) {
+      const draft = await buildWithdraw(
+        wallet,
+        { colour: WSTKA, amount: B31.amount, dest: B31.dest, evmNonce: B31.evmNonce },
+        { reader: fixtureReader(AT_679357) },
+      );
+      const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+      const rebuilt = await rebuildStartWithdraw(
+        runtime,
+        fixtureReader(AT_679357),
+        VAULT,
+        argsFor(wallet, draft.coinNonce),
+      );
+      expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');
+      await draft.release();
+    }
+    await wallet.close();
+  }, 120_000);
+
+  it('refuses a withdrawal whose calls declare more gas than the rebuild (the sponsor’s DUST pays for it)', async () => {
+    const { wallet, draft } = await walletDraft();
+    const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+    const rebuilt = await rebuildStartWithdraw(
+      runtime,
+      fixtureReader(AT_679357),
+      VAULT,
+      argsFor(wallet, draft.coinNonce),
+    );
+    const g = summary.calls[0]!.gas!.guaranteed!;
+    expect(Object.keys(g).length).toBeGreaterThan(0);
+    const inflate = (pct: bigint) => ({
+      ...summary,
+      calls: summary.calls.map((c, i) =>
+        i === 0
+          ? {
+              ...c,
+              gas: {
+                ...c.gas!,
+                guaranteed: Object.fromEntries(
+                  Object.entries(g).map(([k, v]) => [k, ((BigInt(v) * (1000n + pct)) / 1000n).toString()]),
+                ),
+              },
+            }
+          : c,
+      ),
+    });
+    expect(detailOf(() => validateWithdraw(inflate(20n), rebuilt, WSTKA))).toBe('wrong-call'); // +2%
+    expect(detailOf(() => validateWithdraw(inflate(5n), rebuilt, WSTKA))).toBe('accepted'); // +0.5%
     await draft.release();
     await wallet.close();
   });
@@ -148,6 +229,19 @@ describe('G-BRIDGE’s live startWithdraw (the transaction the sponsor paid DUST
     // The shape rules accept it (its own calls as the expected ones): nothing in the rules refuses a real startWithdraw.
     expect(
       detailOf(() => validateWithdraw(summary, { calls: summary.calls, callsDigest: summary.callsDigest }, WSTKA)),
+    ).toBe('accepted');
+    // Audit C4's coin rule on the live transaction: one coin in, one coin out, owned by the vault.
+    const vaultCoins = summary.shielded.outputs.filter((o) => o.contract !== null);
+    expect(vaultCoins).toEqual([{ commitment: expect.stringMatching(/^[0-9a-f]{64}$/), contract: VAULT }]);
+    expect(summary.shielded.inputs).toHaveLength(1);
+    expect(
+      detailOf(() =>
+        validateWithdraw(
+          summary,
+          { calls: summary.calls, callsDigest: summary.callsDigest, outputs: vaultCoins },
+          WSTKA,
+        ),
+      ),
     ).toBe('accepted');
     // ...and it is a finalized transaction, not an unproven one.
     expect(() => l.Transaction.deserialize('signature', 'proof', 'binding', hexToBytes(hex))).not.toThrow();

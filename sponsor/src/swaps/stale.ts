@@ -113,8 +113,20 @@ export class StaleCloser {
     const now = this.now();
     this.lastScanAt = now;
     const olderThan = Math.floor((now - this.deps.config.staleAfterMs) / 1000);
-    const adopted = await this.deps.service.adoptLateStarts(Math.floor((now - 3_600_000) / 1000));
-    for (const id of adopted) this.deps.log.info('late withdrawal start adopted', { swapId: id });
+    // An adopted late start is driven to its settle, which the sponsor pays: it takes the same
+    // daily cap and DUST reserve as a re-drive, and counts as one (audit C12, F-B11).
+    const before = this.refusal();
+    if (before) {
+      this.paused = before;
+      return;
+    }
+    this.prune();
+    const room = this.deps.config.maxPerDay - this.spends.length;
+    const adopted = await this.deps.service.adoptLateStarts(Math.floor((now - 3_600_000) / 1000), room);
+    for (const id of adopted) {
+      this.spends.push(this.now());
+      this.deps.log.info('late withdrawal start adopted', { swapId: id });
+    }
     for (const rec of this.deps.service.stalled(olderThan)) {
       const refusal = this.refusal();
       this.paused = refusal;

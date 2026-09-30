@@ -30,6 +30,7 @@ RUN bun run build:web \
 FROM ${NGINX_IMAGE}
 COPY deploy/web/nginx.conf /etc/nginx/nginx.conf
 COPY deploy/web/entrypoint.sh /usr/local/bin/emt-web
+COPY deploy/web/csp.sh /usr/local/lib/emt/csp.sh
 COPY --from=build /app/web/dist /usr/share/nginx/html
 RUN chmod 0755 /usr/local/bin/emt-web \
  && rm -rf /etc/nginx/conf.d /docker-entrypoint.d

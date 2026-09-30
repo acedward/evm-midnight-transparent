@@ -378,6 +378,12 @@ export const INVALID_TX_DETAILS = [
   'wrong-entry-point',
   'wrong-call',
   'deploy-or-maintenance',
+  /** The coin a withdrawal hands to the vault is not the one this withdrawal names (audit C4). */
+  'missing-output',
+  /** More shielded coins than the take or withdrawal needs: an extra transfer (audit C4). */
+  'extra-coins',
+  /** A contract-owned coin spent, or a coin paid to a contract other than through the call. */
+  'contract-coin',
 ] as const;
 export type InvalidTxDetail = (typeof INVALID_TX_DETAILS)[number];
 

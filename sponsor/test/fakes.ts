@@ -29,7 +29,7 @@ import type {
 } from '../src/swaps/backend.js';
 import type { AttestedKind } from '../src/swaps/model.js';
 import { InvalidTxError } from '../src/validate/rules.js';
-import { callsDigestOf, type CallSummary, type TxSummary } from '../src/validate/summary.js';
+import { callsDigestOf, structureDigestOf, type CallSummary, type TxSummary } from '../src/validate/summary.js';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -54,9 +54,18 @@ export function fakeInspect(bytes: Uint8Array): TxSummary {
   ) as TxSummary;
 }
 
+type Shielded = TxSummary['shielded'];
+
+/** Placeholder coins for `guaranteed`'s counts (a user's coins: no contract). */
+const coinsFor = (g: TxSummary['guaranteed']): Shielded => ({
+  inputs: Array.from({ length: g?.inputs ?? 0 }, (_, i) => ({ nullifier: sha(`fake-in-${i}`), contract: null })),
+  outputs: Array.from({ length: g?.outputs ?? 0 }, (_, i) => ({ commitment: sha(`fake-out-${i}`), contract: null })),
+});
+
 export function summary(over: Partial<TxSummary> = {}): TxSummary {
   const calls = over.calls ?? [];
-  return {
+  const guaranteed = over.guaranteed === undefined ? { inputs: 1, outputs: 1, transients: 0 } : over.guaranteed;
+  const base = {
     intents: 0,
     calls,
     deploys: 0,
@@ -64,13 +73,29 @@ export function summary(over: Partial<TxSummary> = {}): TxSummary {
     unshielded: false,
     dust: false,
     fallibleShielded: false,
-    guaranteed: { inputs: 1, outputs: 2, transients: 0 },
+    guaranteed,
     imbalances: {},
     unshieldedImbalances: 0,
     callsDigest: callsDigestOf(calls),
+    shielded: coinsFor(guaranteed),
+    segments: [0],
     ...over,
   };
+  return { ...base, structureDigest: over.structureDigest ?? structureDigestOf(base) };
 }
+
+/** The same transaction with other shielded coins (the counts and the structure digest follow). */
+export function summaryWith(s: TxSummary, shielded: Shielded): TxSummary {
+  const guaranteed = { inputs: shielded.inputs.length, outputs: shielded.outputs.length, transients: 0 };
+  const next = { ...s, shielded, guaranteed };
+  return { ...next, structureDigest: structureDigestOf(next) };
+}
+
+/** The coin a fake startWithdraw hands to the vault (its commitment follows the coin). */
+export const fakeVaultOutput = (a: { coinNonce: string; colour: string; amount: bigint }) => ({
+  commitment: sha(`vault-coin:${a.coinNonce}:${a.colour}:${a.amount}`),
+  contract: VAULT,
+});
 
 /** A take's balancing transaction: +pay, -receive in segment 0. */
 export function takeTx(
@@ -99,8 +124,25 @@ export function fakeWithdrawCalls(a: WithdrawCallArgs, version: number): CallSum
   ];
 }
 
-export function withdrawTx(calls: CallSummary[], over: Partial<TxSummary> = {}): TxSummary {
-  return summary({ intents: 1, calls, callsDigest: callsDigestOf(calls), ...over });
+export function withdrawTx(
+  calls: CallSummary[],
+  over: Partial<TxSummary> = {},
+  coin?: { coinNonce: string; colour: string; amount: bigint },
+): TxSummary {
+  const shielded = coin
+    ? {
+        inputs: [{ nullifier: sha(`wallet-coin:${coin.coinNonce}`), contract: null }],
+        outputs: [fakeVaultOutput(coin)],
+      }
+    : undefined;
+  return summary({
+    intents: 1,
+    calls,
+    callsDigest: callsDigestOf(calls),
+    ...(shielded ? { shielded, guaranteed: { inputs: 1, outputs: 1, transients: 0 } } : {}),
+    segments: [0, 1],
+    ...over,
+  });
 }
 
 // ── Sepolia ────────────────────────────────────────────────────────────────────
@@ -142,12 +184,16 @@ export class FakeEvm implements EvmReader {
 
 // ── The vault ──────────────────────────────────────────────────────────────────
 
-interface FakeRequest {
+export interface FakeRequest {
   kind: BridgeKind;
   id: string;
   path: string;
   evmNonce: bigint;
   signer: string;
+  erc20: string;
+  amount: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
 }
 
 /** What the next relay of a request does. */
@@ -184,7 +230,22 @@ export class FakeVault implements SwapBackend {
   }
   async openRequests(kind: BridgeKind): Promise<OpenRequests> {
     const mine = [...this.requests.values()].filter((r) => r.kind === kind);
-    return { ids: mine.map((r) => r.id), pathOf: (id) => this.requests.get(id)?.path };
+    return {
+      ids: mine.map((r) => r.id),
+      pathOf: (id) => this.requests.get(id)?.path,
+      detailOf: (id) => {
+        const r = this.requests.get(id);
+        return r
+          ? {
+              erc20: r.erc20,
+              amount: r.amount,
+              evmNonce: r.evmNonce,
+              gasLimit: r.gasLimit,
+              maxFeePerGas: r.maxFeePerGas,
+            }
+          : undefined;
+      },
+    };
   }
   private facts(label: string): MidnightTxFacts {
     const n = ++this.seq;
@@ -212,6 +273,10 @@ export class FakeVault implements SwapBackend {
       path: this.depositPathHex(i.recipientCoinPk),
       evmNonce: i.evmNonce,
       signer,
+      erc20: i.erc20,
+      amount: i.amount,
+      gasLimit: i.gas.gasLimit,
+      maxFeePerGas: i.gas.maxFeePerGas,
     });
     this.startNonces.push({ kind: 'deposit', nonce: i.evmNonce });
     this.version++;
@@ -298,11 +363,14 @@ export class FakeVault implements SwapBackend {
     this.requests.delete(i.requestId);
     return this.facts('abandonDeposit');
   }
+  async vaultStateMark(): Promise<string> {
+    return `v${this.version}`;
+  }
   async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
     const calls = fakeWithdrawCalls(a, this.version);
     const callsDigest = callsDigestOf(calls);
     this.pendingWithdrawArgs.set(callsDigest, a);
-    return { calls, callsDigest, requestId: sha(`withdraw:${callsDigest}`) };
+    return { calls, callsDigest, requestId: sha(`withdraw:${callsDigest}`), outputs: [fakeVaultOutput(a)] };
   }
   /** The request ids of the startWithdraws submitted, in order. */
   readonly submitted: string[] = [];
@@ -315,7 +383,17 @@ export class FakeVault implements SwapBackend {
     this.submitted.push(id);
     this.log.push(`startWithdraw nonce=${args.evmNonce} amount=${args.amount}`);
     this.startNonces.push({ kind: 'withdraw', nonce: args.evmNonce });
-    this.requests.set(id, { kind: 'withdraw', id, path: 'vault', evmNonce: args.evmNonce, signer: VAULT_EVM });
+    this.requests.set(id, {
+      kind: 'withdraw',
+      id,
+      path: 'vault',
+      evmNonce: args.evmNonce,
+      signer: VAULT_EVM,
+      erc20: args.erc20,
+      amount: args.amount,
+      gasLimit: args.gas.gasLimit,
+      maxFeePerGas: args.gas.maxFeePerGas,
+    });
     this.version++;
     return this.facts('startWithdraw');
   }
@@ -335,6 +413,8 @@ export class FakeOffers implements OfferReader {
   readonly offers = new Map<string, OfferDetail>();
   statusOverride = new Map<string, KernelOfferStatus>();
   makers = new Map<string, Record<string, bigint>>();
+  /** sha256 of the maker transaction's bytes by bech32 (default: the offer id the bech32 names). */
+  makerIds = new Map<string, string>();
 
   add(o: {
     offerId: string;
@@ -366,6 +446,7 @@ export class FakeOffers implements OfferReader {
   async status(id: string): Promise<KernelOfferStatus> {
     return this.statusOverride.get(id) ?? ((this.offers.get(id)?.computed.status ?? 'not_found') as KernelOfferStatus);
   }
+  makerTxId = (bech32: string): string => this.makerIds.get(bech32) ?? bech32.replace(/^swapoffer1/, '');
   makerImbalances = (bech32: string): Record<string, bigint> => {
     const m = this.makers.get(bech32);
     if (!m) throw new Error('unknown offer');

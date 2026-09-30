@@ -22,9 +22,12 @@ export interface EvmReader {
 
 export type BridgeKind = 'deposit' | 'withdraw';
 
-/** One stage of the relayer loop, as the vault's `relayRequest` reports it. */
+/** One stage of the relayer loop (../bridge/relay-loop.ts). */
 export type RelayProgress =
-  | { stage: 'signed'; signedTxHash: string; from: string; nonce: number; afterMs: number }
+  | { stage: 'signed'; signedTxHash: string; from: string; nonce: number; afterMs: number; maxFeePerGas?: bigint }
+  /** The signed transfer was broadcast and is not mined yet (reported once; it is broadcast again
+   *  until it is mined or its nonce is consumed). */
+  | { stage: 'pending'; signedTxHash: string; nonce: number; afterMs: number }
   | {
       stage: 'broadcast';
       evmTxHash: string;
@@ -84,13 +87,28 @@ export interface WithdrawCallArgs {
 export interface RebuiltWithdraw {
   calls: CallSummary[];
   callsDigest: string;
+  /** The coins the call hands to contracts (the vault's): commitment and owner. */
+  outputs: { commitment: string; contract: string | null }[];
   /** The request the call creates (read from the call's own next contract state). */
   requestId: string;
+}
+
+/** What an open request asks the MPC to sign, as the vault stores it. */
+export interface RequestDetail {
+  /** The ERC20 the signed transaction calls (0x…, checksum not guaranteed). */
+  erc20: string;
+  /** The `transfer` amount in its calldata. */
+  amount: bigint;
+  evmNonce: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
 }
 
 export interface OpenRequests {
   ids: string[];
   pathOf(requestId: string): string | undefined;
+  /** The request's transaction fields (undefined when they cannot be read). */
+  detailOf(requestId: string): RequestDetail | undefined;
 }
 
 export interface SwapBackend {
@@ -112,12 +130,15 @@ export interface SwapBackend {
     gas: EvmGasPolicy;
     evmNonce: bigint;
   }): Promise<MidnightTxFacts & { requestId: string }>;
-  /** The relayer loop for one request (resumable: re-running it with the same id is safe). */
+  /** The relayer loop for one request (resumable: re-running it with the same id is safe). It never
+   *  waits without a deadline: it throws once the signature or the attestation is overdue. */
   relay(input: {
     kind: BridgeKind;
     requestId: string;
     expectedSigner: string;
     signatureTimeoutMs: number;
+    /** Counted from the signature; the backend's default when absent. */
+    attestationTimeoutMs?: number;
     onProgress: (p: RelayProgress) => void;
   }): Promise<RelayOutcome>;
   /** The request's attestation if one already verifies, without waiting or broadcasting. */
@@ -132,6 +153,9 @@ export interface SwapBackend {
   }): Promise<MidnightTxFacts & { minted: boolean }>;
   /** The vault's permissionless `abandonDeposit`, for a sweep attested never-executed. */
   abandonDeposit(input: { requestId: string; attestation: Attestation }): Promise<MidnightTxFacts>;
+  /** A digest of the vault's current contract state: it changes whenever the vault's state does
+   *  (a request started or settled), so `/prove` can tell a moved vault from a wrong call. */
+  vaultStateMark(): Promise<string>;
   /** The sponsor's own build of `startWithdraw(args)` on the vault's CURRENT state (not proven, not
    *  sent): the calls' public transcripts, and the request it would create. */
   rebuildWithdraw(args: WithdrawCallArgs): Promise<RebuiltWithdraw>;

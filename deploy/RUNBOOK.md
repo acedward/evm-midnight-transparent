@@ -157,6 +157,19 @@ mount a file at `/etc/emt/config.json` in the `web` service with a Compose overr
 served as is. Never put a `mock` block in a deployed `config.json`: it runs the whole app against
 in-page mocks.
 
+**The site's Content-Security-Policy.** The web container sends a strict policy by default
+(`deploy/web/csp.sh`): scripts only from the site (plus `'wasm-unsafe-eval'` for the ledger's
+WebAssembly), no inline script, no eval, no framing, no forms, and network access only to the site
+itself (with its `/sponsor` proxy), the exchange's kernel and batcher, and the Midnight indexer and
+node of the network. It was checked in Chromium against the built image
+(`bash deploy/web/csp-browser-check.sh`: zero violations, every browser spec passes). Leave
+`WEB_CONTENT_SECURITY_POLICY` empty to keep it. If a mounted `config.json` points the page at other
+hosts, add their `https://` or `wss://` origins to `WEB_CSP_CONNECT_EXTRA` (comma-separated), or the
+browser blocks them. `WEB_CONTENT_SECURITY_POLICY=off` sends none; any other value is sent verbatim.
+**HSTS belongs to your TLS proxy**: the web container serves plain HTTP on 127.0.0.1 and cannot set it.
+With Caddy, add `header Strict-Transport-Security "max-age=31536000"` to the site block (Caddy
+already redirects HTTP to HTTPS).
+
 ## 4. The sponsor wallet
 
 The sponsor pays every DUST fee of every swap's bridge legs from one wallet: the sponsor wallet.
@@ -251,6 +264,15 @@ times each fee):
 Sizing example: 200 registered NIGHT generate about 143 DUST a day (about 30 swaps a day), with a
 ceiling of 1,000 DUST.
 
+**The daily budget** (`SPONSOR_DAILY_DUST_BUDGET`, default 500 DUST; 0 turns it off) caps what anyone
+can make the sponsor spend: a new swap (or the re-armed deposit of a failed one) is refused with
+`503 sponsor-budget` when the DUST its legs will cost, plus what the last 24 hours' legs cost, plus
+what the swaps in flight still need, would pass it. Each paid start counts as
+`SWAP_DUST_PER_START_SPECKS` (2.2 DUST) and each settle as `SWAP_DUST_PER_SETTLE_SPECKS` (0.4 DUST):
+5.2 DUST a swap. Set the budget to what your NIGHT generates in a day. `/v1/health`
+`bridge.budget` shows the spend and whether new swaps are refused. Each EVM address may also start at
+most `SWAP_MAX_PER_OWNER_PER_DAY` (10) swaps in 24 hours (`429 too-many-swaps`).
+
 ### 4.5 Low DUST
 
 Below `SPONSOR_DUST_LOW_SPECKS` (default 10 DUST):
@@ -343,7 +365,12 @@ docker compose -f deploy/compose.yml run --rm -v /path/to/vault-managed:/import:
 ```
 
 Do not import MN Bank's key set: it was compiled from an earlier vault commit (`51c1fb4`, whose
-`index.js` differs) and keeps only the prover keys MN Bank uses.
+`index.js` differs) and keeps only the prover keys MN Bank uses. **The sponsor runs only the reviewed
+build of the directory's JavaScript**: before importing `Erc20Vault/contract/index.js` and
+`SignetSigner/contract/index.js` it checks their SHA-256 (`d98e12ad…9296` and `61464470…6a95`, the
+compile of the pinned sources; the web's wallet vendors the same bytes). Any other build is refused
+before it runs (`bridge.keysVerified: false`, "not the reviewed build" in the log), so an imported
+directory must be byte-identical to the compile.
 
 ## 7. Gas for withdrawals: the vault's EVM account
 
@@ -354,8 +381,8 @@ anyone else using the vault.
 
 | Fact | Value |
 |---|---|
-| Gas each withdrawal is signed with | limit 100,000 at up to 10 gwei (priority 1 gwei); the sponsor accepts no other values |
-| Needed in the account **at the start** of a withdrawal | 0.001 ETH (limit × max fee); the sponsor refuses to start below it |
+| Gas each withdrawal is signed with | limit 100,000, priority 1 gwei, max fee **max(10 gwei, 2 × the base fee + 1 gwei)**, sized from the live base fee when the page asks for `withdraw-params`; above `BRIDGE_EVM_MAX_FEE_CAP_WEI` (100 gwei) withdrawals are refused until gas is cheaper ("Sepolia gas is unusually expensive"). The sponsor re-checks it against the base fee at the head of the lane (`stale-gas`: the page rebuilds with the current fee) |
+| Needed in the account **at the start** of a withdrawal | limit × max fee: 0.001 ETH at 10 gwei, more when the base fee is high; the sponsor refuses to start below it |
 | Actually spent per withdrawal | about 0.00007 ETH (34,477 gas measured in P3) |
 | `/v1/health` warns (`vaultGas.low`) below | 0.002 ETH (`VAULT_GAS_LOW_WEI`) |
 | Balance on 2026-09-29 | 0.0356 ETH |
@@ -383,13 +410,15 @@ The HTTP status is 200 for `ok` and `degraded`, and 503 for `down`.
 | `sponsor.dustSpecks`, `dustLow` | DUST balance in specks (10^15 per DUST), and whether it is under the low level. | Section 4.5. |
 | `proofServer.reachable`, `version`, `jobCapacity` | The proof server answers, its version (must be `9.0.0-rc.6`, `PROOF_SERVER_EXPECTED_VERSION`), and its queue size (10). | `reachable: false`: check the proof server; an out-of-memory kill shows as a restart. |
 | `queue.lanes.prover` | The sponsor's proofs running (at most 1) and waiting. | A `waiting` that stays high means users wait for `/prove`. |
-| `queue.lanes.withdrawal` | Withdrawal starts running (at most 1) and waiting (section 9). | A `running` held for more than 5 minutes: section 13.2. |
+| `queue.lanes.withdrawal` | Withdrawal starts running (at most 1) and waiting (section 9). A start holds the lane only for its checks and its submission (seconds). | A `running` held for more than a minute: the node or the proof server is slow. |
 | `queue.lanes.drives` | Swaps being driven in the background (deposits, withdrawals after their start). | Informational; each lasts about 20 minutes. |
 | `kernel.reachable`, `kernel.synced` | The exchange answers and has caught up. | `false`: new swaps cannot be checked and the page cannot list offers (section 13.5). |
 | `batcher.reachable` | The batcher answers its health check. | `false`: takes fail (section 13.5). |
 | `vaultGas.address`, `balanceWei`, `low` | The vault's EVM account and its Sepolia ETH; `balanceWei: null` means the Sepolia RPC did not answer. | `low: true`: section 7. `null` for long: check the RPC file and provider. |
 | `bridge.available`, `keysVerified` | The bridge is loaded (the key directory, the Sepolia RPC); the key directory matched the chain at start. | `available: false`: new swaps are refused; read the sponsor's start-up log. `keysVerified: false`: section 6.3. |
-| `bridge.swaps` | Swaps by state (`awaiting_funds`, `depositing`, `minted`, `taking`, `taken`, `withdrawing`, `bridging_back`, `done`, `failed`). | Many `awaiting_funds` are normal (users who never sent funds; they fail after 24 hours). |
+| `bridge.swaps` | Swaps by state (`awaiting_funds`, `depositing`, `minted`, `taking`, `taken`, `withdrawing`, `bridging_back`, `done`, `failed`). | Many `awaiting_funds` are normal (users who never sent funds; they fail after 3 hours, and are dropped 2 days later). |
+| `bridge.budget` | The DUST the sponsor paid in the last 24 hours and its daily budget (specks), the swaps opened in 24 hours, the swaps waiting for funds that received nothing and their cap, and `exhausted` (new swaps refused). | `exhausted` for long: raise `SPONSOR_DAILY_DUST_BUDGET` if the DUST is there, or look for abuse (many swaps from few addresses). `unfundedOpen` near `unfundedMax`: new swaps get `503 sponsor-busy`. |
+| `bridge.reservations` | The vault account's nonces this sponsor's open withdrawals hold (section 9): each with its swap, whether the MPC signed it and whether it is mined, and `stuck`. | Any `stuck: true`: section 13.7. |
 | `bridge.mpc.lastSignatureAfterSeconds`, `timeouts24h`, `inFlight` | How long the MPC took to sign the last request this sponsor drove, the requests whose signature took more than 20 minutes in the last day, and the requests being followed now. | Normally 20 to 110 s. Timeouts: section 13.4. |
 | `bridge.staleCloser.enabled`, `lastScanAt`, `closed24h`, `maxPerDay`, `paused` | The stale closer (section 13.3). | `paused` says why it holds back. |
 
@@ -411,15 +440,30 @@ time of the start.
 
 **Inside this sponsor**, withdrawals go through ONE lane:
 
-1. The page asks for `withdraw-params`: the vault account's pending nonce, among other things. It
-   builds and proves the `startWithdraw` with it, then hands the bound transaction to the sponsor.
-2. At the head of the lane, the sponsor reads the pending nonce again. If it moved (another
-   withdrawal started meanwhile), it answers `stale-evm-nonce`: the page rebuilds and proves again,
-   automatically (at most 3 times). It also rebuilds the call on the vault's live state
-   (`stale-vault-state` when the vault moved).
-3. It adds DUST, submits, and **holds the lane until the MPC-signed transfer is broadcast** (about 40
-   to 80 seconds), so two of its own withdrawals never share a nonce.
-4. The attestation (about 17 minutes) and `completeWithdraw` run outside the lane.
+1. The page asks for `withdraw-params`: among other things the nonce the withdrawal must sign (the
+   vault account's pending nonce, past every nonce this sponsor's open withdrawals hold) and the gas,
+   sized from the live base fee (section 7). It builds and proves the `startWithdraw` with them, then
+   hands the bound transaction to the sponsor.
+2. At the head of the lane, the sponsor computes the expected nonce again. If it moved (another
+   withdrawal started meanwhile), it answers `stale-evm-nonce`; if the base fee rose above the
+   transfer's cap, `stale-gas`; if the vault moved, `stale-vault-state`. Nothing was paid; the swap's
+   view says `withdrawal.retry: true` and the page rebuilds and proves again, automatically.
+3. It adds DUST and submits. **The lane is released as soon as the start is on chain**: from then on
+   the withdrawal's record in `swaps.json` holds its nonce (a *reservation*) until the request
+   settles or the nonce is used on Sepolia, across restarts and MPC timeouts. So two of this sponsor's
+   withdrawals never share a nonce, and a transfer that is slow to be signed or mined never holds up
+   the next withdrawal.
+4. The relayer then follows the request outside the lane: it waits for the MPC's signature, broadcasts
+   the signed transfer again every minute until it is mined (or its nonce is taken), and waits for the
+   attestation (about 17 minutes); every wait has a deadline, after which the stale closer takes over
+   (section 13.3). Then `completeWithdraw` (or `refundWithdraw`).
+5. **A stuck transfer is replaced.** Sig Network's MPC attests a transfer only once it is mined, or once
+   another transaction took its nonce; it never gives up on one that is simply not mined (the plan's
+   Evidence log, "C2 research"). So when a signed transfer stays unmined for
+   `WITHDRAW_STUCK_AFTER_SECONDS` (30 minutes) while the base fee is above its cap, or a start is still
+   unsigned after `WITHDRAW_UNSIGNED_STALE_SECONDS` (2 hours), the NEXT withdrawal is handed that
+   nonce, with the live fee: one of the two transfers is mined, the other is attested "never executed"
+   and refunded, and its page retries. Section 13.7 has the procedure when no next withdrawal comes.
 
 **MN Bank's relay has its own lane on the same vault** and the two do not coordinate (question Q9,
 default A: accept rare collisions now, a shared host lock later). Two effects:
@@ -428,10 +472,10 @@ default A: accept rare collisions now, a shared host lock later). Two effects:
   either transfer is broadcast, both are signed for the same nonce. Only one transfer can land. The
   other is attested "never executed", and its request is refunded:
   - for this app: the sponsor runs `refundWithdraw`, the coin returns to the swap's temporary wallet,
-    the swap goes back to `minted` with `withdraw.refunds` counted, and **the page rebuilds and
-    resubmits the withdrawal by itself** (up to 3 times, then a Retry button). If the page is closed,
-    the coin waits in the temporary wallet until the user resumes (one signature). A collision costs
-    about 18 more minutes and about 2.5 DUST;
+    the swap goes back to `minted` with `withdraw.refunds` counted and `withdrawal.retry: true`, and
+    **the page rebuilds and resubmits the withdrawal by itself**. If the page is closed, the coin
+    waits in the temporary wallet until the user resumes (one signature). A collision costs about 18
+    more minutes and about 2.6 DUST;
   - for MN Bank: its customer's withdrawal is refunded to their account by MN Bank's relay (its
     runbook, section 14.1).
 - **MN Bank waits for this app's withdrawals.** MN Bank's relay starts no withdrawal while any
@@ -459,12 +503,15 @@ accounts, and this sponsor's only closes requests of its own swaps (section 13.3
 | Limit | Value | Effect |
 |---|---|---|
 | Proofs | one at a time, sponsor-wide (a take about 2 s, a withdrawal about 5 to 8 s; the sponsor's own vault calls queue in the same lane) | Users rarely wait. On a shared proof server, MN Bank's proofs run beside them (`deploy/SYSTEMD.md`, step 2). |
-| Withdrawal starts | one at a time, held until the transfer is broadcast (about 1 minute each) | About one start a minute. The attestation and settle run in parallel. |
-| Deposits | in parallel, one drive per swap; the deposit addresses are read every 15 s (`DEPOSIT_POLL_SECONDS`) | Each takes about 17 minutes from the user's funds to the mint. |
+| Withdrawal starts | one at a time, each holding the lane for its checks and submission only (seconds); its nonce is then held by its record (section 9) | Many starts a minute. The relayer, the attestation and the settle run in parallel. |
+| Deposits | in parallel, one drive per swap; a deposit address is read every 15 s (`DEPOSIT_POLL_SECONDS`) for its first 10 minutes and once any of the token arrived, then every minute, then every 5 minutes after an hour; the ETH only once the token is there. The page watching a swap brings the next read forward | Each takes about 17 minutes from the user's funds to the mint. |
 | Swaps in progress per EVM address | 3 (`SWAP_MAX_ACTIVE_PER_OWNER`) | The next open is refused until one finishes. |
+| New swaps per EVM address | 10 in any 24 hours (`SWAP_MAX_PER_OWNER_PER_DAY`), whatever became of them | `429 too-many-swaps`. |
+| Swaps waiting for funds that received nothing | 100 for all users together (`SWAP_MAX_UNFUNDED`) | New swaps get `503 sponsor-busy` until some are funded or expire. |
+| The daily DUST budget | `SPONSOR_DAILY_DUST_BUDGET` (500 DUST) over the last 24 hours' legs and those still in flight (section 4.4) | New swaps get `503 sponsor-budget`. |
 | Opens | 10 a minute per client, 5 a minute per EVM address | |
-| Proofs per swap | 12 per purpose (take, withdraw), 6 a minute per swap, 20 a minute per client | A page that keeps failing to prove stops getting proofs for that swap. |
-| Funds wait | 24 hours in `awaiting_funds` (`SWAP_FUNDS_WAIT_SECONDS`) | Then `failed` (`funds-not-received`); the user's Resume re-opens it and it waits again. |
+| Proofs per swap | 12 per purpose (take; withdraw, renewed for each new withdrawal attempt after a refund or a failed start), 48 in a swap's whole life (`SWAP_PROOFS_TOTAL_PER_SWAP`), 6 a minute per swap, 20 a minute per client | A page that keeps failing to prove stops getting proofs for that swap. |
+| Funds wait | 3 hours in `awaiting_funds` for a swap that received nothing (`SWAP_FUNDS_WAIT_SECONDS`), 24 hours once part of the token arrived (`SWAP_FUNDS_WAIT_PARTIAL_SECONDS`); a funded swap never fails for its age | Then `failed` (`funds-not-received`, `recoverable`); the user's Resume re-opens it and it waits again. Never-funded failures are dropped after 2 days (`SWAP_RETAIN_UNFUNDED_DAYS`), once their address reads empty. |
 | An offer's remaining time at open | at least 30 minutes (`SWAP_MIN_OFFER_TTL_SECONDS`); the page lists only offers expiring more than 45 minutes out | |
 | Batcher | 1,000 requests per 24 hours per IP, and 1,000 per 24 hours for all its clients together | Takes are sent from the users' browsers. The shared total also serves MN Bank and the ladders: past it, takes fail until the window moves. |
 | Kernel | 600 requests per minute per IP | Browsers read offers directly. |
@@ -483,7 +530,9 @@ Put this where users read it (the site says the same on its pages):
   done, because it cannot be resumed after closing.
 - **Then two Sepolia transactions**: first the ETH for the deposit's sweep (about 0.00017 ETH, of
   which about 0.0001 stays at the deposit address for good), then exactly the token amount. Never
-  send anything else to a deposit address: an excess cannot be recovered.
+  send anything else to a deposit address: an excess cannot be recovered. If Sepolia's gas price
+  rises a lot before the deposit starts, the swap asks for a little more ETH, and the page sends only
+  the difference.
 - **You can close the page.** Your swaps are listed in the app; Resume asks for one signature and
   continues where the swap is. Export the swap records (Local data) to resume on another device.
 - **If the offer is taken by someone else meanwhile**, the page says "Swap is not available" and
@@ -505,9 +554,14 @@ Accepted for this version (the plan's questions):
 - the signing domains ("EVM Midnight Swap", "EVM Midnight Swap Sponsor") are constants in the code:
   renaming them makes swaps in flight unrecoverable by signing again (Q10). `APP_NAME` only changes the
   name `/v1/config` serves;
-- **a deposit that ends `failed` with `deposit-attempts` or `deposit-returned-false` leaves the user's
-  tokens at the deposit address**, and nothing in this version drives it again (Resume re-opens only a
-  swap that failed for `funds-not-received`). Section 13.1.
+- a deposit that ends `failed` with `deposit-attempts` or `deposit-returned-false` leaves the user's
+  tokens at the deposit address until the user resumes it: the Resume re-arms the deposit with a new
+  `startDeposit` to the same recipient, at most `DEPOSIT_MAX_REARMS` (3) times (section 13.1);
+- a signed Sepolia transfer that is never mined is attested by nobody: the sponsor re-broadcasts it
+  and replaces it with the next withdrawal, and section 13.7 has the rest (a deposit's sweep is not
+  replaced automatically);
+- the sponsor keeps its swaps in one JSON file, rewritten on every change (bounded by the caps above
+  and the pruning of never-funded swaps).
 
 ## 13. Incidents
 
@@ -526,13 +580,15 @@ details), the request ids and every hash.
 
 | What the record shows | Why | What to do |
 |---|---|---|
-| `awaiting_funds`, stage `waiting-for-funds` | The deposit address holds less than the token amount, or less than the sweep ETH. The sponsor starts only when both are there. | Check the address on Sepolia. The user's page ("Send funds") sends only what is missing. After 24 hours the swap fails (`funds-not-received`); the user's Resume re-opens it. |
+| `awaiting_funds`, stage `waiting-for-funds` | The deposit address holds less than the token amount, or less than the sweep ETH. The sponsor starts only when both are there. | Check the address on Sepolia. The user's page ("Send funds") sends only what is missing. After 3 hours with nothing (24 hours with part of the token) the swap fails (`funds-not-received`, recoverable); the user's Resume re-opens it. |
+| `waiting-for-funds` with `error: sweep-gas-low` | Sepolia's base fee rose above what the ETH at the address covers: the sweep would not be mined. The swap's `sweepGas` was raised. | Nothing: the page sends the difference, then the deposit starts with the largest fee that ETH covers. |
 | `awaiting_funds` with both funds present | The sponsor's DUST is low or its wallet is not synced (section 4.5), or the bridge is not loaded. | `/v1/health`. The deposit starts by itself once the sponsor is ready. |
 | `waiting-for-funds` with `error: preflight-refused` or `deposit-start-failed` | The start was refused before anything moved (for example Sepolia or the proof server could not be read). | It is retried at every poll (15 s). Read the log line `deposit start failed`. |
 | `depositing`, stages `started` … `evm-broadcast` … `evm-final` | Normal: the MPC signs within 20 to 110 s, then Sepolia finality and the attestation take 15 to 19 minutes. | Wait. |
 | `depositing`, stage `relay-stalled` | The MPC did not sign within 20 minutes, or the attestation is late. | The stale closer drives it again (section 13.3). Check the request on the Sig Network explorer (section 13.4). |
 | stages `abandoning`, `abandoned`, then `waiting-for-funds` | The MPC attested the sweep "never executed" (for example the sweep gas was too low for a Sepolia gas spike). The sponsor ran `abandonDeposit`; the tokens are still at the deposit address, and it starts again. | Nothing, unless it repeats: after 3 starts (`DEPOSIT_MAX_ATTEMPTS`) the swap fails with `deposit-attempts`. |
-| `failed`, `deposit-attempts` or `deposit-returned-false` | Three starts never executed, or the token refused the vault's transfer. The tokens are at the deposit address; nothing was minted. | **Nothing in this version drives it again** (section 12). Keep `swaps.json`; record the swap id, the deposit address and the request ids, and raise it with the maintainers. |
+| `failed`, `deposit-attempts` or `deposit-returned-false` (`recoverable: true`) | Three starts never executed, or the token refused the vault's transfer. The tokens are at the deposit address; nothing was minted. | The user's Resume (the page offers it) re-arms the deposit: a new `startDeposit` to the same recipient, with fresh attempts, within the daily budget. After `DEPOSIT_MAX_REARMS` (3) re-arms the failure is `recoverable: false`: keep `swaps.json`, record the swap id, the deposit address and the request ids, and raise it with the maintainers. |
+| stages `mpc-signed`, `evm-pending` and no `evm-broadcast` for long | The MPC signed the sweep, but it is not mined (the base fee rose above its cap, or the node dropped it). | Section 13.7. |
 
 ### 13.2 A withdrawal was refunded, or is slow
 
@@ -541,15 +597,16 @@ details), the request ids and every hash.
   account running out of gas between the start and the broadcast, or a reverted transfer. The coin
   is back in the temporary wallet and the page retries by itself. If refunds repeat: check
   `vaultGas` (section 7), and whether MN Bank or another vault user is withdrawing at the same time.
-- **`failed` with `stale-evm-nonce` or `stale-vault-state`** on a withdrawal attempt: not an
-  incident. Something else started a withdrawal (or the vault moved) between the page's build and the
-  lane; the page rebuilds.
+- **`failed` with `stale-evm-nonce`, `stale-gas` or `stale-vault-state`** on a withdrawal attempt: not
+  an incident. Something else started a withdrawal, the base fee rose above the transfer's cap, or the
+  vault moved, between the page's build and the lane; the view says `withdrawal.retry: true` and the
+  page rebuilds.
 - **`failed` with `interrupted`**: the sponsor restarted after accepting a withdrawal but before
   submitting it. The state is back to `minted`; the page (or the user's Resume) rebuilds it.
-- **The lane held for more than 5 minutes** (`queue.lanes.withdrawal.running: 1`): the sponsor is
-  waiting for the MPC to sign the transfer. Section 13.4.
-- **`relay-stalled` after the start**: the request is open in the vault; the stale closer drives it
-  again. While it is open, MN Bank's withdrawals wait (section 9).
+- **Stages `mpc-signed`, `evm-pending` and no `evm-broadcast` for more than 30 minutes**: the transfer
+  is signed but not mined. Section 13.7.
+- **`relay-stalled` after the start**: the request is open in the vault and its record keeps its nonce;
+  the stale closer drives it again. While it is open, MN Bank's withdrawals wait (section 9).
 
 ### 13.3 The stale closer
 
@@ -562,7 +619,9 @@ Every `STALE_CLOSER_INTERVAL_SECONDS` (5 minutes) it looks for swaps in `deposit
 `bridging_back` that nothing drives and that have not moved for `STALE_AFTER_SECONDS` (15 minutes),
 and drives each again: the relayer loop resumes from the recorded request id, and the permissionless
 settle it ends with pays the temporary wallet the vault's request names. It also adopts a withdrawal
-whose start was reported failed but landed after all.
+whose start was reported failed but landed after all (under the same daily cap and DUST reserve,
+counted as a re-drive). A deposit request is adopted only when it moves the swap's own token and
+amount: `startDeposit` is permissionless, so anyone can open a request for a swap's recipient.
 
 It never touches a request that is not one of this sponsor's swaps. Its spending is capped:
 
@@ -607,7 +666,50 @@ request is slow, the MPC network is degraded: there is nothing to restart on you
 | `sponsor.state: error` | The wallet lost the node or the indexer | Restart the sponsor; check stagenet. |
 | Withdrawals refused: "vault gas" in the message | The vault's EVM account holds less than 0.001 ETH | Section 7. |
 | New swaps refused: "Sepolia gas is unusually expensive" | The sweep would cost more than `SWEEP_MAX_WEI` (0.005 ETH) | Wait for the spike to pass. |
+| Withdrawals refused: "Sepolia gas is unusually expensive" | 2 × the base fee + 1 gwei is above `BRIDGE_EVM_MAX_FEE_CAP_WEI` (100 gwei) | Wait for the spike to pass; the coins wait in the temporary wallets. |
+| `bridge.keysVerified: false` and "not the reviewed build" in the log | The key directory's `index.js` is not the pinned build (section 6.4) | Rebuild the directory with the key job (section 6). |
+| The sponsor exits with code 78: "must come from …_FILE on a live network" | `SPONSOR_SEED` or `SEPOLIA_RPC_URL` was set as a plain environment value | Use `SPONSOR_SEED_FILE` / `SEPOLIA_RPC_URL_FILE` (a plain value is visible in `docker inspect`). |
+| New swaps refused: `503 sponsor-busy` or `503 sponsor-budget` | The cap of swaps waiting for funds, or the daily DUST budget (section 10) | `/v1/health` `bridge.budget`. |
 | Proofs refused after a stagenet upgrade | The ledger moved | Section 14.3. |
+
+### 13.7 A Sepolia transfer is signed but not mined
+
+**What it looks like**: a withdrawal or a deposit whose stages end with `mpc-signed` and `evm-pending`
+(the `mpc-signed` stage records the transfer's `maxFeePerGas`) and no `evm-broadcast` for more than
+30 minutes; for a withdrawal, `/v1/health` `bridge.reservations` shows it with `signed: true`,
+`mined: false`, and `stuck: true` once it is 30 minutes old. On Sepolia the transfer is pending (or
+unknown to the explorer: dropped).
+
+**Why nothing settles it by itself**: Sig Network's MPC attests a transfer when it is mined (success
+or reverted), or when another transaction from the same account took its nonce ("never executed").
+It has no timeout for a transfer that is simply not mined, so the request, and the user's coin (a
+withdrawal) or tokens (a deposit), stay open until one of those two happens.
+
+**What the sponsor does**:
+- while it drives the request, it broadcasts the signed transfer again every minute; the transfer is
+  mined as soon as the base fee falls under its cap. Each drive has a deadline; the stale closer
+  starts another (section 13.3);
+- **withdrawals**: once the reservation is stuck (30 minutes unmined with the base fee above its cap,
+  or 2 hours unsigned), the NEXT withdrawal of any swap signs the same nonce with the live fee. One of
+  the two transfers is mined; the other is attested "never executed" and refunded to its temporary
+  wallet, and that swap's page retries.
+
+**What you do**, in order:
+1. Compare the Sepolia base fee with the transfer's `maxFeePerGas`. If the base fee is already back
+   under it, the next re-broadcast gets it mined: wait for the stale closer (or restart the sponsor,
+   which resumes every swap in flight at once).
+2. A stuck **withdrawal** with no other withdrawal coming: any withdrawal from the vault signed with
+   the same nonce and a higher fee resolves it. The quickest is another swap's withdrawal through this
+   sponsor (it is handed the stuck nonce automatically); a Bridge back of a small test swap works.
+   Withdrawals by other vault users (MN Bank) consume the nonce too, if theirs uses it.
+3. A stuck **deposit** sweep: the deposit address's nonce is only ever used by the vault's sweeps for
+   that recipient, and the sweep was signed with the largest fee the ETH at the address covered, so
+   the usual cure is to wait for the base fee to fall (step 1). If it does not, raise it with the
+   maintainers: a replacement sweep (a new `startDeposit` for the same recipient, the same
+   deposit-address nonce and a higher fee, after the user tops up the address's ETH; the vault allows
+   several open requests per recipient) is possible but not automated in this version.
+4. Never edit or delete the swap's record while its request is open: it holds the vault account's
+   nonce (the reservation) and the request id the settle needs.
 
 ## 14. Start, stop, upgrade and re-pin
 
@@ -703,3 +805,4 @@ settings are in `deploy/.env.example`.
 | `sponsor-wallet new`, `register-dust` and `status` on a new wallet (section 4) | Not run: the live runs used an already funded wallet | **Not tested** |
 | A nonce collision with MN Bank (section 9) | The refund path is unit-tested (a refund returns the swap to `minted`, the page retries); no live collision was provoked | Live: **not tested** |
 | The native layout next to MN Bank | `deploy/SYSTEMD.md` | **Not run on a host** (see its last section) |
+| The security fix pass (plan 00048 P4.2-fix, lane FS: audit rows C1–C7, C11–C16) | Unit and route tests against fakes and the recorded stagenet state (`sponsor/test/fix-pass.test.ts`, `relay-loop.test.ts`, `rebuild-wallet.test.ts`, `packages/core/test/deploy-csp.test.ts`), each failing before its fix; the web image's default CSP in Chromium (`deploy/web/csp-browser-check.sh`) | PASS offline. **Not tested live**: the relay loop now broadcasts itself (the vendored loop's receipt wait had no deadline), the live fee sizing, the lane released at the start and the replacement of a stuck transfer |

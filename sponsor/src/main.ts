@@ -6,6 +6,7 @@
 // key volume and Passport runtime.
 
 import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { KernelClient, decodeOffer } from '@evm-midnight-transparent/core';
@@ -19,7 +20,7 @@ import { Redactor, createLogger } from './log.js';
 import { ProofServerClient } from './prover/client.js';
 import { FacadeSponsorSession, openFacadeWallet } from './sponsor/facade.js';
 import { DisabledSponsorSession, type SponsorSession } from './sponsor/session.js';
-import { SwapService } from './swaps/service.js';
+import { SwapService, swapServiceConfig } from './swaps/service.js';
 import { StaleCloser } from './swaps/stale.js';
 import { JsonFileSwapStore, MemorySwapStore, type SwapStore } from './swaps/store.js';
 import { inspectTransaction, makerImbalances } from './validate/inspect.js';
@@ -125,26 +126,14 @@ async function main(): Promise<void> {
 
   const kernel = new KernelClient({ baseUrl: config.network.zswap.kernelUrl });
   const swaps = new SwapService({
-    config: {
-      network: config.network.name,
-      tokens: config.tokens,
-      bridgeGas: config.bridgeGas,
-      sweepGasLimits: config.swaps.sweepGasLimits,
-      maxSweepWei: config.swaps.maxSweepWei,
-      minOfferTtlSeconds: config.swaps.minOfferTtlSeconds,
-      maxActiveSwapsPerOwner: config.swaps.maxActivePerOwner,
-      proofsPerSwap: config.swaps.proofsPerSwap,
-      depositPollMs: config.swaps.depositPollSeconds * 1000,
-      fundsWaitSeconds: config.swaps.fundsWaitSeconds,
-      maxDepositAttempts: config.swaps.maxDepositAttempts,
-      dustLowSpecks: config.sponsor.dustLowSpecks,
-    },
+    config: swapServiceConfig(config),
     store,
     backend: () => live?.backend ?? null,
     prover: () => live?.prover ?? null,
     offers: { offer: (id) => kernel.offer(id), status: (id) => kernel.offerStatus(id) },
     inspect: (bytes, stage) => inspectTransaction(bytes, stage).summary,
     makerImbalances: (offer) => makerImbalances(decodeOffer(offer)),
+    makerTxId: (offer) => createHash('sha256').update(decodeOffer(offer)).digest('hex'),
     sponsor: () => sponsor.status(),
     log: log.child({ component: 'swaps' }),
   });
@@ -177,6 +166,8 @@ async function main(): Promise<void> {
         keysVerified,
         swaps: swaps.countsByState(),
         mpc: swaps.mpcStatus(),
+        budget: swaps.budgetStatus(),
+        reservations: swaps.reservationsStatus(),
         staleCloser: {
           enabled: cs.enabled,
           lastScanAt: cs.lastScanAt,
@@ -201,9 +192,14 @@ async function main(): Promise<void> {
 
   swaps.start();
   closer.start();
+  let sweeps = 0;
   const sweeper = setInterval(() => {
     nonces.sweep();
     store.prune(Math.floor(Date.now() / 1000));
+    // Never-funded failed swaps: one read each before they are dropped (audit C6), every 10 minutes.
+    if (++sweeps % 10 === 0) {
+      void swaps.pruneUnfunded().catch((e: unknown) => log.warn('unfunded prune failed', { error: e }));
+    }
   }, 60_000);
 
   const server = Bun.serve({ hostname: config.host, port: config.port, fetch: app.fetch });

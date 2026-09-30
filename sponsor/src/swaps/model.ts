@@ -8,12 +8,24 @@
 //                         │            │  └── refund (the vault's transfer did not happen) ◄─┤
 //                         │            └──────────────────────────► bridging_back ─► done (bridged back)
 //                         └─ never-executed sweep: back to awaiting_funds (the funds wait at the address)
-//   any non-terminal state ─► failed (with a reason); failed(funds-not-received) ─► awaiting_funds on re-open
+//   any non-terminal state ─► failed (with a reason); a RECOVERABLE failure ─► awaiting_funds on re-open
+//   (funds-not-received; deposit-attempts and deposit-returned-false while re-arms remain: the
+//   funds wait at the deposit address and a new startDeposit to the same recipient moves them)
+//   taken ─► minted on a not-available report, and ─► bridging_back: a "taken" report never blocks
+//   Bridge back, because only the coin the temporary wallet really holds can be withdrawn (audit C13)
 //
 // `minted` means "the temporary wallet holds the funds and the app acts next": after the deposit,
 // after a lost take race ("Swap is not available"), and after a refunded withdrawal.
 
-import type { StageEntry, SwapState, SwapView, SweepGas, WithdrawKind } from '@evm-midnight-transparent/core';
+import {
+  SWAP_ERRORS,
+  type StageEntry,
+  type SwapState,
+  type SwapView,
+  type SweepGas,
+  type WithdrawKind,
+  type WithdrawalStatus,
+} from '@evm-midnight-transparent/core';
 
 export type AttestedKind = 'success' | 'returned-false' | 'never-executed';
 
@@ -25,7 +37,23 @@ export interface LegRecord {
   decimals: number;
 }
 
-export interface DepositRecord {
+/** The EIP-1559 fee fields a request signs (decimal strings). */
+export interface GasRecord {
+  gasLimit: string;
+  maxFeePerGas: string;
+  maxPriorityFeePerGas: string;
+}
+
+/** The relay's progress on the signed Sepolia transfer (both legs; audit C2, C3). */
+interface TransferProgress {
+  /** ms: when the MPC's signature was first seen. */
+  signedAtMs?: number;
+  signedTxHash?: string;
+  /** ms: when the transfer's receipt was first seen. */
+  minedAtMs?: number;
+}
+
+export interface DepositRecord extends TransferProgress {
   stage: string;
   stages: StageEntry[];
   attempts: number;
@@ -38,9 +66,13 @@ export interface DepositRecord {
   attested?: AttestedKind;
   /** ms: when the start landed (the MPC signature budget counts from it). */
   startedAtMs?: number;
+  /** How many times a re-open re-armed this deposit after a recoverable failure (audit C5). */
+  rearms?: number;
+  /** Unix seconds: when the deposit address was first seen holding any of the token (audit C6). */
+  seenAt?: number;
 }
 
-export interface WithdrawRecord {
+export interface WithdrawRecord extends TransferProgress {
   kind: WithdrawKind;
   colour: string;
   amount: string;
@@ -51,6 +83,8 @@ export interface WithdrawRecord {
   evmNonce: string;
   /** The nonce of the coin the call hands to the vault (public: a call argument). */
   coinNonce: string;
+  /** The transfer's fee fields, sized from the live base fee at withdraw-params (audit C2). */
+  gas?: GasRecord;
   /** The request the call creates (predicted from the call's own next state, before it is sent). */
   requestId?: string;
   startTx?: string;
@@ -63,12 +97,28 @@ export interface WithdrawRecord {
   error?: { code: string; message: string };
 }
 
+/** What the latest `withdraw-params` handed out: `/prove withdraw` rebuilds with its gas, and tells a
+ *  vault that moved since (409, rebuild) from a wrong call (422) by its state mark (audit C11). */
+export interface WithdrawOffer {
+  kind: WithdrawKind;
+  evmNonce: string;
+  /** A digest of the vault's contract state when the parameters were handed out. */
+  vaultMark?: string;
+  /** The fee fields handed out (sized from the live base fee; audit C2). */
+  gas?: GasRecord;
+  at: number;
+}
+
 /** What the latest `/prove withdraw` validated: `/withdraw` must carry the same calls. */
 export interface ProvenWithdraw {
   kind: WithdrawKind;
   callsDigest: string;
+  /** The proven transaction's structure (calls, segments, every shielded coin): `/withdraw` must
+   *  carry exactly this one, apart from proofs and binding (audit C4). */
+  structureDigest?: string;
   coinNonce: string;
   evmNonce: string;
+  gas?: GasRecord;
   at: number;
 }
 
@@ -89,12 +139,16 @@ export interface SwapRecord {
   state: SwapState;
   deposit: DepositRecord | null;
   takeTx: string | null;
-  proofs: { take: number; withdraw: number };
+  /** Proofs used: take and withdraw (the withdraw budget renews per attempt) and all of them. */
+  proofs: { take: number; withdraw: number; total?: number };
+  withdrawOffer?: WithdrawOffer;
   provenWithdraw: ProvenWithdraw | null;
   withdrawals: WithdrawRecord[];
   outcome?: 'swapped' | 'bridged-back';
   reason?: string;
   message?: string;
+  /** On `failed`: whether the same open-swap revives it (audit C5). */
+  recoverable?: boolean;
   history: { state: SwapState; at: number }[];
   createdAt: number;
   updatedAt: number;
@@ -106,7 +160,7 @@ export const TRANSITIONS: Readonly<Record<SwapState, readonly SwapState[]>> = {
   depositing: ['minted', 'awaiting_funds', 'failed'],
   minted: ['taking', 'taken', 'withdrawing', 'bridging_back', 'failed'],
   taking: ['taken', 'minted', 'withdrawing', 'bridging_back', 'failed'],
-  taken: ['withdrawing', 'failed'],
+  taken: ['withdrawing', 'bridging_back', 'minted', 'failed'],
   withdrawing: ['done', 'minted', 'failed'],
   bridging_back: ['done', 'minted', 'failed'],
   done: [],
@@ -132,7 +186,7 @@ export function transition(
   rec: SwapRecord,
   to: SwapState,
   now: number,
-  extra: { reason?: string; message?: string } = {},
+  extra: { reason?: string; message?: string; recoverable?: boolean } = {},
 ) {
   if (!canTransition(rec.state, to)) throw new TransitionError(rec.state, to);
   rec.state = to;
@@ -142,11 +196,16 @@ export function transition(
   if (to === 'failed') {
     rec.reason = extra.reason ?? 'failed';
     rec.message = extra.message ?? 'the swap failed';
+    rec.recoverable = extra.recoverable ?? false;
   } else {
     delete rec.reason;
     delete rec.message;
+    delete rec.recoverable;
   }
 }
+
+/** The failures a re-open can revive (the funds wait at the deposit address). */
+export const RECOVERABLE_FAILURES = ['funds-not-received', 'deposit-attempts', 'deposit-returned-false'] as const;
 
 export const isTerminal = (s: SwapState) => s === 'done' || s === 'failed';
 
@@ -168,14 +227,27 @@ export const currentWithdrawal = (rec: SwapRecord): WithdrawRecord | null => rec
 
 const copyStages = (s: StageEntry[]) => s.map((x) => ({ ...x, ...(x.detail ? { detail: { ...x.detail } } : {}) }));
 
-function withdrawView(w: WithdrawRecord) {
+/**
+ * The retry signal (audit C1): the latest withdrawal ended without moving the funds and the
+ * temporary wallet holds them again, so the page must rebuild the withdrawal and submit it again.
+ */
+export function withdrawalStatus(rec: SwapRecord): WithdrawalStatus {
+  const w = currentWithdrawal(rec);
+  let last: WithdrawalStatus['last'] = null;
+  if (w?.stage === 'refunded') last = 'refunded';
+  else if (w?.stage === 'failed') last = w.error?.code === SWAP_ERRORS.staleVaultState ? 'stale-vault' : 'start-failed';
+  return { attempts: rec.withdrawals.length, last, retry: last !== null && WALLET_HOLDS_FUNDS.includes(rec.state) };
+}
+
+/** `refunds` = the withdrawals of this swap refunded so far, the given one included. */
+function withdrawView(w: WithdrawRecord, refunds: number) {
   return {
     kind: w.kind,
     colour: w.colour,
     amount: w.amount,
     stage: w.stage,
     stages: copyStages(w.stages),
-    refunds: w.refunds,
+    refunds,
     ...(w.requestId ? { requestId: w.requestId } : {}),
     ...(w.startTx ? { startTx: w.startTx } : {}),
     ...(w.startTxId ? { startTxId: w.startTxId } : {}),
@@ -189,7 +261,8 @@ function withdrawView(w: WithdrawRecord) {
 
 export function swapView(rec: SwapRecord): SwapView {
   const d = rec.deposit;
-  const w = currentWithdrawal(rec);
+  let refunded = 0;
+  const withdrawals = rec.withdrawals.map((x) => withdrawView(x, x.stage === 'refunded' ? ++refunded : refunded));
   return {
     swapId: rec.swapId,
     state: rec.state,
@@ -217,11 +290,13 @@ export function swapView(rec: SwapRecord): SwapView {
         }
       : null,
     takeTx: rec.takeTx,
-    withdraw: w ? withdrawView(w) : null,
-    withdrawals: rec.withdrawals.map(withdrawView),
+    withdraw: withdrawals.at(-1) ?? null,
+    withdrawals,
+    withdrawal: withdrawalStatus(rec),
     ...(rec.outcome ? { outcome: rec.outcome } : {}),
     ...(rec.reason ? { reason: rec.reason } : {}),
     ...(rec.message ? { message: rec.message } : {}),
+    ...(rec.state === 'failed' ? { recoverable: rec.recoverable === true } : {}),
     createdAt: rec.createdAt,
     updatedAt: rec.updatedAt,
   };

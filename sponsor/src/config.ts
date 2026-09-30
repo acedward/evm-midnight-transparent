@@ -3,8 +3,8 @@
 // settings; L-SPONSOR added the swap settings (data directory, vault key directory, sweep gas,
 // swap limits, the stale closer). Every variable is listed in sponsor/README.md.
 //
-// Secrets never come from plain env values in production: pass the PATH of a file
-// (SPONSOR_SEED_FILE, SEPOLIA_RPC_URL_FILE), which a deployment mounts read-only. Secrets are
+// Secrets never come from plain env values on a live network (refused: audit F-A17): pass the PATH
+// of a file (SPONSOR_SEED_FILE, SEPOLIA_RPC_URL_FILE), which a deployment mounts read-only. Secrets are
 // returned separately from the config, are registered with the log redactor at startup, and
 // never appear in /health, /v1/config or any log line.
 
@@ -78,12 +78,31 @@ export interface SponsorConfig {
     /** A new swap's offer must expire at least this far ahead. */
     minOfferTtlSeconds: number;
     maxActivePerOwner: number;
-    /** Proofs per swap and purpose (take, withdraw). */
+    /** New swaps per EVM address in any 24 hours, whatever became of them (audit C7). */
+    maxPerOwnerPerDay: number;
+    /** Swaps waiting for funds that have received nothing, all addresses together (audit C6). */
+    maxUnfunded: number;
+    /** Proofs per swap and purpose (take, withdraw); the withdraw budget is renewed for each new
+     *  attempt after a refund or a failed start (audit C11). */
     proofsPerSwap: number;
+    /** Every proof of one swap together, over its whole life. */
+    proofsTotalPerSwap: number;
     depositPollSeconds: number;
-    /** An awaiting_funds swap fails after this long without its funds (re-opening resumes it). */
+    /** An awaiting_funds swap that received NOTHING fails after this long (re-opening resumes it). */
     fundsWaitSeconds: number;
+    /** ... and one that received part of the token, after this long (audit C6). */
+    fundsWaitPartialSeconds: number;
+    /** Failed swaps that never received anything are dropped after this many days, once their
+     *  deposit address is read empty (audit C6). */
+    retainUnfundedDays: number;
+    /** The sponsorship budget (audit C7): DUST (specks) the sponsor may pay in any 24 hours, 0 for
+     *  none, and the estimate of one paid start and one paid settle. */
+    dailyDustBudgetSpecks: bigint;
+    dustPerStartSpecks: bigint;
+    dustPerSettleSpecks: bigint;
     maxDepositAttempts: number;
+    /** How often a re-open may re-arm a deposit that failed with its funds at the address (audit C5). */
+    maxDepositRearms: number;
     /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
     sweepGasLimits: Record<string, bigint>;
     /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
@@ -103,9 +122,17 @@ export interface SponsorConfig {
   appName: string;
   /** Health reports low gas when the vault's EVM account holds less than this (wei). */
   vaultGasLowWei: bigint;
-  /** The Sepolia gas fields a withdrawal signs (the MPC signs them verbatim). A withdrawal's gas is
-   *  paid from the vault's shared EVM account, so the sponsor accepts no other values. */
+  /** The Sepolia gas fields a withdrawal signs (the MPC signs them verbatim), paid from the vault's
+   *  shared EVM account. `maxFeePerGas` is the FLOOR: each withdrawal signs max(floor, 2 × the live
+   *  base fee + tip), sized when withdraw-params hands it out (audit C2). */
   bridgeGas: EvmGasPolicy;
+  /** The most a withdrawal's `maxFeePerGas` may be: above it, withdrawals wait for cheaper gas. */
+  bridgeMaxFeeCapWei: bigint;
+  /** A signed transfer still not mined after this long, with the base fee above its cap, is stuck:
+   *  the next withdrawal takes its nonce (a replacement; audit C2). */
+  withdrawStuckAfterSeconds: number;
+  /** A started withdrawal the MPC has not signed after this long is stale the same way. */
+  withdrawUnsignedStaleSeconds: number;
   healthCacheSeconds: number;
   logLevel: LogLevel;
 }
@@ -147,10 +174,11 @@ const big = (v: string | undefined, dflt: bigint, name: string): bigint => {
 const str = (v: string | undefined): string | undefined => (v === undefined || v.trim() === '' ? undefined : v.trim());
 
 /**
- * Read a secret from `<NAME>_FILE` (preferred) or, for local development only, `<NAME>`.
- * Returns null when neither is set.
+ * Read a secret from `<NAME>_FILE` (preferred) or, on the local network only, `<NAME>`: a plain
+ * environment value is visible in `docker inspect` and the process table, so a live network refuses
+ * it (audit F-A17). Returns null when neither is set.
  */
-function secret(env: Env, readFile: ReadFile, name: string): string | null {
+function secret(env: Env, readFile: ReadFile, name: string, allowPlain: boolean): string | null {
   const file = str(env[`${name}_FILE`]);
   if (file) {
     let text: string;
@@ -161,7 +189,13 @@ function secret(env: Env, readFile: ReadFile, name: string): string | null {
     }
     return text;
   }
-  return str(env[name]) ?? null;
+  const plain = str(env[name]);
+  if (plain !== undefined && !allowPlain) {
+    throw new ConfigError(
+      `${name} must come from ${name}_FILE on a live network (a plain value is visible in docker inspect)`,
+    );
+  }
+  return plain ?? null;
 }
 
 /**
@@ -299,10 +333,19 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       retainDays: int(env.SWAP_RETAIN_DAYS, 30, 'SWAP_RETAIN_DAYS', 1, 3650),
       minOfferTtlSeconds: int(env.SWAP_MIN_OFFER_TTL_SECONDS, 1800, 'SWAP_MIN_OFFER_TTL_SECONDS', 0, 86_400),
       maxActivePerOwner: int(env.SWAP_MAX_ACTIVE_PER_OWNER, 3, 'SWAP_MAX_ACTIVE_PER_OWNER', 1, 100),
+      maxPerOwnerPerDay: int(env.SWAP_MAX_PER_OWNER_PER_DAY, 10, 'SWAP_MAX_PER_OWNER_PER_DAY', 1, 10_000),
+      maxUnfunded: int(env.SWAP_MAX_UNFUNDED, 100, 'SWAP_MAX_UNFUNDED', 1, 100_000),
       proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
+      proofsTotalPerSwap: int(env.SWAP_PROOFS_TOTAL_PER_SWAP, 48, 'SWAP_PROOFS_TOTAL_PER_SWAP', 1, 10_000),
       depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
-      fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_SECONDS', 60),
+      fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 10_800, 'SWAP_FUNDS_WAIT_SECONDS', 60),
+      fundsWaitPartialSeconds: int(env.SWAP_FUNDS_WAIT_PARTIAL_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_PARTIAL_SECONDS', 60),
+      retainUnfundedDays: int(env.SWAP_RETAIN_UNFUNDED_DAYS, 2, 'SWAP_RETAIN_UNFUNDED_DAYS', 1, 3650),
+      dailyDustBudgetSpecks: big(env.SPONSOR_DAILY_DUST_BUDGET, 500n, 'SPONSOR_DAILY_DUST_BUDGET') * 10n ** 15n,
+      dustPerStartSpecks: big(env.SWAP_DUST_PER_START_SPECKS, 2_200_000_000_000_000n, 'SWAP_DUST_PER_START_SPECKS'),
+      dustPerSettleSpecks: big(env.SWAP_DUST_PER_SETTLE_SPECKS, 400_000_000_000_000n, 'SWAP_DUST_PER_SETTLE_SPECKS'),
       maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),
+      maxDepositRearms: int(env.DEPOSIT_MAX_REARMS, 3, 'DEPOSIT_MAX_REARMS', 0, 10),
       sweepGasLimits: (() => {
         try {
           return parseSweepGasLimits(str(env.SWEEP_GAS_LIMITS));
@@ -333,13 +376,22 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       ),
       keyVersion: DEFAULT_EVM_GAS.keyVersion,
     },
+    bridgeMaxFeeCapWei: big(env.BRIDGE_EVM_MAX_FEE_CAP_WEI, 100_000_000_000n, 'BRIDGE_EVM_MAX_FEE_CAP_WEI'),
+    withdrawStuckAfterSeconds: int(env.WITHDRAW_STUCK_AFTER_SECONDS, 1_800, 'WITHDRAW_STUCK_AFTER_SECONDS', 60),
+    withdrawUnsignedStaleSeconds: int(
+      env.WITHDRAW_UNSIGNED_STALE_SECONDS,
+      7_200,
+      'WITHDRAW_UNSIGNED_STALE_SECONDS',
+      1_200,
+    ),
     healthCacheSeconds: int(env.HEALTH_CACHE_SECONDS, 15, 'HEALTH_CACHE_SECONDS', 0, 600),
     logLevel,
   };
 
-  const sponsorSeedSource = secret(env, readFile, 'SPONSOR_SEED');
+  const plainSecrets = network.name === 'undeployed';
+  const sponsorSeedSource = secret(env, readFile, 'SPONSOR_SEED', plainSecrets);
   const sponsorSeedHex = sponsorSeedSource === null ? null : parseSponsorSeed(sponsorSeedSource);
-  const sepoliaRpcUrl = secret(env, readFile, 'SEPOLIA_RPC_URL')?.trim() ?? null;
+  const sepoliaRpcUrl = secret(env, readFile, 'SEPOLIA_RPC_URL', plainSecrets)?.trim() ?? null;
   if (sepoliaRpcUrl !== null) {
     try {
       new URL(sepoliaRpcUrl);

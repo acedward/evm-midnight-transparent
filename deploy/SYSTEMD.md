@@ -193,6 +193,11 @@ SPONSOR_TOOL_HEALTH_URL=http://127.0.0.1:8091/health
 LOG_LEVEL=info
 ```
 
+- The secrets come only from the `*_FILE` settings: on stagenet the sponsor refuses a plain
+  `SPONSOR_SEED` or `SEPOLIA_RPC_URL` (visible in `systemctl show` and the process table).
+- The spending controls keep their defaults unless you set them (`sponsor/README.md`): a daily DUST
+  budget (`SPONSOR_DAILY_DUST_BUDGET`, 500 DUST; set it to what the sponsor's NIGHT generates in a
+  day), 10 new swaps per EVM address a day, 100 swaps waiting for funds (RUNBOOK section 10).
 - `SPONSOR_DEDICATED_WALLET=true` says the seed is this sponsor's alone. Only set it when it is: on
   stagenet the sponsor refuses to open a wallet without it (or a lock file).
 - `SPONSOR_TOOL_HEALTH_URL` matters. The wallet tool (step 7) looks for the sponsor at
@@ -253,7 +258,8 @@ unit's view. Anything else means don't start the sponsor; see RUNBOOK section 6.
   Compose key job) to a directory `emt` can read, and add `IMPORT_DIR=<that directory>` to
   `/etc/emt/sponsor.env` for the first run (the sponsor ignores it); remove the line afterwards, or a
   later rebuild (step 10) imports that directory again. It goes through the same checks.
-  Do not import MN Bank's key set (RUNBOOK section 6.4).
+  Do not import MN Bank's key set (RUNBOOK section 6.4): the sponsor runs only the pinned build of
+  the directory's `index.js` files and refuses any other before it runs.
 - **The indexer unreachable at boot** fails the check, and the sponsor stays down with it
   (`Requires=`). Start both again later: `sudo systemctl restart emt-vault-keys emt-sponsor`.
 
@@ -355,6 +361,10 @@ server {
   add_header Referrer-Policy no-referrer always;
   add_header X-Frame-Options DENY always;
   add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+  add_header Strict-Transport-Security "max-age=31536000" always;
+  # The Compose bundle's default policy for stagenet (deploy/web/csp.sh prints it:
+  # sh deploy/web/csp.sh stagenet /sponsor), checked in Chromium (RUNBOOK section 3).
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://stagenet.api-zswap.zkdojo.com https://stagenet.batcher-zswap.zkdojo.com https://indexer.stagenet.shielded.tools wss://indexer.stagenet.shielded.tools https://rpc.stagenet.shielded.tools wss://rpc.stagenet.shielded.tools; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
 
   location = /healthz { access_log off; default_type text/plain; return 200 "ok\n"; }
   location = /config.json { default_type application/json; expires -1; }
@@ -382,9 +392,11 @@ server {
   shares one rate-limit bucket at the sponsor.
 - **https, not http.** The page carries the swap's bearer token and its users sign with their
   wallets; serve it only over TLS. The port-80 block only redirects.
-- **No Content-Security-Policy**, as in the Compose bundle's default. If you add one, it must allow
-  `'wasm-unsafe-eval'` and `connect-src` to the stagenet indexer (https and wss), the kernel and the
-  batcher (not tested).
+- **The Content-Security-Policy** is the Compose bundle's default (audit C15): regenerate the line with
+  `sh deploy/web/csp.sh stagenet /sponsor` after an upgrade, and add the origins of any network
+  overrides you put in `config.json` to its `connect-src`, or the browser blocks them. nginx drops the
+  server's `add_header` lines in a `location` that has its own, so add none there. HSTS is set here:
+  this nginx terminates TLS.
 - **Separate from MN Bank's users.** Browser storage is per origin: swap records on this site are not
   on MN Bank's, and the other way round.
 

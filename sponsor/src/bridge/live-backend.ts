@@ -12,6 +12,8 @@
 //   - the relayer options of test/gates/bridge/gate.ts `runRelay` (request paths [0] and [2], the
 //     vault's response key and schema, the MPC output cache).
 
+import { createHash } from 'node:crypto';
+
 import {
   depositAddressFor,
   depositPathOf,
@@ -29,15 +31,18 @@ import type {
   OpenRequests,
   RebuiltWithdraw,
   RelayOutcome,
+  RequestDetail,
   SwapBackend,
   SwapProver,
   WithdrawCallArgs,
 } from '../swaps/backend.js';
 import { jsonRpcEvmReader } from './evm.js';
 import { rebuildStartWithdraw } from './rebuild.js';
+import { relayLoop } from './relay-loop.js';
 import {
   addDustAndSubmit,
   callVault,
+  checkVaultModules,
   loadVault,
   openRequests as vaultOpenRequests,
   publicDataProviderFor,
@@ -75,6 +80,28 @@ export interface LiveBackend {
 
 const norm = (h: string) => h.replace(/^0x/i, '').toLowerCase();
 
+/**
+ * The transaction fields of a vault request (a Signet `SignBidirectionalEvent` whose txParams are an
+ * `EvmType2TxParams<2, 0, 0>`: `to` = the ERC20, calldata `transfer(address, amount)` with the amount
+ * as its second 32-byte word). Undefined when the record does not have that shape.
+ */
+export function requestDetail(record: Any): RequestDetail | undefined {
+  try {
+    const p = record?.txParams;
+    const words = p?.calldata?.is_some ? p.calldata.value?.words : undefined;
+    if (!(p?.to instanceof Uint8Array) || !Array.isArray(words) || !(words[1] instanceof Uint8Array)) return undefined;
+    return {
+      erc20: `0x${Buffer.from(p.to).toString('hex')}`,
+      amount: BigInt(`0x${Buffer.from(words[1]).toString('hex') || '0'}`),
+      evmNonce: BigInt(p.nonce),
+      gasLimit: BigInt(p.gasLimit),
+      maxFeePerGas: BigInt(p.maxFeePerGas),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Load the vault and its keys, verify them against the chain, and compose the backend. Throws a
  *  BridgeConfigError when the keys are not the deployed ones (the sponsor then bridges nothing). */
 export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBackend> {
@@ -93,6 +120,12 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   const vault = norm(b.vaultAddress);
   const singleton = norm(b.signetSingleton);
   const root = sdk.normaliseSecp256k1PublicKey(b.mpcRootPublicKey);
+  try {
+    checkVaultModules(o.managedDir);
+  } catch (e) {
+    // A key directory whose JavaScript is not the reviewed build: the bridge stays off (audit F-A16).
+    throw new BridgeConfigError((e as Error).message);
+  }
   const rt: VaultRuntime = await loadVault(o.managedDir);
   const endpoints = {
     networkId: o.network.midnightNetworkId,
@@ -157,6 +190,7 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         const p = records.get(norm(id))?.path;
         return p === undefined ? undefined : p instanceof Uint8Array ? Buffer.from(p).toString('hex') : norm(String(p));
       },
+      detailOf: (id) => requestDetail(records.get(norm(id))),
     };
   };
 
@@ -206,34 +240,77 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         return { ...(await facts(out.txId, out.status, out.txHash)), requestId: out.requestId };
       }),
 
+    // The sponsor's own bounded loop (./relay-loop.ts, audit C2) over the vendored relayer's
+    // reader and attestation check; one JSON-RPC provider per call, destroyed when it returns.
     async relay(i) {
-      const r = await relayer.relayRequest({
+      const id = norm(i.requestId);
+      const reader = relayer.makeReader({
         publicDataProvider: pdp,
         indexerUrl: o.network.midnight.indexerUrl,
         requesterContractAddress: vault,
         requesterRequestsPath: i.kind === 'deposit' ? [0] : [2],
         signetContractAddress: singleton,
-        requestId: norm(i.requestId),
-        expectedSigner: i.expectedSigner,
-        mpcResponseKey: responseKey,
-        responseSchema,
-        evmRpcUrl: o.evmRpcUrl,
-        outputCache: { networkId: o.network.midnightNetworkId, cacheUrl: b.mpcOutputCacheUrl },
-        signatureTimeoutMs: i.signatureTimeoutMs,
-        intervalMs: 15_000,
-        onProgress: (p) => i.onProgress(p as never),
-        log: (line: string) => o.log.info('relayer', { requestId: i.requestId, line: line.trim() }),
-      });
-      const out: RelayOutcome = {
-        kind: r.kind,
-        event: r.event,
-        serializedOutput: r.serializedOutput,
-        signedTxHash: r.signedTxHash,
-        signatureAfterMs: r.signatureAfterMs,
-        attestationAfterMs: r.attestationAfterMs,
-        ...(r.evmTxHash ? { evmTxHash: r.evmTxHash } : {}),
-      };
-      return out;
+      }) as Any;
+      const cache = new sdk.MpcOutputCacheReader({
+        networkId: o.network.midnightNetworkId,
+        cacheUrl: b.mpcOutputCacheUrl,
+        signetContractAddress: singleton,
+      } as never) as Any;
+      const { JsonRpcProvider } = await import('ethers');
+      const provider = new JsonRpcProvider(o.evmRpcUrl, undefined, { staticNetwork: true });
+      try {
+        const r = await relayLoop(
+          {
+            now: () => Date.now(),
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+            log: (line) => o.log.info('relayer', { requestId: i.requestId, line }),
+            signedTx: async (rid, signer) => {
+              const tx: Any = await reader.getSignedEvmTransaction(rid as never, signer);
+              if (!tx) return undefined;
+              return {
+                hash: String(tx.hash),
+                from: String(tx.from),
+                nonce: Number(tx.nonce),
+                maxFeePerGas: BigInt(tx.maxFeePerGas ?? 0),
+                serialized: String(tx.serialized),
+              };
+            },
+            receipt: async (hash) => {
+              const rc = await provider.getTransactionReceipt(hash);
+              return rc ? { hash: rc.hash, blockNumber: rc.blockNumber, status: rc.status } : null;
+            },
+            latestNonce: (address) => provider.getTransactionCount(address, 'latest'),
+            broadcast: async (serialized) => {
+              await provider.broadcastTransaction(serialized);
+            },
+            finalizedBlock: async () => (await provider.getBlock('finalized'))?.number ?? null,
+            cachedOutput: (rid) => cache.fetchSerializedOutput(rid) as Promise<Uint8Array | undefined>,
+            posts: (rid) => reader.getRespondBidirectionalEvents(rid as never) as Promise<readonly unknown[]>,
+            find: (rid, posts, cached) => relayer.findAttestation(rid, posts, responseKey, responseSchema, cached),
+          },
+          {
+            requestId: id,
+            expectedSigner: i.expectedSigner,
+            signatureTimeoutMs: i.signatureTimeoutMs,
+            attestationTimeoutMs: i.attestationTimeoutMs ?? relayer.DEFAULT_ATTESTATION_TIMEOUT_MS,
+            intervalMs: 15_000,
+            rebroadcastMs: 60_000,
+            onProgress: (p) => i.onProgress(p),
+          },
+        );
+        const out: RelayOutcome = {
+          kind: r.kind,
+          event: sdk.respondBidirectionalEventToCircuitInput(r.post as never),
+          serializedOutput: r.serializedOutput,
+          signedTxHash: r.signedTxHash,
+          signatureAfterMs: r.signatureAfterMs,
+          attestationAfterMs: r.attestationAfterMs,
+          ...(r.evmTxHash ? { evmTxHash: r.evmTxHash } : {}),
+        };
+        return out;
+      } finally {
+        provider.destroy();
+      }
     },
 
     attestation,
@@ -260,9 +337,17 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         return facts(out.txId, out.status, out.txHash);
       }),
 
+    async vaultStateMark(): Promise<string> {
+      const state: Any = await pdp.queryContractState(vault);
+      if (!state) throw new Error('no contract state at the vault');
+      return createHash('sha256')
+        .update(Buffer.from(state.serialize() as Uint8Array))
+        .digest('hex');
+    },
+
     async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
       const r = await rebuildStartWithdraw({ compiledContract: rt.compiledContract, ledger: rt.ledger }, pdp, vault, a);
-      return { calls: r.calls, callsDigest: r.callsDigest, requestId: r.requestId };
+      return { calls: r.calls, callsDigest: r.callsDigest, outputs: r.outputs, requestId: r.requestId };
     },
 
     submitWithdraw: (finalTx) =>

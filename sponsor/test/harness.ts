@@ -20,7 +20,7 @@ import { NonceStore } from '../src/auth/nonces.js';
 import { loadConfig, type SponsorConfig } from '../src/config.js';
 import { createLogger, type Logger } from '../src/log.js';
 import type { SponsorSession, SponsorStatus } from '../src/sponsor/session.js';
-import { SwapService, type SwapServiceConfig } from '../src/swaps/service.js';
+import { SwapService, swapServiceConfig, type SwapServiceConfig } from '../src/swaps/service.js';
 import { MemorySwapStore, type SwapStore } from '../src/swaps/store.js';
 import {
   FakeOffers,
@@ -110,18 +110,10 @@ export function harness(
   const now = { ms: Date.now() };
   const swaps = new SwapService({
     config: {
-      network: config.network.name,
-      tokens: config.tokens,
-      bridgeGas: config.bridgeGas,
-      sweepGasLimits: config.swaps.sweepGasLimits,
-      maxSweepWei: config.swaps.maxSweepWei,
-      minOfferTtlSeconds: config.swaps.minOfferTtlSeconds,
-      maxActiveSwapsPerOwner: config.swaps.maxActivePerOwner,
-      proofsPerSwap: config.swaps.proofsPerSwap,
+      ...swapServiceConfig(config),
       depositPollMs: 1_000_000,
-      fundsWaitSeconds: config.swaps.fundsWaitSeconds,
-      maxDepositAttempts: config.swaps.maxDepositAttempts,
-      dustLowSpecks: config.sponsor.dustLowSpecks,
+      // Every pass reads a fresh swap's address (tests call pollDeposits by hand).
+      pollBackoffMs: { fast: 0, medium: 60_000, slow: 300_000 },
       ...opts.service,
     },
     store,
@@ -130,6 +122,7 @@ export function harness(
     offers,
     inspect: (bytes) => fakeInspect(bytes),
     makerImbalances: offers.makerImbalances,
+    makerTxId: offers.makerTxId,
     sponsor: () => sponsor.status(),
     log,
     now: () => now.ms,
@@ -280,15 +273,25 @@ export function withdrawFor(
     erc20?: string;
     refund?: string;
     gasLimit?: bigint;
+    maxFeePerGas?: bigint;
   } = {},
 ) {
   const leg = kind === 'swap' ? BID.receive : BID.pay;
   const coinNonce = over.coinNonce ?? hex32(`coin-nonce-${kind}`);
+  const coin = {
+    coinNonce,
+    colour: over.colour ?? leg.token.midnightColour,
+    amount: over.amount ?? leg.amount,
+  };
   const evmNonce = over.evmNonce ?? 9n;
   const calls = fakeWithdrawCalls(
     {
       evmNonce,
-      gas: { ...h.config.bridgeGas, ...(over.gasLimit ? { gasLimit: over.gasLimit } : {}) },
+      gas: {
+        ...h.config.bridgeGas,
+        ...(over.gasLimit ? { gasLimit: over.gasLimit } : {}),
+        ...(over.maxFeePerGas ? { maxFeePerGas: over.maxFeePerGas } : {}),
+      },
       erc20: over.erc20 ?? leg.token.sepoliaAddress,
       amount: over.amount ?? leg.amount,
       dest: over.dest ?? s.user.address,
@@ -300,5 +303,5 @@ export function withdrawFor(
     },
     h.vault.version,
   );
-  return { calls, coinNonce, evmNonce, tx: withdrawTx(calls) };
+  return { calls, coinNonce, evmNonce, tx: withdrawTx(calls, {}, coin) };
 }

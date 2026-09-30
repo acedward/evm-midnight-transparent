@@ -16,8 +16,11 @@ export interface CallSummary {
   address: string;
   /** The entry point's name (or its bytes as hex). */
   entryPoint: string;
-  /** sha256 of the call's canonical public transcripts. */
+  /** sha256 of the call's canonical public transcripts, their declared gas left out. */
   digest: string;
+  /** The transcripts' declared gas (each cost as a decimal string), compared with a tolerance: the
+   *  callee's random commitment moves it a little from build to build (P4.2-fix, found in CI). */
+  gas?: { guaranteed: Record<string, string> | null; fallible: Record<string, string> | null };
 }
 
 export interface TxSummary {
@@ -40,8 +43,18 @@ export interface TxSummary {
   imbalances: Record<string, Record<string, bigint>>;
   /** Non-zero UNSHIELDED imbalances, any segment. */
   unshieldedImbalances: number;
-  /** sha256 over every call's digest, in order: what `/withdraw` must match. */
+  /** sha256 over every call's digest, in order. */
   callsDigest: string;
+  /** Every intent's segment id (0 = the guaranteed section), ascending. */
+  segments: number[];
+  /** The guaranteed shielded offer's coins: input nullifiers and output commitments, each with the
+   *  contract that owns it (null for a user's coin; audit C4). */
+  shielded: {
+    inputs: { nullifier: string; contract: string | null }[];
+    outputs: { commitment: string; contract: string | null }[];
+  };
+  /** ./summary.ts `structureDigestOf`: what `/withdraw` must match. */
+  structureDigest: string;
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -122,7 +135,9 @@ function maskBytes(v: unknown, commitments: readonly string[], depth = 0): unkno
 
 /**
  * A transcript with the per-build randomness masked (see the header): the communication commitment
- * of each callee, both where the effects claim it and where the program pushes it.
+ * of each callee, both where the effects claim it and where the program pushes it, and the declared
+ * gas, which that commitment's encoded length moves by a few hundred-thousandths (compared apart,
+ * with a tolerance: ../validate/rules.ts `gasClose`).
  */
 function maskTranscript(t: unknown): unknown {
   if (!t || typeof t !== 'object') return t ?? null;
@@ -131,6 +146,7 @@ function maskTranscript(t: unknown): unknown {
   const calls = tr.effects?.claimedContractCalls;
   const masked = {
     ...(t as object),
+    ...('gas' in (t as object) ? { gas: '$gas' } : {}),
     ...(Array.isArray(calls)
       ? {
           effects: {
@@ -141,6 +157,17 @@ function maskTranscript(t: unknown): unknown {
       : {}),
   };
   return maskBytes(masked, commitments);
+}
+
+/** A transcript's declared gas: each numeric cost as a decimal string (null without a transcript). */
+export function gasOf(t: unknown): Record<string, string> | null {
+  const g = (t as { gas?: unknown } | null | undefined)?.gas;
+  if (!g || typeof g !== 'object') return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(g as Record<string, unknown>)) {
+    if (typeof v === 'bigint' || typeof v === 'number') out[k] = BigInt(v).toString(10);
+  }
+  return out;
 }
 
 export function callDigest(call: {
@@ -158,6 +185,23 @@ export function callDigest(call: {
         fallible: maskTranscript(call.fallibleTranscript),
       }),
     ),
+  );
+}
+
+/**
+ * sha256 over everything a proof or a binding cannot change: the calls' digest, the intents' segment
+ * ids, and every guaranteed shielded coin (input nullifiers, output commitments, each with the
+ * contract owning it), sorted. `/withdraw` must carry the structure the sponsor proved (audit C4).
+ */
+export function structureDigestOf(
+  s: Pick<TxSummary, 'callsDigest' | 'segments' | 'shielded'> & { calls?: readonly CallSummary[] },
+): string {
+  const ins = s.shielded.inputs.map((i) => `${i.nullifier}/${i.contract ?? ''}`).sort();
+  const outs = s.shielded.outputs.map((o) => `${o.commitment}/${o.contract ?? ''}`).sort();
+  // The calls' declared gas exactly: `/withdraw` pays for what `/prove` saw, no more.
+  const gas = (s.calls ?? []).map((c) => canonical(c.gas ?? null));
+  return sha256(
+    JSON.stringify({ calls: s.callsDigest, segments: [...s.segments].sort((a, b) => a - b), ins, outs, gas }),
   );
 }
 

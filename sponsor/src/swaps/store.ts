@@ -31,6 +31,8 @@ export interface SwapStore {
   all(): SwapRecord[];
   /** Insert or replace, and persist. */
   put(rec: SwapRecord): void;
+  /** Remove one swap, and persist. */
+  delete(swapId: string): void;
   /** Drop finished swaps older than the retention; returns how many. */
   prune(nowSeconds: number): number;
 }
@@ -58,6 +60,10 @@ export class MemorySwapStore implements SwapStore {
   put(rec: SwapRecord) {
     this.swaps.set(rec.swapId, rec);
     this.persist();
+  }
+
+  delete(swapId: string) {
+    if (this.swaps.delete(swapId)) this.persist();
   }
 
   prune(nowSeconds: number) {

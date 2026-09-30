@@ -177,3 +177,29 @@ describe('the salt', () => {
     expect(newSwapSalt((buf) => buf.fill(7))).toBe(`0x${'07'.repeat(32)}`);
   });
 });
+
+describe('the public swap id (plan 00048 P4.2-fix, audit C14: the salt never leaves the browser)', () => {
+  it('is keccak256(utf8(tag) ‖ salt), the same as Solidity abi.encodePacked(string, bytes32)', async () => {
+    const { SWAP_ID_TAG, publicSwapId } = await import('../src/swap-key.js');
+    const { solidityPackedKeccak256 } = await import('ethers');
+    expect(SWAP_ID_TAG).toBe('evm-midnight-swap/id');
+    const byHand = keccak256(concat([toUtf8Bytes(SWAP_ID_TAG), VECTOR.salt])).slice(2);
+    expect(publicSwapId(VECTOR.salt)).toBe(byHand);
+    expect(publicSwapId(VECTOR.salt)).toBe(
+      solidityPackedKeccak256(['string', 'bytes32'], [SWAP_ID_TAG, VECTOR.salt]).slice(2),
+    );
+    // A fixed vector: changing it changes every swap's id at the sponsor.
+    expect(publicSwapId(`0x${'00'.repeat(32)}`)).toBe(
+      keccak256(concat([toUtf8Bytes('evm-midnight-swap/id'), new Uint8Array(32)])).slice(2),
+    );
+  });
+
+  it('is 64 lowercase hex, never the salt, and accepts the salt with or without 0x', async () => {
+    const { publicSwapId } = await import('../src/swap-key.js');
+    const id = publicSwapId(VECTOR.salt);
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
+    expect(id).not.toBe(VECTOR.salt.slice(2));
+    expect(publicSwapId(VECTOR.salt.slice(2).toUpperCase())).toBe(id);
+    expect(() => publicSwapId('0x1234')).toThrow(SwapKeyError);
+  });
+});
