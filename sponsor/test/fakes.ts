@@ -12,20 +12,21 @@ import { createHash } from 'node:crypto';
 import { getAddress } from 'ethers';
 import type { EvmGasPolicy, KernelOfferStatus, OfferDetail } from '@evm-midnight-transparent/core';
 
-import type {
-  Attestation,
-  BridgeKind,
-  EvmReader,
-  MidnightTxFacts,
-  OfferReader,
-  OpenRequests,
-  RebuiltWithdraw,
-  RelayOutcome,
-  RelayProgress,
-  SettleCircuit,
-  SwapBackend,
-  SwapProver,
-  WithdrawCallArgs,
+import {
+  NotSubmittedError,
+  type Attestation,
+  type BridgeKind,
+  type EvmReader,
+  type MidnightTxFacts,
+  type OfferReader,
+  type OpenRequests,
+  type RebuiltWithdraw,
+  type RelayOutcome,
+  type RelayProgress,
+  type SettleCircuit,
+  type SwapBackend,
+  type SwapProver,
+  type WithdrawCallArgs,
 } from '../src/swaps/backend.js';
 import type { AttestedKind } from '../src/swaps/model.js';
 import { InvalidTxError } from '../src/validate/rules.js';
@@ -46,13 +47,20 @@ export function encodeFakeTx(s: TxSummary): string {
   return Buffer.from(MARK + json, 'utf8').toString('hex');
 }
 
+/** A fake transaction's summary; its `erased` form is the whole fake (a fake has no proofs), unless
+ *  the summary names one. */
 export function fakeInspect(bytes: Uint8Array): TxSummary {
   const text = Buffer.from(bytes).toString('utf8');
   if (!text.startsWith(MARK)) throw new InvalidTxError('not-a-transaction', 'not a transaction');
-  return JSON.parse(text.slice(MARK.length), (_k, v: unknown) =>
+  const s = JSON.parse(text.slice(MARK.length), (_k, v: unknown) =>
     typeof v === 'string' && /^-?\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v,
   ) as TxSummary;
+  return { ...s, erased: s.erased ?? Buffer.from(bytes).toString('hex') };
 }
+
+/** The fake `coinCommitment`: a coin's commitment follows the coin AND the key it is paid to. */
+export const fakeCoinCommitment = (coin: { nonce: string; colour: string; value: bigint }, coinPk: string) =>
+  sha(`coin:${coinPk}:${coin.nonce}:${coin.colour}:${coin.value}`);
 
 type Shielded = TxSummary['shielded'];
 
@@ -220,6 +228,11 @@ export class FakeVault implements SwapBackend {
   relayPlans = new Map<string, RelayPlan>();
   defaultRelay: RelayPlan = {};
   submitStatus = 'SucceedEntirely';
+  /** How the next startWithdraw submission fails: before the node (`not-submitted`), or with an
+   *  unknown outcome after the start landed (`lost-landed`) or when it did not (`lost`). */
+  submitFailure: 'not-submitted' | 'lost-landed' | 'lost' | null = null;
+  /** Attestations that already verify for a request (settled or not), by request id. */
+  attestations = new Map<string, AttestedKind>();
   private seq = 0;
 
   depositAddress(coinPk: string) {
@@ -333,8 +346,9 @@ export class FakeVault implements SwapBackend {
       ...(kind === 'never-executed' ? {} : { evmTxHash }),
     };
   }
-  async attestation(): Promise<Attestation | null> {
-    return null;
+  async attestation(_kind: BridgeKind, requestId: string): Promise<Attestation | null> {
+    const kind = this.attestations.get(requestId);
+    return kind ? { kind, event: { requestId }, serializedOutput: new Uint8Array([kind === 'success' ? 1 : 0]) } : null;
   }
   readonly settles: { circuit: SettleCircuit; requestId: string; coinPk: string; encPk: string }[] = [];
   async settle(i: {
@@ -379,6 +393,10 @@ export class FakeVault implements SwapBackend {
     const s = fakeInspect(finalTx);
     const args = this.pendingWithdrawArgs.get(s.callsDigest);
     if (!args) throw new Error('the fake vault does not know this withdrawal (register its args first)');
+    const failure = this.submitFailure;
+    this.submitFailure = null;
+    if (failure === 'not-submitted') throw new NotSubmittedError('the DUST balancing failed');
+    if (failure === 'lost') throw new Error('the node did not answer (the transaction was not included)');
     const id = sha(`withdraw:${s.callsDigest}`);
     this.submitted.push(id);
     this.log.push(`startWithdraw nonce=${args.evmNonce} amount=${args.amount}`);
@@ -395,6 +413,7 @@ export class FakeVault implements SwapBackend {
       maxFeePerGas: args.gas.maxFeePerGas,
     });
     this.version++;
+    if (failure === 'lost-landed') throw new Error('the indexer timed out (the transaction landed)');
     return this.facts('startWithdraw');
   }
 }

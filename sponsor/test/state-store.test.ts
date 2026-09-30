@@ -228,9 +228,15 @@ describe('restarts: the service resumes every swap in flight from its recorded r
       requestId: '99'.repeat(32),
     });
     h.store.put(rec);
+    // P4.2-fix2 (audit R5): a request not seen yet may be a lagging read: the attempt keeps its nonce
+    // until the window shows it did not land.
+    await h.swaps.resumeWithdraw(s.swapId);
+    expect(h.store.get(s.swapId)!.state).toBe('bridging_back');
+    expect(h.store.get(s.swapId)!.withdrawals.at(-1)!.stage).toBe('submission-uncertain');
+    h.now.ms += 16 * 60_000;
     await h.swaps.resumeWithdraw(s.swapId);
     expect(h.store.get(s.swapId)!.state).toBe('minted');
-    expect(h.store.get(s.swapId)!.withdrawals.at(-1)!.error!.code).toBe('interrupted');
+    expect(h.store.get(s.swapId)!.withdrawals.at(-1)!.error!.code).toBe('not-included');
   });
 });
 

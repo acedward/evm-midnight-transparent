@@ -123,6 +123,7 @@ export function summarise(tx: Any): TxSummary {
     segments,
     shielded,
     structureDigest: structureDigestOf({ callsDigest, segments, shielded, calls }),
+    erased: Buffer.from((tx.eraseProofs() as Any).serialize() as Uint8Array).toString('hex'),
   };
 }
 
@@ -137,6 +138,17 @@ export function inspectTransaction(bytes: Uint8Array, stage: TxStage): { tx: Any
     throw new InvalidTxError('not-a-transaction', 'the transaction could not be read');
   }
   return { tx, summary };
+}
+
+/**
+ * The commitment of a shielded coin owned by `coinPk` (ledger-v9 `coinCommitment`), lowercase hex:
+ * what an output paying that coin to that key carries. The sponsor recomputes each coin `/prove`
+ * says it pays to the temporary wallet (audit R1).
+ */
+export function walletCoinCommitment(coin: { nonce: string; colour: string; value: bigint }, coinPk: string): string {
+  return String(
+    ledger.coinCommitment({ type: coin.colour, nonce: coin.nonce, value: coin.value } as Any, coinPk as Any),
+  ).toLowerCase();
 }
 
 /** The imbalances (segment 0) of a maker's finalized offer transaction, from its bytes. */

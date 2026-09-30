@@ -236,6 +236,9 @@ export const SwapViewSchema = z.object({
    *  owner, terms and temporary keys) revives the swap, e.g. the funds reached the deposit address
    *  late or the sponsor could not start the deposit; the page offers Resume for it (audit C5). */
   recoverable: z.boolean().optional(),
+  /** On a recoverable `failed` swap the sponsor will not revive yet (a deposit re-arm paced by its
+   *  cooldown or its daily count): unix seconds from which a re-open revives it (audit R3). */
+  retryAt: z.number().int().optional(),
   createdAt: z.number().int(),
   updatedAt: z.number().int(),
 });
@@ -283,12 +286,28 @@ const txHex = z
   .max(1_500_000)
   .refine((s) => s.replace(/^0x/i, '').length % 2 === 0, 'odd-length hex');
 
+/** A coin the transaction pays to the temporary wallet, disclosed so the sponsor can recompute its
+ *  commitment with the temporary coin public key (plan 00048 P4.2-fix2, audit R1 / F-B21). */
+export const WalletOutputSchema = z
+  .object({ nonce: hex64, colour: hex64, value: z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units') })
+  .strict();
+export type WalletOutput = z.infer<typeof WalletOutputSchema>;
+
+/** At most this many disclosed wallet outputs (a transaction has at most 4 coins in and out). */
+export const MAX_WALLET_OUTPUTS = 4;
+
+/** EVERY coin the transaction pays to the temporary wallet: a take's received coin and its change, a
+ *  withdrawal's change (none when its coin was exact). Every guaranteed output that is neither the
+ *  vault's coin (a withdrawal) nor one of these is refused (`invalid-tx` / `undisclosed-output`). */
+const walletOutputs = z.array(WalletOutputSchema).max(MAX_WALLET_OUTPUTS).optional();
+
 export const ProveRequestSchema = z.discriminatedUnion('purpose', [
-  z.object({ purpose: z.literal('take'), tx: txHex }).strict(),
+  z.object({ purpose: z.literal('take'), tx: txHex, walletOutputs }).strict(),
   z
     .object({
       purpose: z.literal('withdraw'),
       tx: txHex,
+      walletOutputs,
       /** The nonce of the coin the call hands to the vault (public: it is in the call's arguments). */
       coinNonce: hex64,
       /** The vault account's EVM nonce the call signs (from withdraw-params). */
@@ -345,8 +364,12 @@ export const SWAP_ERRORS = {
   withdrawalInProgress: 'withdrawal-in-progress',
   /** 429: the swap's proof budget is spent. */
   proofBudget: 'proof-budget',
-  /** 429: too many open swaps for this EVM address, or its daily swap allowance is used. */
+  /** 429: too many open swaps for this EVM address, or its daily swap allowance is used, or (detail
+   *  `client`) too many swaps waiting for funds from this client (its IPv4 address or IPv6 /64). */
   tooManySwaps: 'too-many-swaps',
+  /** 422: a new swap (or the revival of one that received nothing) needs the EVM address to hold the
+   *  pay amount of the pay token (detail `token`) and the sweep's ETH (detail `eth`) (audit R4). */
+  insufficientFunds: 'insufficient-funds',
   /** 503: too many swaps are waiting for funds right now (all addresses together); try later. */
   sponsorBusy: 'sponsor-busy',
   /** 503: the sponsor's daily DUST budget is spent; new swaps wait for tomorrow's. */
@@ -384,6 +407,8 @@ export const INVALID_TX_DETAILS = [
   'extra-coins',
   /** A contract-owned coin spent, or a coin paid to a contract other than through the call. */
   'contract-coin',
+  /** An output that is neither the vault's coin nor one of the disclosed `walletOutputs` (audit R1). */
+  'undisclosed-output',
 ] as const;
 export type InvalidTxDetail = (typeof INVALID_TX_DETAILS)[number];
 

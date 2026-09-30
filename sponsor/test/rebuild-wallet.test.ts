@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import * as l from '@midnightntwrk/ledger-v9';
 import { CompiledContract } from '@midnight-ntwrk/compact-js';
 import { DEFAULT_EVM_GAS, STAGENET, decodeOffer, hexToBytes } from '@evm-midnight-transparent/core';
-import { buildTake, buildWithdraw } from '@evm-midnight-transparent/wallet';
+import { buildTake, buildWithdraw, temporaryWalletKeys } from '@evm-midnight-transparent/wallet';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 import { beforeAll, describe, expect, it } from 'vitest';
 
@@ -27,7 +27,7 @@ import {
 import { requestDetail } from '../src/bridge/live-backend.js';
 import { rebuildStartWithdraw } from '../src/bridge/rebuild.js';
 import type { WithdrawCallArgs } from '../src/swaps/backend.js';
-import { inspectTransaction, makerImbalances, summarise } from '../src/validate/inspect.js';
+import { inspectTransaction, makerImbalances, summarise, walletCoinCommitment } from '../src/validate/inspect.js';
 import { InvalidTxError, gasClose, validateTake, validateWithdraw } from '../src/validate/rules.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -268,6 +268,85 @@ describe('the take: the wallet’s balancing transaction for the G-TAKE bid', ()
       'wrong-amount',
     );
     expect(detailOf(() => validateTake(summary, { pay: terms.receive, receive: terms.pay }))).toBe('wrong-offer');
+    await draft.release();
+    await wallet.close();
+  });
+});
+
+describe('R1 on the real ledger: the outputs the wallet discloses, recomputed by the sponsor (plan Lane contracts, FS2 item 1)', () => {
+  const BID = fixture<{ offerId: string; offerBech32: string }>('stagenet-bid-9ed57eec.json');
+  const terms = {
+    pay: { colour: WSTKA, amount: 104_166_667n },
+    receive: { colour: WUSDC, amount: 1_000_000n },
+  };
+
+  /** ledger-v9 `coinCommitment` (the sponsor's `walletCoinCommitment` is checked equal below). */
+  const commitment = (o: { nonce: string; colour: string; value: bigint }, coinPk: string) =>
+    String(l.coinCommitment({ type: o.colour, nonce: o.nonce, value: o.value } as any, coinPk as any)).toLowerCase();
+
+  /** The Lane contracts recipe: the wallet decrypts its own outputs of the unproven transaction. */
+  const walletOutputsOf = (txHex: string) => {
+    const keys = temporaryWalletKeys(TEST_SEED_A, 'stagenet');
+    const tx = l.Transaction.deserialize('signature', 'pre-proof', 'pre-binding', hexToBytes(txHex)) as any;
+    const coins = [...new l.ZswapLocalState().apply(keys.shieldedSecretKeys, tx.guaranteedOffer).coins];
+    keys.clear();
+    return coins.map((c: any) => ({ nonce: String(c.nonce), colour: String(c.type), value: BigInt(c.value) }));
+  };
+
+  it('a take with change: the received coin and the change are the wallet’s; withheld, they are refused', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: 200_000_000n }]);
+    const draft = await buildTake(wallet, BID.offerBech32);
+    const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+    const outs = walletOutputsOf(draft.tx);
+    expect(outs.map((o) => [o.colour, o.value])).toEqual(
+      expect.arrayContaining([
+        [WUSDC, 1_000_000n],
+        [WSTKA, 95_833_333n],
+      ]),
+    );
+    const all = new Set(outs.map((o) => commitment(o, wallet.coinPk)));
+    expect([...all].sort()).toEqual(summary.shielded.outputs.map((x) => x.commitment.toLowerCase()).sort());
+    // FW2's draft discloses exactly these (packages/wallet/src/outputs.ts, the same recipe).
+    expect(new Set(draft.walletOutputs.map((o) => commitment(o, wallet.coinPk)))).toEqual(all);
+    expect(detailOf(() => validateTake(summary, terms, { walletOutputs: all }))).toBe('accepted');
+    const noChange = new Set(outs.filter((o) => o.colour === WUSDC).map((o) => commitment(o, wallet.coinPk)));
+    expect(detailOf(() => validateTake(summary, terms, { walletOutputs: noChange }))).toBe('undisclosed-output');
+    expect(detailOf(() => validateTake(summary, terms, { walletOutputs: new Set() }))).toBe('undisclosed-output');
+    // Recomputed with another key, the same coins are not the wallet's.
+    const otherKey = new Set(outs.map((o) => commitment(o, '77'.repeat(32))));
+    expect(detailOf(() => validateTake(summary, terms, { walletOutputs: otherKey }))).toBe('undisclosed-output');
+    // The sponsor's recomputation (main.ts wires it) is ledger-v9's.
+    for (const o of outs) expect(walletCoinCommitment(o, wallet.coinPk)).toBe(commitment(o, wallet.coinPk));
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('a withdrawal with change: accepted with the change disclosed, refused without; the bound form erases to the same bytes', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: 3_000_000n }]);
+    const draft = await buildWithdraw(
+      wallet,
+      { colour: WSTKA, amount: B31.amount, dest: B31.dest, evmNonce: B31.evmNonce },
+      { reader: fixtureReader(AT_679357) },
+    );
+    const { summary } = inspectTransaction(hexToBytes(draft.tx), 'unproven');
+    const rebuilt = await rebuildStartWithdraw(
+      runtime,
+      fixtureReader(AT_679357),
+      VAULT,
+      argsFor(wallet, draft.coinNonce),
+    );
+    const outs = walletOutputsOf(draft.tx);
+    expect(outs.map((o) => [o.colour, o.value])).toEqual([[WSTKA, 2_000_000n]]);
+    const change = new Set(outs.map((o) => commitment(o, wallet.coinPk)));
+    expect(new Set(draft.walletOutputs.map((o) => commitment(o, wallet.coinPk)))).toEqual(change);
+    expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA, { walletOutputs: change }))).toBe('accepted');
+    expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA, { walletOutputs: new Set() }))).toBe(
+      'undisclosed-output',
+    );
+    // /withdraw compares the whole proof-erased transaction: binding does not change it.
+    const tx = l.Transaction.deserialize('signature', 'pre-proof', 'pre-binding', hexToBytes(draft.tx)) as any;
+    expect(summary.erased).toMatch(/^[0-9a-f]+$/);
+    expect(summarise(tx.bind()).erased).toBe(summary.erased);
     await draft.release();
     await wallet.close();
   });

@@ -70,6 +70,14 @@ export interface DepositRecord extends TransferProgress {
   rearms?: number;
   /** Unix seconds: when the deposit address was first seen holding any of the token (audit C6). */
   seenAt?: number;
+  /** The most of the token the deposit address was seen holding (base units): less later means a
+   *  request swept it into the vault for this recipient (audit R6). */
+  maxSeen?: string;
+  /** Unix seconds of each re-arm: paced by a cooldown and a per-day count, never a lifetime cap (audit R3). */
+  rearmTimes?: number[];
+  /** Requests of another party that swept this recipient's deposit address with another token or
+   *  amount, completed by the sponsor so the coin reaches the temporary wallet (audit R6). */
+  foreign?: { requestId: string; erc20: string; amount: string; at: number; completeTx?: string }[];
 }
 
 export interface WithdrawRecord extends TransferProgress {
@@ -95,6 +103,18 @@ export interface WithdrawRecord extends TransferProgress {
   attested?: AttestedKind;
   startedAtMs?: number;
   error?: { code: string; message: string };
+  /** ms: when the transaction was handed to the node (the start's request id is known from then). */
+  submittedAtMs?: number;
+  /** ms: since when the submission's outcome is unknown (stage `submission-uncertain`, audit R5). */
+  uncertainSinceMs?: number;
+  /** A failed attempt recorded before P4.2-fix2 that named a request id: whether it landed is not
+   *  established, so it keeps its nonce until the sponsor reconciles it (audit R5). */
+  unresolved?: boolean;
+  /** How an attempt that failed ended, when it is settled: `not-submitted` (never reached the node),
+   *  `failed-on-chain`, `not-included` (established by reconciliation). */
+  resolution?: 'not-submitted' | 'failed-on-chain' | 'not-included';
+  /** The fee fields of the transfer the MPC actually signed (audit R2: replacements outbid both). */
+  signedFees?: { maxFeePerGas: string; maxPriorityFeePerGas: string };
 }
 
 /** What the latest `withdraw-params` handed out: `/prove withdraw` rebuilds with its gas, and tells a
@@ -120,6 +140,20 @@ export interface ProvenWithdraw {
   evmNonce: string;
   gas?: GasRecord;
   at: number;
+  /** The whole proof-erased transaction `/prove` validated (hex): `/withdraw` must erase to exactly
+   *  it (audit R1). */
+  erased?: string;
+  /** The proof-budget entry this proof took (given back on a transient `/withdraw` refusal, audit R3). */
+  proofId?: number;
+}
+
+/** One proof the swap asked for, in the rolling 24-hour budget (audit R3). */
+export interface ProofEntry {
+  id: number;
+  at: number;
+  purpose: 'take' | 'withdraw';
+  /** Sent to the proof server and it failed: counts in the daily total, not in the purpose's budget. */
+  failed?: boolean;
 }
 
 export interface SwapRecord {
@@ -139,8 +173,10 @@ export interface SwapRecord {
   state: SwapState;
   deposit: DepositRecord | null;
   takeTx: string | null;
-  /** Proofs used: take and withdraw (the withdraw budget renews per attempt) and all of them. */
-  proofs: { take: number; withdraw: number; total?: number };
+  /** Proofs used: take and withdraw (the withdraw budget renews per attempt) and all of them; `log`
+   *  holds the last 24 hours' proofs, which every budget counts (audit R3: no lifetime cap), and
+   *  `withdrawSince` when the current withdrawal attempt began (unix seconds). */
+  proofs: { take: number; withdraw: number; total?: number; log?: ProofEntry[]; withdrawSince?: number };
   withdrawOffer?: WithdrawOffer;
   provenWithdraw: ProvenWithdraw | null;
   withdrawals: WithdrawRecord[];
@@ -149,6 +185,8 @@ export interface SwapRecord {
   message?: string;
   /** On `failed`: whether the same open-swap revives it (audit C5). */
   recoverable?: boolean;
+  /** On a recoverable `failed` swap whose re-arm is paced: unix seconds from which a re-open revives it. */
+  retryAt?: number;
   history: { state: SwapState; at: number }[];
   createdAt: number;
   updatedAt: number;
@@ -202,10 +240,21 @@ export function transition(
     delete rec.message;
     delete rec.recoverable;
   }
+  delete rec.retryAt;
 }
 
-/** The failures a re-open can revive (the funds wait at the deposit address). */
-export const RECOVERABLE_FAILURES = ['funds-not-received', 'deposit-attempts', 'deposit-returned-false'] as const;
+/** The failures a re-open can revive (the funds wait at the deposit address, or never came). Every
+ *  one stays recoverable while any balance or unsettled request remains (audit R3): no lifetime cap. */
+export const RECOVERABLE_FAILURES: readonly string[] = [
+  'funds-not-received',
+  'deposit-attempts',
+  'deposit-returned-false',
+];
+
+/** Whether a withdrawal attempt's outcome is still unknown (audit R5): its submission was uncertain,
+ *  or it failed before P4.2-fix2 after naming a request id. It keeps its nonce until reconciled. */
+export const isUnresolved = (w: WithdrawRecord): boolean =>
+  w.requestId !== undefined && (w.stage === 'submission-uncertain' || w.unresolved === true);
 
 export const isTerminal = (s: SwapState) => s === 'done' || s === 'failed';
 
@@ -297,6 +346,7 @@ export function swapView(rec: SwapRecord): SwapView {
     ...(rec.reason ? { reason: rec.reason } : {}),
     ...(rec.message ? { message: rec.message } : {}),
     ...(rec.state === 'failed' ? { recoverable: rec.recoverable === true } : {}),
+    ...(rec.state === 'failed' && rec.retryAt !== undefined ? { retryAt: rec.retryAt } : {}),
     createdAt: rec.createdAt,
     updatedAt: rec.updatedAt,
   };

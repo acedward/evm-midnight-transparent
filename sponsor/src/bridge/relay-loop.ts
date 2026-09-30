@@ -30,6 +30,8 @@ export interface SignedTransfer {
   from: string;
   nonce: number;
   maxFeePerGas: bigint;
+  /** The tip it signs (a replacement must outbid both fee fields; audit R2). */
+  maxPriorityFeePerGas?: bigint;
   /** The signed, serialised EIP-1559 transaction (0x…). */
   serialized: string;
 }
@@ -112,6 +114,7 @@ export async function relayLoop(io: RelayLoopIo, o: RelayLoopOptions): Promise<R
     nonce: signed.nonce,
     afterMs: signatureAfterMs,
     maxFeePerGas: signed.maxFeePerGas,
+    ...(signed.maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas: signed.maxPriorityFeePerGas } : {}),
   });
 
   // ---- 2 and 3. on chain, then the attestation, every wait bounded -----------------------

@@ -55,6 +55,10 @@ export interface TxSummary {
   };
   /** ./summary.ts `structureDigestOf`: what `/withdraw` must match. */
   structureDigest: string;
+  /** The whole transaction with its proofs and binding erased (`eraseProofs().serialize()`, hex):
+   *  every input, output, recipient ciphertext, intent, call and transcript. `/withdraw` must erase
+   *  to exactly the one `/prove withdraw` validated (audit R1, F-B21). */
+  erased?: string;
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');

@@ -27,6 +27,7 @@ import {
   FakeProver,
   FakeVault,
   encodeFakeTx,
+  fakeCoinCommitment,
   fakeInspect,
   fakeWithdrawCalls,
   takeTx,
@@ -97,6 +98,8 @@ export function harness(
     offers?: FakeOffers;
     service?: Partial<SwapServiceConfig>;
     bridge?: boolean;
+    /** The caller's address the app sees (mutable: per-client tests change it). */
+    client?: { address: string };
   } = {},
 ): Harness {
   const config = opts.config ?? testConfig();
@@ -123,6 +126,7 @@ export function harness(
     inspect: (bytes) => fakeInspect(bytes),
     makerImbalances: offers.makerImbalances,
     makerTxId: offers.makerTxId,
+    coinCommitment: fakeCoinCommitment,
     sponsor: () => sponsor.status(),
     log,
     now: () => now.ms,
@@ -147,7 +151,7 @@ export function harness(
     swaps,
     sponsor,
     health,
-    clientAddress: () => '198.51.100.7',
+    clientAddress: () => opts.client?.address ?? '198.51.100.7',
     now: () => Math.floor(now.ms / 1000),
   });
   return { app, config, log, nonces, vault, prover, offers, store, swaps, sponsor, now };
@@ -196,8 +200,12 @@ export async function openBody(
     action?: string;
     signedSwap?: string;
     signedPayload?: Record<string, unknown>;
+    /** Leave the owner's Sepolia balances as they are (by default the owner holds the pay amount and
+     *  the sweep ETH, which an open checks: audit R4). */
+    ownerUnfunded?: boolean;
   } = {},
 ) {
+  if (!over.ownerUnfunded) fundOwner(h, s);
   const nonce = over.nonce ?? ((await (await h.app.request(SWAP_PATHS.nonce)).json()) as { nonce: string }).nonce;
   const message = buildSponsorActionMessage({
     action: over.action ?? 'open-swap',
@@ -210,6 +218,18 @@ export async function openBody(
   });
   const signature = await (over.signer ?? s.user).signTypedData(sponsorDomain(), SPONSOR_ACTION_TYPES, message);
   return { swap: s.swapId, payload: s.payload, auth: { message, signature } };
+}
+
+/** The owner holds the pay amount of the pay token and 1 ETH on Sepolia (what an open checks). */
+export function fundOwner(h: Harness, s: SwapInput) {
+  const erc20 = h.config.tokens.byColour(s.payload.pay.colour)?.sepoliaAddress;
+  const owner = s.payload.evmAddress;
+  if (erc20) {
+    const key = `${erc20.toLowerCase()}/${owner.toLowerCase()}`;
+    const have = h.vault.evm.erc20.get(key) ?? 0n;
+    if (have < BigInt(s.payload.pay.amount)) h.vault.evm.setErc20(erc20, owner, BigInt(s.payload.pay.amount));
+  }
+  if ((h.vault.evm.eth.get(owner.toLowerCase()) ?? 0n) < 10n ** 18n) h.vault.evm.setEth(owner, 10n ** 18n);
 }
 
 export const post = (h: Harness, path: string, body: unknown, token?: string) =>
@@ -259,6 +279,42 @@ export const bidTake = (over: Partial<TxSummary> = {}) =>
     over,
   );
 
+/** A coin paid to the temporary wallet, as `/prove` discloses it (audit R1). */
+export interface WalletCoin {
+  nonce: string;
+  colour: string;
+  value: string;
+}
+
+export const coinOutput = (coin: WalletCoin, coinPk: string) => ({
+  commitment: fakeCoinCommitment({ ...coin, value: BigInt(coin.value) }, coinPk),
+  contract: null,
+});
+
+/** The G-TAKE bid's take for swap `s` as the wallet builds it: the wallet's coin in, the received
+ *  coin out to the temporary wallet, and the disclosure of that coin (audit R1). */
+export function bidTakeFor(s: SwapInput, over: Partial<TxSummary> = {}) {
+  const received: WalletCoin = {
+    nonce: hex32(`received-${s.swapId.slice(0, 8)}`),
+    colour: BID.receive.token.midnightColour,
+    value: BID.receive.amount.toString(),
+  };
+  const tx = bidTake({
+    shielded: {
+      inputs: [{ nullifier: hex32(`pay-coin-${s.swapId.slice(0, 8)}`), contract: null }],
+      outputs: [coinOutput(received, s.payload.tempCoinPk)],
+    },
+    ...over,
+  });
+  return { tx, walletOutputs: [received] };
+}
+
+/** The `/prove` body of `bidTakeFor(s)`. */
+export const takeBody = (s: SwapInput, over: Partial<TxSummary> = {}) => {
+  const t = bidTakeFor(s, over);
+  return { purpose: 'take', tx: encodeFakeTx(t.tx), walletOutputs: t.walletOutputs };
+};
+
 /** A startWithdraw for `kind` as the browser would build it on the fake vault's current state. */
 export function withdrawFor(
   h: Harness,
@@ -274,6 +330,7 @@ export function withdrawFor(
     refund?: string;
     gasLimit?: bigint;
     maxFeePerGas?: bigint;
+    maxPriorityFeePerGas?: bigint;
   } = {},
 ) {
   const leg = kind === 'swap' ? BID.receive : BID.pay;
@@ -291,6 +348,7 @@ export function withdrawFor(
         ...h.config.bridgeGas,
         ...(over.gasLimit ? { gasLimit: over.gasLimit } : {}),
         ...(over.maxFeePerGas ? { maxFeePerGas: over.maxFeePerGas } : {}),
+        ...(over.maxPriorityFeePerGas ? { maxPriorityFeePerGas: over.maxPriorityFeePerGas } : {}),
       },
       erc20: over.erc20 ?? leg.token.sepoliaAddress,
       amount: over.amount ?? leg.amount,

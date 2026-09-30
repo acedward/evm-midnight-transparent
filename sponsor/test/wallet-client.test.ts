@@ -7,7 +7,7 @@ import { SponsorApiError, sponsorClient } from '@evm-midnight-transparent/wallet
 import { describe, expect, it } from 'vitest';
 
 import { VAULT_EVM } from './fakes.js';
-import { BID, bidTake, harness, mintedSwap, testConfig, tok, txHex, withdrawFor } from './harness.js';
+import { BID, bidTakeFor, harness, mintedSwap, testConfig, tok, txHex, withdrawFor } from './harness.js';
 
 describe('the wallet’s sponsor client against the sponsor', () => {
   it('drives a whole take and withdrawal', async () => {
@@ -16,6 +16,7 @@ describe('the wallet’s sponsor client against the sponsor', () => {
     h.vault.evm.setEth(VAULT_EVM, 10n ** 17n);
     h.vault.evm.setErc20(tok('USDC').sepoliaAddress, VAULT_EVM, 10n ** 12n);
     const { s, token } = await mintedSwap(h);
+    const take = bidTakeFor(s);
     const client = sponsorClient({
       baseUrl: 'http://sponsor.test',
       swapId: `0x${s.swapId}`,
@@ -23,8 +24,9 @@ describe('the wallet’s sponsor client against the sponsor', () => {
       fetchImpl: ((url: string, init: RequestInit) => h.app.request(url, init)) as typeof fetch,
     });
 
-    // take
-    const proven = await client.prove('take', txHex(bidTake()));
+    // take, disclosing the coin it pays to the temporary wallet (P4.2-fix2 R1, FW2's `disclosure`)
+    const walletOutputs = take.walletOutputs.map((o) => ({ ...o, value: BigInt(o.value) }));
+    const proven = await client.prove('take', txHex(take.tx), undefined, { walletOutputs });
     expect(Buffer.from(proven, 'hex').toString('utf8')).toMatch(/^PROVEN:/);
     await client.reportTake({ outcome: 'taken', takeTx: `0x${'ab'.repeat(32)}` });
     expect(h.store.get(s.swapId)!).toMatchObject({ state: 'taken', takeTx: 'ab'.repeat(32) });

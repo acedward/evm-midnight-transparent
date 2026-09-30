@@ -80,28 +80,35 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `SWAP_MIN_OFFER_TTL_SECONDS` | `1800` | a new swap's offer must expire at least this far ahead |
 | `SWAP_MAX_ACTIVE_PER_OWNER` | `3` | swaps in progress per EVM address |
 | `SWAP_MAX_PER_OWNER_PER_DAY` | `10` | new swaps per EVM address in any 24 hours (`429 too-many-swaps`) |
-| `SWAP_MAX_UNFUNDED` | `100` | swaps waiting for funds that received nothing, all users (`503 sponsor-busy` past it) |
-| `SPONSOR_DAILY_DUST_BUDGET` | `500` | DUST the sponsor may pay in any 24 hours, counting the legs still in flight (`503 sponsor-budget` for new swaps and re-arms past it); `0`: none |
+| `SWAP_MAX_UNFUNDED` | `100` | swaps waiting for funds that received nothing, all users (`503 sponsor-busy` past it); a revival of such a swap counts like a new one |
+| `SWAP_MAX_UNFUNDED_PER_CLIENT` | `10` | ... per client: an IPv4 address, or an IPv6 /64 (`429 too-many-swaps`, detail `client`) |
+| `SWAP_OWNER_BALANCE_CACHE_SECONDS` | `30` | an open (and the revival of a swap that received nothing) needs the EVM address to hold the pay amount and the sweep ETH on Sepolia (`422 insufficient-funds`); each read is reused this long |
+| `SPONSOR_DAILY_DUST_BUDGET` | `500` | DUST the sponsor may pay in any 24 hours, counting the legs still in flight, committed when a swap's funds are all at its deposit address (a funded swap over it waits in `budget-wait`; new swaps get `503 sponsor-budget`); `0`: none |
 | `SWAP_DUST_PER_START_SPECKS`, `SWAP_DUST_PER_SETTLE_SPECKS` | 2.2 and 0.4 DUST | the budget's estimate of one paid start and one paid settle |
-| `SWAP_PROOFS_PER_SWAP` | `12` | proofs per swap and purpose (take; withdraw, renewed per attempt after a refund or failed start) |
-| `SWAP_PROOFS_TOTAL_PER_SWAP` | `48` | proofs in a swap's whole life |
+| `SWAP_PROOFS_PER_SWAP` | `12` | proofs per swap and purpose in any 24 hours (take; withdraw, also renewed per attempt after a refund, a failed start or a not-included one) |
+| `SWAP_PROOFS_PER_SWAP_PER_DAY` | `48` | every proof of one swap in any 24 hours, failed prover work included (`429 proof-budget` with `Retry-After`; no lifetime cap). The old `SWAP_PROOFS_TOTAL_PER_SWAP` is read as it |
 | `SWAP_FUNDS_WAIT_SECONDS` | `10800` | an `awaiting_funds` swap that received nothing fails after this (recoverable: a re-open resumes it); a funded one never fails for its age |
 | `SWAP_FUNDS_WAIT_PARTIAL_SECONDS` | `86400` | ... one that received part of the token |
 | `SWAP_RETAIN_UNFUNDED_DAYS` | `2` | never-funded failed swaps are dropped after this, once their address reads empty |
 | `DEPOSIT_POLL_SECONDS` | `15` | how often a deposit address is read at first (then every minute, and every 5 minutes after an hour, while nothing arrives) |
+| `DEPOSIT_POLL_MAX_READS` | `120` | deposit-address reads per poll pass, all swaps together (the longest due first) |
+| `DEPOSIT_POLL_NUDGE_MIN_SECONDS` | `60` | a page reading a swap brings its next address read forward, never closer than this to the last |
 | `DEPOSIT_MAX_ATTEMPTS` | `3` | `startDeposit` attempts per swap (a never-executed sweep is retried) |
-| `DEPOSIT_MAX_REARMS` | `3` | how often a re-open may re-arm a failed deposit (`deposit-attempts`, `deposit-returned-false`) with a new `startDeposit` |
+| `DEPOSIT_REARMS_PER_DAY` | `3` | how often, in any 24 hours, a re-open may re-arm a failed deposit (`deposit-attempts`, `deposit-returned-false`) with a new `startDeposit`; the failure stays recoverable, a paced re-open answers `retryAt`. The old `DEPOSIT_MAX_REARMS` is read as it |
+| `DEPOSIT_REARM_COOLDOWN_SECONDS` | `1800` | ... and not sooner than this after the previous re-arm |
 | `SWEEP_GAS_LIMITS` | 65,000 for each token | per-token overrides, `USDC:70000,stkA:60000` (`src/swaps/sweep-gas.ts`) |
 | `SWEEP_MAX_WEI` | `5·10^15` | refuse new swaps while the sweep would cost more ETH (a gas spike); also caps the fee a sweep signs |
 | `BRIDGE_EVM_GAS_LIMIT`, `BRIDGE_EVM_MAX_FEE_PER_GAS`, `BRIDGE_EVM_MAX_PRIORITY_FEE_PER_GAS` | 100,000, 10 gwei, 1 gwei | the withdrawal's gas (paid by the vault's EVM account); the max fee here is a floor: each withdrawal signs max(it, 2 × the live base fee + tip), sized at withdraw-params |
 | `BRIDGE_EVM_MAX_FEE_CAP_WEI` | `10^11` (100 gwei) | above it, withdrawals are refused until gas is cheaper |
 | `WITHDRAW_STUCK_AFTER_SECONDS`, `WITHDRAW_UNSIGNED_STALE_SECONDS` | `1800`, `7200` | a transfer signed but unmined this long (with the base fee above its cap), or a start unsigned this long, is stuck: the next withdrawal takes its nonce |
+| `BRIDGE_EVM_REPLACEMENT_BUMP_PERCENT` | `10` | that replacement outbids every transfer holding the nonce by at least this percent on BOTH fee fields (the pools' rule; 10 to 100) |
+| `WITHDRAW_UNCERTAIN_SECONDS` | `900` | a withdrawal whose submission's outcome is unknown (`submission-uncertain`) keeps its nonce; its request neither in the vault nor attested this long after it was sent means it did not land (`not-included`) |
 | `VAULT_GAS_LOW_WEI` | `2·10^15` | health degrades when the vault's EVM account holds less |
 | `STALE_CLOSER_ENABLED` | `true` | |
 | `STALE_CLOSER_INTERVAL_SECONDS`, `STALE_AFTER_SECONDS` | `300`, `900` | scan period; how long a request must be idle |
 | `STALE_CLOSER_MAX_PER_DAY` | `48` | re-drives paid for in any 24 hours |
 | `STALE_CLOSER_MIN_DUST_SPECKS` | 2 × the low level | the closer spends nothing below this |
-| `RATE_LIMIT_*` | | per minute: `READS` 240, `HEALTH` 60, `NONCES` 30, `OPENS` 10 (per IP) and `OPENS_PER_OWNER` 5, `PROVES` 20 (per IP) and `PROVES_PER_SWAP` 6, `WRITES` 20 |
+| `RATE_LIMIT_*` | | per minute: `READS` 240, `HEALTH` 60, `NONCES` 30, `OPENS` 10 (per client) and `OPENS_PER_OWNER` 5, `PROVES` 20 (per client) and `PROVES_PER_SWAP` 6, `WRITES` 20; a client is an IPv4 address or an IPv6 /64 |
 | `AUTH_MAX_TTL_SECONDS`, `AUTH_NONCE_TTL_SECONDS` | `600`, `600` | the open-swap signature's expiry cap; how long a nonce lives |
 | `SPONSOR_MAX_BODY_BYTES` | `2097152` | request body limit |
 | `MIDNIGHT_*`, `ZSWAP_*`, `BRIDGE_*` | the network profile | endpoint and contract overrides |
@@ -113,6 +120,9 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 the open-swap signature and the bearer token, every take and withdraw refusal rule (on summaries,
 through the routes, and over real ledger-v9 transactions), the state machine, the server-driven
 deposit, the withdrawal lane (no two starts share a nonce), refunds, Bridge back, restarts, the
-stale closer and the sweep sizing, and the security fix pass (`test/fix-pass.test.ts`, one block per
-audit row; `test/relay-loop.test.ts`, the bounded relayer on a virtual clock). Nothing in them
-touches a network.
+stale closer and the sweep sizing, and the security fix passes (`test/fix-pass.test.ts` and
+`test/fix2-pass.test.ts`, one block per audit row; `test/relay-loop.test.ts`, the bounded relayer on a
+virtual clock). Nothing in them touches a network. One more needs a node:
+`test/replacement-pool.test.ts` checks a stuck transfer's replacement against a real transaction
+pool, a geth dev node in Docker (`scripts/replacement-pool-check.sh`, after
+`scripts/docker-check.sh up` and `sync`); without `EVM_DEV_RPC_URL` it is skipped.

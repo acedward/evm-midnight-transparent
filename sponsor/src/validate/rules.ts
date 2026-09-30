@@ -12,7 +12,19 @@
 //     against the offer id (sha256 of its bytes), so this transaction balances this offer;
 //   - its coins (audit C4): the wallet's coin in, the maker's coin out, at most one change coin
 //     besides ((1,1), (1,2) or (2,1)); none of a contract. A separately balanced transfer needs one
-//     more coin in and out, so it never fits (net imbalances cannot see it).
+//     more coin in and out, so it never fits (net imbalances cannot see it);
+//   - its recipients (audit R1, F-B21): EVERY output is a coin of the temporary wallet. `/prove`
+//     discloses each (nonce, colour, value) as `walletOutputs`, the sponsor recomputes each one's
+//     commitment with the temporary coin public key (ledger-v9 `coinCommitment`), and an output
+//     that is not one of them is refused (`undisclosed-output`): no coin of a take can go to anyone
+//     else.
+//   - ACCEPTED (audit R1, the orchestrator's disposition): the proof of a take cannot say WHICH maker
+//     transaction it will be merged with, only that it is the exact complement of this swap's terms.
+//     Open binds the swap to the maker transaction the kernel served (sha256 of its bytes = the
+//     offer id), but another offer with the same two legs could be merged with the same proven
+//     complement. The sponsor only PROVES a take; the batcher pays its fee, and the coins are the
+//     temporary wallet's own, so such a merge costs the sponsor nothing beyond the proof time
+//     already bounded by the proof budget, and moves no one else's funds.
 //
 // WITHDRAW (/prove purpose "withdraw", and /withdraw): the temporary wallet's `startWithdraw`.
 //   - one intent, holding exactly the calls the sponsor itself rebuilt from the swap's values (the
@@ -26,9 +38,13 @@
 //     it), no fallible shielded offer, at most MAX_COINS inputs and outputs;
 //   - its coins (audit C4): the coin handed to the vault is exactly the rebuild's output (same
 //     commitment, owned by the vault), the wallet's coin in, at most one change coin out or a
-//     second coin in; no contract's coin spent or paid otherwise. `/withdraw` must then carry the
-//     proven transaction's exact structure (calls, segments, every coin: ./summary.ts
-//     `structureDigestOf`), apart from proofs and the binding.
+//     second coin in; no contract's coin spent or paid otherwise;
+//   - its change (audit R1, F-B21): any output besides the vault's coin is a disclosed coin of the
+//     temporary wallet (`walletOutputs`, recomputed with its coin public key), so an oversized coin
+//     cannot pay the remainder to someone else as "change". `/withdraw` must then carry EXACTLY the
+//     transaction `/prove` validated, apart from proofs and the binding: the sponsor keeps the
+//     whole proof-erased serialisation and compares it byte for byte (every input, output,
+//     recipient ciphertext, call and transcript), not a digest.
 
 import type { InvalidTxDetail } from '@evm-midnight-transparent/core';
 
@@ -70,12 +86,30 @@ export interface LegTerms {
   amount: bigint;
 }
 
+/** The commitments (lowercase hex) of the coins a transaction may pay to the temporary wallet: the
+ *  sponsor recomputes them from the disclosed `walletOutputs` (audit R1). */
+export type WalletCommitments = ReadonlySet<string>;
+
+/** Every output in `outputs` is one of the temporary wallet's disclosed coins. */
+function walletOnly(
+  outputs: readonly { commitment: string; contract: string | null }[],
+  wallet: WalletCommitments | undefined,
+  what: string,
+): void {
+  if (wallet === undefined) return;
+  for (const o of outputs) {
+    if (o.contract !== null || !wallet.has(o.commitment.toLowerCase())) {
+      fail('undisclosed-output', `${what} pays a coin that is not one of the temporary wallet’s disclosed outputs`);
+    }
+  }
+}
+
 /**
  * The take's coins (audit C4): the wallet's pay coin(s) in, the maker's coin out, and at most one
  * change coin besides: (1 in, 1 out), (1 in, 2 out) or (2 in, 1 out). A separately balanced transfer
  * needs one more coin in AND one more out, so it never fits. No contract's coin.
  */
-function takeCoins(s: TxSummary): void {
+function takeCoins(s: TxSummary, wallet: WalletCommitments | undefined): void {
   const { inputs, outputs } = s.shielded;
   if (inputs.some((i) => i.contract !== null) || outputs.some((o) => o.contract !== null)) {
     fail('contract-coin', 'a take moves no contract’s coin');
@@ -83,6 +117,7 @@ function takeCoins(s: TxSummary): void {
   if (inputs.length < 1 || outputs.length < 1 || inputs.length + outputs.length > 3) {
     fail('extra-coins', 'a take spends the wallet’s coin and receives the maker’s, with at most one change coin');
   }
+  walletOnly(outputs, wallet, 'the take');
 }
 
 /**
@@ -93,6 +128,7 @@ function takeCoins(s: TxSummary): void {
 function withdrawCoins(
   s: TxSummary,
   contractOutputs: readonly { commitment: string; contract: string | null }[],
+  wallet: WalletCommitments | undefined,
 ): void {
   const { inputs, outputs } = s.shielded;
   const key = (o: { commitment: string; contract: string | null }) => `${o.commitment}/${o.contract ?? ''}`;
@@ -108,10 +144,21 @@ function withdrawCoins(
   if (inputs.length < 1 || inputs.length + extra.length > 2) {
     fail('extra-coins', 'a withdrawal spends the wallet’s coin, with at most one change coin (or a second coin in)');
   }
+  walletOnly(extra, wallet, 'the withdrawal');
+}
+
+/** What the service always passes: the disclosed wallet outputs' commitments (audit R1). The shape
+ *  tests may leave it out (no recipient check). */
+export interface ValidateOptions {
+  walletOutputs?: WalletCommitments;
 }
 
 /** A take for a swap that pays `pay` and receives `receive`. */
-export function validateTake(s: TxSummary, terms: { pay: LegTerms; receive: LegTerms }): void {
+export function validateTake(
+  s: TxSummary,
+  terms: { pay: LegTerms; receive: LegTerms },
+  opts: ValidateOptions = {},
+): void {
   commonShape(s, false);
   const segments = Object.keys(s.imbalances);
   if (segments.some((k) => k !== '0')) fail('contract-calls', 'a take has only segment 0');
@@ -131,7 +178,7 @@ export function validateTake(s: TxSummary, terms: { pay: LegTerms; receive: LegT
   for (const [colour, want] of Object.entries(expected)) {
     if (imb[colour] !== want) fail('wrong-amount', 'the transaction balances this offer with other amounts');
   }
-  takeCoins(s);
+  takeCoins(s, opts.walletOutputs);
 }
 
 /** The calls a withdrawal must carry: the sponsor's own rebuild of `startWithdraw` (and its callee),
@@ -169,7 +216,12 @@ export function gasClose(got: CallSummary['gas'], want: CallSummary['gas']): boo
   return true;
 }
 
-export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: string): void {
+export function validateWithdraw(
+  s: TxSummary,
+  expected: ExpectedCalls,
+  colour: string,
+  opts: ValidateOptions = {},
+): void {
   commonShape(s, true);
   if (s.intents !== 1) fail('extra-calls', 'a withdrawal is exactly one intent');
   const addresses = new Set(expected.calls.map((c) => c.address));
@@ -195,7 +247,7 @@ export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: 
     if (!gasClose(got.gas, want.gas)) fail('wrong-call', 'the call declares another cost than the sponsor’s rebuild');
   }
   if (s.callsDigest !== expected.callsDigest) fail('wrong-call', 'the calls differ from the expected startWithdraw');
-  if (expected.outputs) withdrawCoins(s, expected.outputs);
+  if (expected.outputs) withdrawCoins(s, expected.outputs, opts.walletOutputs);
   for (const segment of Object.values(s.imbalances)) {
     for (const [c, v] of Object.entries(segment)) {
       if (v === 0n) continue;

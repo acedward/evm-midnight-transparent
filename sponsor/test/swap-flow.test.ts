@@ -10,6 +10,7 @@ import {
   BID,
   bidSwap,
   bidTake,
+  bidTakeFor,
   fund,
   get,
   harness,
@@ -26,6 +27,7 @@ import {
   type Harness,
   type SwapInput,
 } from './harness.js';
+import type { TxSummary } from '../src/validate/summary.js';
 
 const expectError = async (res: Response, status: number, code: string, detail?: string) => {
   const body = (await res.json()) as { error?: { code: string; detail?: string } };
@@ -39,8 +41,15 @@ const expectError = async (res: Response, status: number, code: string, detail?:
 const view = async (h: Harness, s: SwapInput, token: string): Promise<SwapView> =>
   ((await (await get(h, SWAP_PATHS.swap(s.swapId), token)).json()) as { swap: SwapView }).swap;
 
-const proveTake = (h: Harness, s: SwapInput, token: string, tx = bidTake()) =>
-  post(h, SWAP_PATHS.prove(s.swapId), { purpose: 'take', tx: txHex(tx) }, token);
+const proveTake = (h: Harness, s: SwapInput, token: string, tx?: TxSummary) => {
+  const t = bidTakeFor(s);
+  return post(
+    h,
+    SWAP_PATHS.prove(s.swapId),
+    { purpose: 'take', tx: txHex(tx ?? t.tx), walletOutputs: t.walletOutputs },
+    token,
+  );
+};
 
 async function takenSwap(h: Harness, s: SwapInput = bidSwap(h)) {
   const m = await mintedSwap(h, s);
@@ -458,17 +467,16 @@ describe('/prove withdraw and /withdraw: only this swap’s startWithdraw', () =
     expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
     const other = withdrawFor(h, s, 'swap', { coinNonce: hex32('another-coin') });
     await expectError(await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(other.tx) }, token), 409, 'not-proven');
+    // DUST added: not the transaction /prove validated (P4.2-fix2 R1: compared in full).
     await expectError(
       await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex({ ...w.tx, dust: true }) }, token),
-      422,
-      'invalid-tx',
-      'dust',
+      409,
+      'not-proven',
     );
     await expectError(
       await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex({ ...w.tx, unshielded: true }) }, token),
-      422,
-      'invalid-tx',
-      'unshielded',
+      409,
+      'not-proven',
     );
     expect(h.vault.submitted).toHaveLength(0);
     // still usable
