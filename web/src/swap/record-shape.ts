@@ -125,6 +125,15 @@ const SwapRecordV2 = z
         attempts: z.number().int().min(0).max(100).optional(),
       })
       .strict(),
+    /** A PARTIAL deposit (P4.2-fix3 S2, ./partial.ts): the sponsor reported that a completed vault
+     *  request minted less than the pay amount to the temporary wallet. `minted` is what the
+     *  temporary wallet received, `remaining` what is still missing (at the deposit address);
+     *  `wait` = the user chose "Wait for the rest". Kept after a Bridge back of what arrived, so the
+     *  page can say what stayed at the deposit address. */
+    partial: z
+      .object({ minted: decimal, remaining: decimal, wait: z.literal(true).optional() })
+      .strict()
+      .optional(),
     /** 'swap' until the user presses Bridge back. */
     choice: z.enum(['swap', 'bridge-back']),
     bridgeOut: z

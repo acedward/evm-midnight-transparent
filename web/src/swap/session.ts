@@ -22,7 +22,14 @@
 //   resume  "start swap" signed ONCE: the re-derived coin key must equal the record's; then the swap
 //           is re-opened with the sponsor for a new token, and the loop continues from its state. A
 //           failed swap the sponsor marked `recoverable` is resumed the same way (P4.2-fix C5), and so
-//           is one whose record does not say (written before), for the sponsor to decide (P4.2-fix2 R3).
+//           is one whose record does not say (written before), for the sponsor to decide (P4.2-fix2 R3);
+//   partial the sponsor says `partial`: only part of the pay amount reached the temporary wallet
+//           (another party's request swept part of the deposit address, or a sweep landed between its
+//           polls: P4.2-fix3 S2, ./partial.ts). The page shows what arrived and what is missing and
+//           asks the user: "Wait for the rest" (the sponsor deposits the remainder from the deposit
+//           address by itself; the page may top up the sweep ETH, NEVER the token) or "Bridge back"
+//           what arrived (the Bridge back path, for that amount; what waits at the deposit address is
+//           then deposited and bridged back too). Nothing is sent before the user chooses.
 //
 // The swap's PUBLIC id is keccak256(tag ‖ salt) (P4.2-fix C14): the sponsor, URLs and the snapshot
 // see it; the salt stays in this tab and the local record. Secrets stay in memory only: the sponsor's
@@ -43,10 +50,11 @@ import {
 } from '@evm-midnight-transparent/core';
 import { getAddress } from 'ethers';
 
-import { ethText } from './display.js';
+import { clockText, ethText } from './display.js';
 import { EvmError, type EvmPort, transferData } from './evm.js';
 import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, revivalNote, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
+import { bridgeBackAmount, partialOf } from './partial.js';
 import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner, WithdrawDraft } from './ports.js';
 import {
   SWAP_RECORD_VERSION,
@@ -79,6 +87,9 @@ const RECEIPT_POLL_MS = 3_000;
 export const FUNDING_CHECK_MS = 15_000;
 
 const WAITING_FOR_FUNDS = 'Waiting for your funds to reach the deposit address';
+const WAITING_FOR_REST = 'Waiting for the sponsor to bridge in the rest from the deposit address';
+const WAITING_FOR_REST_BACK =
+  'Waiting for the sponsor to bridge in the rest from the deposit address, to bridge it back to you';
 
 /** What the deposit address still lacks of the verified funding, in wei and token base units. */
 interface Shortfall {
@@ -97,6 +108,9 @@ export type SessionStatus =
   | { kind: 'working'; what: string }
   /** The offer was gone at take time: waiting for Bridge back. */
   | { kind: 'unavailable' }
+  /** Only part of the pay amount reached the temporary wallet (S2): waiting for the user's choice,
+   *  "Wait for the rest" or "Bridge back" what arrived. */
+  | { kind: 'partial' }
   | { kind: 'done' }
   /** `canResume`: a failed swap the sponsor marked recoverable (P4.2-fix C5): Resume revives it. */
   | { kind: 'error'; message: string; canRetry: boolean; canResume?: boolean }
@@ -522,8 +536,9 @@ export class SwapSession {
       const pendingEth = r.funding.eth?.status === 'sent';
       const pendingToken = r.funding.token?.status === 'sent';
       // The token goes at most once: once this page's transfer is confirmed, the deposit address held
-      // the amount, and only the vault's sweep moves it (P4.2-fix2 R7).
-      const tokenDelivered = r.funding.token?.status === 'confirmed';
+      // the amount, and only the vault's sweep moves it (P4.2-fix2 R7). On a partial deposit (S2) the
+      // sponsor saw the token: never again, whatever the record says of the transfer.
+      const tokenDelivered = r.funding.token?.status === 'confirmed' || r.partial !== undefined;
       // Only what the deposit address lacks NOW, against the sponsor's current requirement (a raised
       // sweep gas, a re-armed deposit whose sweep used the ETH: P4.2-fix2 R7).
       const needEth = !pendingEth && ethThere < ethWei ? ethWei - ethThere : 0n;
@@ -616,9 +631,17 @@ export class SwapSession {
     const f = this.funding;
     if (!f || this.fundingRefusal()) return null;
     const r = this.record;
-    const key = [f.address, f.erc20Address, f.amount, f.ethWei, r.funding.eth?.status, r.funding.token?.status].join(
-      '|',
-    );
+    // A new partial-deposit report or choice (S2) is a new requirement too: read at once.
+    const part = r.partial ? `${r.partial.minted}/${r.partial.remaining}/${r.partial.wait ? 1 : 0}/${r.choice}` : '';
+    const key = [
+      f.address,
+      f.erc20Address,
+      f.amount,
+      f.ethWei,
+      r.funding.eth?.status,
+      r.funding.token?.status,
+      part,
+    ].join('|');
     const now = this.deps.now();
     if (this.lack && this.lack.key === key && now - this.lack.at < FUNDING_CHECK_MS) return this.lack.value;
     let value: Shortfall | null;
@@ -646,22 +669,36 @@ export class SwapSession {
     const lack = await this.shortfall();
     if (this.closed) return;
     if (lack === null) {
-      // Unreadable (or funding paused): as before, the funding step until the transfers are sent.
-      if (this.fundingSent(r)) this.status({ kind: 'working', what: WAITING_FOR_FUNDS });
+      // Unreadable (or funding paused): as before, the funding step until the transfers are sent; on a
+      // partial deposit (S2) nothing is offered to send until the deposit address can be read.
+      if (r.partial) this.status({ kind: 'working', what: this.waitingForRest() });
+      else if (this.fundingSent(r)) this.status({ kind: 'working', what: WAITING_FOR_FUNDS });
       else if (this.snap.status.kind !== 'fund') this.status({ kind: 'fund', sending: null });
       return;
     }
     const ethMissing = lack.eth > 0n && r.funding.eth?.status !== 'sent';
+    // A partial deposit (S2): the sponsor saw the token, so it is never missing for this page.
     const tokenMissing =
-      lack.token > 0n && r.funding.token?.status !== 'sent' && r.funding.token?.status !== 'confirmed';
+      r.partial === undefined &&
+      lack.token > 0n &&
+      r.funding.token?.status !== 'sent' &&
+      r.funding.token?.status !== 'confirmed';
     if (ethMissing || tokenMissing) {
       if (this.snap.status.kind === 'fund') return;
       this.status({ kind: 'fund', sending: null });
       // A top-up after the funds were sent (not the first funding): say what is missing and why.
-      if (this.fundingSent(r) && !tokenMissing)
+      if (r.partial)
+        this.set({
+          notice: `The deposit address holds ${ethText(lack.eth)} less sweep gas than the bridge needs to bring in the rest (the other request's sweep used it). Press "Top up the sweep gas": only the missing ETH is sent; your ${r.offer.pay.symbol} is not sent again.`,
+        });
+      else if (this.fundingSent(r) && !tokenMissing)
         this.set({
           notice: `The deposit address holds ${ethText(lack.eth)} less sweep gas than the bridge needs now (the Sepolia gas price rose, or an earlier sweep used it). Press Send funds to top it up: only the missing ETH is sent.`,
         });
+      return;
+    }
+    if (r.partial) {
+      this.status({ kind: 'working', what: this.waitingForRest() });
       return;
     }
     this.status({
@@ -671,6 +708,34 @@ export class SwapSession {
           ? `Your ${r.offer.pay.symbol} transfer is confirmed, but the deposit address does not hold it now: waiting for the sponsor`
           : WAITING_FOR_FUNDS,
     });
+  }
+
+  /** What the page waits for on a partial deposit whose rest the sponsor deposits (S2), with the time
+   *  the sponsor starts it when it paces it (`rearm-wait`). */
+  private waitingForRest(): string {
+    const r = this.record;
+    const p = this.snap.view ? partialOf(this.snap.view, BigInt(r.offer.pay.amount)) : null;
+    const base = r.choice === 'bridge-back' ? WAITING_FOR_REST_BACK : WAITING_FOR_REST;
+    return p?.retryAt && p.retryAt > this.deps.now() ? `${base} (it starts from ${clockText(p.retryAt)})` : base;
+  }
+
+  /** The sponsor says `partial` (S2): the user's choice while both ways out are open; else the wait
+   *  for the rest, where only the sweep ETH may be topped up. The loop goes on reading the sponsor. */
+  private async partialStep(view: SwapView): Promise<void> {
+    const r = this.record;
+    const p = partialOf(view, BigInt(r.offer.pay.amount));
+    if (!p) {
+      this.status({ kind: 'working', what: 'The sponsor reports a partial deposit this page cannot read; waiting' });
+      return;
+    }
+    if (r.choice === 'swap' && !r.partial?.wait && p.canBridgeBack) {
+      if (this.snap.status.kind !== 'partial') this.status({ kind: 'partial' });
+      return;
+    }
+    // Waiting for the rest: chosen, or after a Bridge back of what arrived (what waits at the deposit
+    // address is deposited, then bridged back too).
+    if (p.canWait) await this.fundingStep();
+    else this.status({ kind: 'working', what: 'Waiting for the sponsor' });
   }
 
   /** Why funding cannot go on right now (mock mode with a real wallet, or the wallet left Sepolia or
@@ -795,7 +860,10 @@ export class SwapSession {
         }
         this.saveRecord(record);
         this.set({ view });
-        if (view.state === 'awaiting_funds' && view.sweepGas) this.adoptRaisedSweep(view.sweepGas);
+        // The sweep gas may rise while the sponsor waits for funds, and on a partial deposit (S2) while
+        // it waits for the rest.
+        if ((view.state === 'awaiting_funds' || view.state === 'partial') && view.sweepGas)
+          this.adoptRaisedSweep(view.sweepGas);
         // A funding transfer still pending: read its receipt, whatever the sponsor's state.
         if (record.funding.eth?.status === 'sent' || record.funding.token?.status === 'sent')
           await this.checkReceipts();
@@ -820,12 +888,18 @@ export class SwapSession {
         }
         if (act === 'fund') {
           await this.fundingStep();
+        } else if (act === 'partial') {
+          // S2: nothing is sent before the user chooses; while the rest is awaited, only the sweep ETH
+          // may be topped up. Either way the loop keeps reading the sponsor: never a silent wait.
+          await this.partialStep(view);
         } else if (act === 'wait') {
           this.status({
             kind: 'working',
             what:
               view.state === 'depositing'
-                ? 'Bridging in'
+                ? this.record.partial
+                  ? 'Bridging in the rest'
+                  : 'Bridging in'
                 : view.state === 'bridging_back'
                   ? 'Bridging back'
                   : 'Bridging out',
@@ -969,6 +1043,9 @@ export class SwapSession {
     }
     this.retryApproved = false;
     const l = which === 'receive' ? r.offer.receive : r.offer.pay;
+    // Bridge back returns what the temporary wallet received: all of the pay amount, or on a partial
+    // deposit (S2) the part that arrived.
+    const amount = which === 'receive' ? BigInt(l.amount) : bridgeBackAmount(r);
     for (let attempt = 1; ; attempt++) {
       this.status({
         kind: 'working',
@@ -982,13 +1059,13 @@ export class SwapSession {
           which === 'receive' ? 'swap' : 'bridge-back',
         );
       } catch (e) {
-        if (this.inProgress(e)) return false;
+        if (this.inProgress(e) || this.partialMovedOn(e)) return false;
         throw e;
       }
       // Never build a withdrawal of anything but this swap's own leg, to anyone but its owner.
       if (
         params.colour !== l.colour ||
-        params.amount !== BigInt(l.amount) ||
+        params.amount !== amount ||
         getAddress(params.dest) !== getAddress(r.evmAddress) ||
         params.refundRecipient !== r.temp.coinPk
       )
@@ -1012,7 +1089,7 @@ export class SwapSession {
         this.submitted = draft;
       } catch (e) {
         await draft.release();
-        if (this.inProgress(e)) return false;
+        if (this.inProgress(e) || this.partialMovedOn(e)) return false;
         if (e instanceof SponsorError && e.rebuild && attempt < 3) {
           this.set({ notice: 'The vault moved on while the withdrawal was being proven; building it again.' });
           continue;
@@ -1047,13 +1124,52 @@ export class SwapSession {
     return true;
   }
 
+  /** A Bridge back of a partial deposit refused because the swap left `partial` meanwhile (409
+   *  `wrong-state`: the sponsor started the rest's deposit, FS3 item 4): not an error; the page waits
+   *  for its view (then the whole amount, or what arrived, goes back). */
+  private partialMovedOn(e: unknown): boolean {
+    if (!(e instanceof SponsorError) || e.code !== 'wrong-state' || !this.snap.record?.partial) return false;
+    this.status({ kind: 'working', what: 'Waiting for the sponsor (the deposit of the rest started)' });
+    return true;
+  }
+
   // ── user actions ────────────────────────────────────────────────────────
 
-  /** "Bridge back": withdraw the paid token to the user's EVM address (Q6). */
+  /** "Bridge back": withdraw the paid token to the user's EVM address (Q6); on a partial deposit
+   *  (S2), what the temporary wallet received, also while waiting for the rest. */
   bridgeBack(): void {
-    if (this.snap.status.kind !== 'unavailable') return;
+    if (!this.canBridgeBackPartial() && this.snap.status.kind !== 'unavailable') return;
     this.saveRecord({ ...this.record, choice: 'bridge-back', phase: 'bridging-back', updatedAt: this.deps.now() });
     this.status({ kind: 'working', what: 'Bridging back' });
+    void this.loop();
+  }
+
+  /** A partial deposit this tab drives, whose Bridge back the sponsor offers now (S2): the swap is
+   *  `partial` (no deposit of the rest is running), and no funding transfer is open. */
+  private canBridgeBackPartial(): boolean {
+    const r = this.snap.record;
+    const v = this.snap.view;
+    if (!r?.partial || r.choice !== 'swap' || this.closed || !this.token || !v) return false;
+    if (!partialOf(v, BigInt(r.offer.pay.amount))?.canBridgeBack) return false;
+    const st = this.snap.status;
+    return st.kind === 'partial' || st.kind === 'working' || (st.kind === 'fund' && st.sending === null);
+  }
+
+  /** Whether "Bridge back what arrived" is on offer now (S2). */
+  get partialChoiceOpen(): boolean {
+    return this.canBridgeBackPartial();
+  }
+
+  /** "Wait for the rest" (S2): the sponsor bridges the remainder in from the deposit address; the page
+   *  then tops up only the sweep ETH if the deposit address lacks it. Nothing is sent here. */
+  waitForRest(): void {
+    if (this.snap.status.kind !== 'partial') return;
+    const r = this.record;
+    const v = this.snap.view;
+    if (!r.partial || !v || !partialOf(v, BigInt(r.offer.pay.amount))?.canWait) return;
+    this.saveRecord({ ...r, partial: { ...r.partial, wait: true }, updatedAt: this.deps.now() });
+    this.lack = null;
+    this.status({ kind: 'working', what: this.waitingForRest() });
     void this.loop();
   }
 
