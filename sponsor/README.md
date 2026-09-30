@@ -11,9 +11,9 @@ public keys and the transactions it is asked to prove or pay for.
 | Step | Who | What the sponsor does |
 |---|---|---|
 | Open | the page, with ONE EIP-712 signature (`SponsorAction` "open-swap") | checks the offer (live, far from expiry, exactly the swap's two legs in the kernel's view AND in the maker's transaction), computes the deposit address from the temporary coin key, sizes the sweep gas, answers a bearer token |
-| Deposit | server-driven | watches the deposit address until it holds the pay amount of the ERC20 and the sweep ETH, then `startDeposit` (recipient = the temporary coin key), the relayer (MPC signature, broadcast, Sepolia finality, attestation), `completeDeposit` with the temporary encryption key mapped, so the minted coin is sealed to the temporary wallet |
-| Take | the browser (the batcher pays its fee) | proves the take's balancing transaction if and only if it balances THIS swap's offer |
-| Withdraw / Bridge back | the browser builds and binds `startWithdraw`; the sponsor pays | proves it if and only if its calls are exactly the `startWithdraw` the sponsor rebuilds from the swap's own values and its coins are exactly the wallet's coin in and the vault's coin out (at most one change coin); `/withdraw` must carry that exact transaction; then, in the ONE withdrawal lane (the vault account's EVM nonce), adds DUST, submits, and releases the lane (the start's record now holds the nonce); the relayer (re-broadcasting until mined, every wait bounded) and `completeWithdraw` (or `refundWithdraw`) follow; a refund or a failed start sets `withdrawal.retry` |
+| Deposit | server-driven | watches the deposit address until it holds the pay amount of the ERC20 and the sweep ETH, then `startDeposit` (recipient = the temporary coin key), the relayer (MPC signature, broadcast, Sepolia finality, attestation), `completeDeposit` with the temporary encryption key mapped, so the minted coin is sealed to the temporary wallet. It also reads the vault's open requests for every waiting recipient and completes any that swept its address (anyone may start one); one that minted less than the pay amount makes the swap `partial`: the sponsor deposits the remainder by itself, or the page bridges back what arrived |
+| Take | the browser (the batcher pays its fee) | proves the take's balancing transaction if and only if it balances THIS swap's offer and every coin it pays is the temporary wallet's (its coins in: any the caller can spend, up to 4, `src/validate/rules.ts` "INPUTS — ACCEPTED POLICY") |
+| Withdraw / Bridge back | the browser builds and binds `startWithdraw`; the sponsor pays | proves it if and only if its calls are exactly the `startWithdraw` the sponsor rebuilds from the swap's own values and its coins are the wallet's coins in and exactly the vault's coin out (at most one change coin, the wallet's); `/withdraw` must carry that exact transaction, approved by this sponsor version; then, in the ONE withdrawal lane (the vault account's EVM nonce), adds DUST, submits, and releases the lane (the start's record now holds the nonce); the relayer (re-broadcasting until mined, every wait bounded) and `completeWithdraw` (or `refundWithdraw`) follow; a refund or a failed start sets `withdrawal.retry` |
 | Stale requests | the sponsor | resumes its own swaps' requests after a restart, and drives again any that stalled (capped per day, never below a DUST reserve); a transfer signed but stuck unmined is replaced by the next withdrawal's (`deploy/RUNBOOK.md` 13.7) |
 | Spending controls | the sponsor | new swaps per address per day, swaps waiting for funds overall, a daily DUST budget over paid and in-flight legs; recoverable failures (`failed.recoverable`) revive on a re-open |
 
@@ -71,7 +71,7 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `SPONSOR_CORS_ORIGINS` | (none) | the web's origins, comma-separated |
 | `SPONSOR_TRUST_PROXY` | `false` | rate-limit by the last `X-Forwarded-For` hop (behind our own proxy only) |
 | `SPONSOR_DATA_DIR` | `sponsor-data` | where the swaps are kept (`/data` in the image; `:memory:` for tests) |
-| `SWAP_RETAIN_DAYS` | `30` | finished swaps are dropped after this; swaps in flight never are |
+| `SWAP_RETAIN_DAYS` | `30` | finished swaps are dropped after this, but only with nothing left to recover (`done`, or a failure no re-open revives, with no unsettled or re-checked withdrawal attempt and no token seen at the address: `src/swaps/model.ts` `retentionMayDrop`); swaps in flight, recoverable failures and funded records never are |
 | `VAULT_MANAGED_DIR` | `vault-managed` | the vault key directory, under the repository root (`/app/vault-managed` in the image); its `Erc20Vault` and `SignetSigner` `contract/index.js` must be the pinned build (`src/bridge/vault.ts` `VAULT_MODULE_SHA256`) or the bridge stays off |
 | `MIDNIGHT_PROOF_SERVER_URL` | `http://proof-server:6300` | the sponsor's proof server |
 | `PROOF_SERVER_EXPECTED_VERSION` | `9.0.0-rc.6` | health reports a mismatch |
@@ -80,8 +80,8 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `SWAP_MIN_OFFER_TTL_SECONDS` | `1800` | a new swap's offer must expire at least this far ahead |
 | `SWAP_MAX_ACTIVE_PER_OWNER` | `3` | swaps in progress per EVM address |
 | `SWAP_MAX_PER_OWNER_PER_DAY` | `10` | new swaps per EVM address in any 24 hours (`429 too-many-swaps`) |
-| `SWAP_MAX_UNFUNDED` | `100` | swaps waiting for funds that received nothing, all users (`503 sponsor-busy` past it); a revival of such a swap counts like a new one |
-| `SWAP_MAX_UNFUNDED_PER_CLIENT` | `10` | ... per client: an IPv4 address, or an IPv6 /64 (`429 too-many-swaps`, detail `client`) |
+| `SWAP_MAX_UNFUNDED` | `1000` | swaps waiting for funds (their WHOLE pay amount not at the deposit address yet), all users (`503 sponsor-busy` past it; a backstop: the deposit reads are budgeted per pass); a revival of such a swap counts like a new one |
+| `SWAP_MAX_UNFUNDED_PER_CLIENT` | `10` | ... per client: an IPv4 address, or an IPv6 /48 (`429 too-many-swaps`, detail `client`) |
 | `SWAP_OWNER_BALANCE_CACHE_SECONDS` | `30` | an open (and the revival of a swap that received nothing) needs the EVM address to hold the pay amount and the sweep ETH on Sepolia (`422 insufficient-funds`); each read is reused this long |
 | `SPONSOR_DAILY_DUST_BUDGET` | `500` | DUST the sponsor may pay in any 24 hours, counting the legs still in flight, committed when a swap's funds are all at its deposit address (a funded swap over it waits in `budget-wait`; new swaps get `503 sponsor-budget`); `0`: none |
 | `SWAP_DUST_PER_START_SPECKS`, `SWAP_DUST_PER_SETTLE_SPECKS` | 2.2 and 0.4 DUST | the budget's estimate of one paid start and one paid settle |
@@ -91,7 +91,8 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `SWAP_FUNDS_WAIT_PARTIAL_SECONDS` | `86400` | ... one that received part of the token |
 | `SWAP_RETAIN_UNFUNDED_DAYS` | `2` | never-funded failed swaps are dropped after this, once their address reads empty |
 | `DEPOSIT_POLL_SECONDS` | `15` | how often a deposit address is read at first (then every minute, and every 5 minutes after an hour, while nothing arrives) |
-| `DEPOSIT_POLL_MAX_READS` | `120` | deposit-address reads per poll pass, all swaps together (the longest due first) |
+| `DEPOSIT_POLL_MAX_READS` | `120` | deposit-address reads per poll pass, all swaps together (funded swaps first, then the longest due) |
+| `DEPOSIT_RECONCILE_SECONDS` | `120` | how often the vault's open deposit requests are read for every swap waiting for funds or `partial`, whatever its address shows: a request the MPC attests as executed is completed (a sweep between two reads; a partial sweep → `partial`) |
 | `DEPOSIT_POLL_NUDGE_MIN_SECONDS` | `60` | a page reading a swap brings its next address read forward, never closer than this to the last |
 | `DEPOSIT_MAX_ATTEMPTS` | `3` | `startDeposit` attempts per swap (a never-executed sweep is retried) |
 | `DEPOSIT_REARMS_PER_DAY` | `3` | how often, in any 24 hours, a re-open may re-arm a failed deposit (`deposit-attempts`, `deposit-returned-false`) with a new `startDeposit`; the failure stays recoverable, a paced re-open answers `retryAt`. The old `DEPOSIT_MAX_REARMS` is read as it |
@@ -102,13 +103,15 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `BRIDGE_EVM_MAX_FEE_CAP_WEI` | `10^11` (100 gwei) | above it, withdrawals are refused until gas is cheaper |
 | `WITHDRAW_STUCK_AFTER_SECONDS`, `WITHDRAW_UNSIGNED_STALE_SECONDS` | `1800`, `7200` | a transfer signed but unmined this long (with the base fee above its cap), or a start unsigned this long, is stuck: the next withdrawal takes its nonce |
 | `BRIDGE_EVM_REPLACEMENT_BUMP_PERCENT` | `10` | that replacement outbids every transfer holding the nonce by at least this percent on BOTH fee fields (the pools' rule; 10 to 100) |
-| `WITHDRAW_UNCERTAIN_SECONDS` | `900` | a withdrawal whose submission's outcome is unknown (`submission-uncertain`) keeps its nonce; its request neither in the vault nor attested this long after it was sent means it did not land (`not-included`) |
+| `WITHDRAW_UNCERTAIN_SECONDS` | `900` | a withdrawal whose submission's outcome is unknown (`submission-uncertain`) keeps its nonce; its request neither in the vault nor attested this long after it was sent means it did not land (`not-included`), provided the vault read is fresh (below) and the attestation lookup worked |
+| `WITHDRAW_EXPIRY_MARGIN_SECONDS` | `120` | "not included" needs a vault read AS OF an indexer block at least this far past the transaction's expiry (its DUST intent's time to live, recorded before the node sees it) |
+| `WITHDRAW_RECHECK_SECONDS` | `86400` | an attempt judged `not-included` is re-checked by its request id this long and adopted again if it landed (it does not hold its nonce meanwhile) |
 | `VAULT_GAS_LOW_WEI` | `2·10^15` | health degrades when the vault's EVM account holds less |
 | `STALE_CLOSER_ENABLED` | `true` | |
 | `STALE_CLOSER_INTERVAL_SECONDS`, `STALE_AFTER_SECONDS` | `300`, `900` | scan period; how long a request must be idle |
 | `STALE_CLOSER_MAX_PER_DAY` | `48` | re-drives paid for in any 24 hours |
 | `STALE_CLOSER_MIN_DUST_SPECKS` | 2 × the low level | the closer spends nothing below this |
-| `RATE_LIMIT_*` | | per minute: `READS` 240, `HEALTH` 60, `NONCES` 30, `OPENS` 10 (per client) and `OPENS_PER_OWNER` 5, `PROVES` 20 (per client) and `PROVES_PER_SWAP` 6, `WRITES` 20; a client is an IPv4 address or an IPv6 /64 |
+| `RATE_LIMIT_*` | | per minute: `READS` 240, `HEALTH` 60, `NONCES` 30, `OPENS` 10 (per client) and `OPENS_PER_OWNER` 5, `PROVES` 20 (per client) and `PROVES_PER_SWAP` 6, `WRITES` 20; a client is an IPv4 address or an IPv6 /48 |
 | `AUTH_MAX_TTL_SECONDS`, `AUTH_NONCE_TTL_SECONDS` | `600`, `600` | the open-swap signature's expiry cap; how long a nonce lives |
 | `SPONSOR_MAX_BODY_BYTES` | `2097152` | request body limit |
 | `MIDNIGHT_*`, `ZSWAP_*`, `BRIDGE_*` | the network profile | endpoint and contract overrides |
@@ -120,9 +123,10 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 the open-swap signature and the bearer token, every take and withdraw refusal rule (on summaries,
 through the routes, and over real ledger-v9 transactions), the state machine, the server-driven
 deposit, the withdrawal lane (no two starts share a nonce), refunds, Bridge back, restarts, the
-stale closer and the sweep sizing, and the security fix passes (`test/fix-pass.test.ts` and
-`test/fix2-pass.test.ts`, one block per audit row; `test/relay-loop.test.ts`, the bounded relayer on a
-virtual clock). Nothing in them touches a network. One more needs a node:
+stale closer and the sweep sizing, and the security fix passes (`test/fix-pass.test.ts`,
+`test/fix2-pass.test.ts` and `test/fix3-pass.test.ts`, one block per audit row;
+`test/relay-loop.test.ts`, the bounded relayer on a virtual clock; `test/indexer-head.test.ts`, the
+read watermark). Nothing in them touches a network. One more needs a node:
 `test/replacement-pool.test.ts` checks a stuck transfer's replacement against a real transaction
 pool, a geth dev node in Docker (`scripts/replacement-pool-check.sh`, after
 `scripts/docker-check.sh up` and `sync`); without `EVM_DEV_RPC_URL` it is skipped.
