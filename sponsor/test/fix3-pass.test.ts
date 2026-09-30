@@ -8,6 +8,8 @@ import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transpa
 import { Wallet } from 'ethers';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { partialOf } from '../../web/src/swap/partial.js';
+import { SwapViewSchema as WebSwapViewSchema } from '../../web/src/swap/sponsor-client.js';
 import { swapView, type SwapRecord } from '../src/swaps/model.js';
 import { MemorySwapStore } from '../src/swaps/store.js';
 import { VAULT_EVM, gate } from './fakes.js';
@@ -645,5 +647,42 @@ describe('the partial view parses with core’s schema (FW3 builds to it)', () =
       SwapViewSchema.parse(JSON.parse(JSON.stringify(swapView(h.store.get(m.s.swapId)!)))).partial,
     ).toBeUndefined();
     expect(o.swapToken).toBeTruthy();
+  });
+});
+
+// ── Cross-lane: the real sponsor's views through the page's reader (FW3, #13) ──
+
+describe('cross-lane S2: the page reads the real sponsor’s partial views (web/src/swap/partial.ts)', () => {
+  it('griefed → partial (wait, bridge-back) → a Bridge back → partial (wait) → the rest deposited → partial (bridge-back)', async () => {
+    const { s, o } = await griefedSwap(h, 'x');
+    const page = async () => {
+      const body = (await (await get(h, SWAP_PATHS.swap(s.swapId), o.swapToken)).json()) as { swap: unknown };
+      return partialOf(WebSwapViewSchema.parse(body.swap), BigInt(o.amount));
+    };
+    const amount = BigInt(o.amount);
+    expect(await page()).toMatchObject({ minted: 1n, remaining: amount - 1n, canWait: true, canBridgeBack: true });
+    const w = await paramsAndBuild(h, s, o.swapToken, 'bridge-back', 'x1');
+    expect((await proveWithdraw(h, s, o.swapToken, w)).status).toBe(200);
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, o.swapToken)).status).toBe(202);
+    await h.swaps.idle();
+    expect(await page()).toMatchObject({ minted: 0n, remaining: amount - 1n, canWait: true, canBridgeBack: false });
+    h.vault.evm.setEth(o.depositAddress, BigInt(o.sweepGas.ethWei));
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    expect(await page()).toMatchObject({ minted: amount - 1n, remaining: 0n, canWait: false, canBridgeBack: true });
+  });
+
+  it('a paced remainder start shows its retryAt to the page', async () => {
+    const { s, o } = await griefedSwap(h, 'y');
+    // A re-arm happened moments ago: the next remainder start waits for the cooldown.
+    const rec = h.store.get(s.swapId)!;
+    rec.deposit!.rearmTimes = [Math.floor(h.now.ms / 1000)];
+    h.store.put(rec);
+    h.vault.evm.setEth(o.depositAddress, BigInt(o.sweepGas.ethWei));
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    const body = (await (await get(h, SWAP_PATHS.swap(s.swapId), o.swapToken)).json()) as { swap: unknown };
+    const p = partialOf(WebSwapViewSchema.parse(body.swap), BigInt(o.amount));
+    expect(p?.retryAt).toBe((Math.floor(h.now.ms / 1000) + 1_800) * 1000);
   });
 });
