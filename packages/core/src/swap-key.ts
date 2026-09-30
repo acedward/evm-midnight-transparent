@@ -15,7 +15,9 @@
 //   message  purpose = START_SWAP_PURPOSE (fixed text),
 //            network = the Midnight network ("stagenet"),
 //            vault   = the bridge vault's Midnight contract address (32 bytes),
-//            salt    = 32 random bytes, new for every swap and kept in the swap record (public)
+//            salt    = 32 random bytes, new for every swap, kept in the browser's own swap record
+//                      and NEVER sent anywhere: the sponsor, URLs and logs see only the swap's
+//                      public id, publicSwapId(salt) below (plan 00048 P4.2-fix, audit C14)
 //   sig      the 65-byte r ‖ s ‖ v the wallet returns; v is normalised to 27/28
 //   seed     keccak256(sig), 32 bytes
 //
@@ -29,7 +31,16 @@
 // Binding the vault and the network into the message keeps a stagenet swap's key different from
 // any other deployment's; binding the chain id makes the wallet refuse to sign on another chain.
 
-import { TypedDataEncoder, getAddress, getBytes, hexlify, keccak256, verifyTypedData } from 'ethers';
+import {
+  TypedDataEncoder,
+  concat,
+  getAddress,
+  getBytes,
+  hexlify,
+  keccak256,
+  toUtf8Bytes,
+  verifyTypedData,
+} from 'ethers';
 
 import { bytesToHex } from './hex.js';
 import { SEPOLIA_CHAIN_ID } from './network.js';
@@ -127,6 +138,22 @@ export function recoverStartSwapSigner(p: StartSwapParams, signature: string): s
 /** A new swap's salt: 32 bytes from the platform's CSPRNG, 0x-prefixed hex. */
 export function newSwapSalt(random: (b: Uint8Array) => Uint8Array = (b) => crypto.getRandomValues(b)): string {
   return `0x${bytesToHex(random(new Uint8Array(32)))}`;
+}
+
+/** The tag hashed in front of the salt to make the swap's public id. */
+export const SWAP_ID_TAG = 'evm-midnight-swap/id';
+
+/**
+ * The swap's PUBLIC id: keccak256(utf8(SWAP_ID_TAG) ‖ salt), i.e. Solidity's
+ * `keccak256(abi.encodePacked(string, bytes32))`, as 64 lowercase hex without 0x.
+ *
+ * The salt is an input of the "start swap" message: whoever holds it can show the user the exact
+ * prompt that yields the temporary wallet's keys (audit F-A11). So the salt stays in the browser's
+ * own swap record; the sponsor's swap id, the open-swap signature's `swap`, URLs and logs carry
+ * only this hash, from which the salt cannot be recovered.
+ */
+export function publicSwapId(salt: string): string {
+  return keccak256(concat([toUtf8Bytes(SWAP_ID_TAG), getBytes(hex32('salt', salt))])).slice(2);
 }
 
 /** The 65 signature bytes r ‖ s ‖ v, with v normalised to 27/28 (some signers return 0/1). */

@@ -20,7 +20,7 @@ import { NonceStore } from '../src/auth/nonces.js';
 import { loadConfig, type SponsorConfig } from '../src/config.js';
 import { createLogger, type Logger } from '../src/log.js';
 import type { SponsorSession, SponsorStatus } from '../src/sponsor/session.js';
-import { SwapService, type SwapServiceConfig } from '../src/swaps/service.js';
+import { SwapService, swapServiceConfig, type SwapServiceConfig } from '../src/swaps/service.js';
 import { MemorySwapStore, type SwapStore } from '../src/swaps/store.js';
 import {
   FakeOffers,
@@ -109,21 +109,7 @@ export function harness(
   const sponsor = new FakeSponsor();
   const now = { ms: Date.now() };
   const swaps = new SwapService({
-    config: {
-      network: config.network.name,
-      tokens: config.tokens,
-      bridgeGas: config.bridgeGas,
-      sweepGasLimits: config.swaps.sweepGasLimits,
-      maxSweepWei: config.swaps.maxSweepWei,
-      minOfferTtlSeconds: config.swaps.minOfferTtlSeconds,
-      maxActiveSwapsPerOwner: config.swaps.maxActivePerOwner,
-      proofsPerSwap: config.swaps.proofsPerSwap,
-      depositPollMs: 1_000_000,
-      fundsWaitSeconds: config.swaps.fundsWaitSeconds,
-      maxDepositAttempts: config.swaps.maxDepositAttempts,
-      dustLowSpecks: config.sponsor.dustLowSpecks,
-      ...opts.service,
-    },
+    config: { ...swapServiceConfig(config), depositPollMs: 1_000_000, ...opts.service },
     store,
     backend: () => (opts.bridge === false ? null : vault),
     prover: () => (opts.bridge === false ? null : prover),
@@ -280,6 +266,7 @@ export function withdrawFor(
     erc20?: string;
     refund?: string;
     gasLimit?: bigint;
+    maxFeePerGas?: bigint;
   } = {},
 ) {
   const leg = kind === 'swap' ? BID.receive : BID.pay;
@@ -288,7 +275,11 @@ export function withdrawFor(
   const calls = fakeWithdrawCalls(
     {
       evmNonce,
-      gas: { ...h.config.bridgeGas, ...(over.gasLimit ? { gasLimit: over.gasLimit } : {}) },
+      gas: {
+        ...h.config.bridgeGas,
+        ...(over.gasLimit ? { gasLimit: over.gasLimit } : {}),
+        ...(over.maxFeePerGas ? { maxFeePerGas: over.maxFeePerGas } : {}),
+      },
       erc20: over.erc20 ?? leg.token.sepoliaAddress,
       amount: over.amount ?? leg.amount,
       dest: over.dest ?? s.user.address,

@@ -19,7 +19,7 @@ import { Redactor, createLogger } from './log.js';
 import { ProofServerClient } from './prover/client.js';
 import { FacadeSponsorSession, openFacadeWallet } from './sponsor/facade.js';
 import { DisabledSponsorSession, type SponsorSession } from './sponsor/session.js';
-import { SwapService } from './swaps/service.js';
+import { SwapService, swapServiceConfig } from './swaps/service.js';
 import { StaleCloser } from './swaps/stale.js';
 import { JsonFileSwapStore, MemorySwapStore, type SwapStore } from './swaps/store.js';
 import { inspectTransaction, makerImbalances } from './validate/inspect.js';
@@ -125,20 +125,7 @@ async function main(): Promise<void> {
 
   const kernel = new KernelClient({ baseUrl: config.network.zswap.kernelUrl });
   const swaps = new SwapService({
-    config: {
-      network: config.network.name,
-      tokens: config.tokens,
-      bridgeGas: config.bridgeGas,
-      sweepGasLimits: config.swaps.sweepGasLimits,
-      maxSweepWei: config.swaps.maxSweepWei,
-      minOfferTtlSeconds: config.swaps.minOfferTtlSeconds,
-      maxActiveSwapsPerOwner: config.swaps.maxActivePerOwner,
-      proofsPerSwap: config.swaps.proofsPerSwap,
-      depositPollMs: config.swaps.depositPollSeconds * 1000,
-      fundsWaitSeconds: config.swaps.fundsWaitSeconds,
-      maxDepositAttempts: config.swaps.maxDepositAttempts,
-      dustLowSpecks: config.sponsor.dustLowSpecks,
-    },
+    config: swapServiceConfig(config),
     store,
     backend: () => live?.backend ?? null,
     prover: () => live?.prover ?? null,

@@ -347,11 +347,13 @@ describe('/prove withdraw and /withdraw: only this swap’s startWithdraw', () =
       evmNonce: '9',
       vaultAddress: VAULT,
     });
-    await expectError(
-      await get(h, `${SWAP_PATHS.withdrawParams(s.swapId)}?kind=bridge-back`, token),
-      409,
-      'wrong-state',
-    );
+    // After the take, Bridge back is still offered: only the coin the wallet holds can be withdrawn
+    // (audit C13), so a mistaken "taken" report can never strand the paid token.
+    const back = (await (await get(h, `${SWAP_PATHS.withdrawParams(s.swapId)}?kind=bridge-back`, token)).json()) as {
+      colour: string;
+      amount: string;
+    };
+    expect(back).toMatchObject({ colour: BID.pay.token.midnightColour, amount: BID.pay.amount.toString() });
     await expectError(await get(h, `${SWAP_PATHS.withdrawParams(s.swapId)}?kind=nope`, token), 400, 'bad-request');
   });
 
@@ -534,11 +536,14 @@ describe('/prove withdraw and /withdraw: only this swap’s startWithdraw', () =
     expect(await view(h, s, token)).toMatchObject({ state: 'done', outcome: 'bridged-back' });
   });
 
-  it('refuses a withdrawal of the swap’s token for the pay amount, and of the pay token after the take', async () => {
+  it('refuses a withdrawal of the swap’s token for the pay amount; a pay-token withdrawal after the take is Bridge back', async () => {
     const { s, token } = await takenSwap(h);
-    const payBack = withdrawFor(h, s, 'bridge-back');
-    await expectError(await proveWithdraw(h, s, token, payBack), 422, 'invalid-tx', 'wrong-call');
-    await expectError(await proveWithdraw(h, s, token, payBack, 'bridge-back'), 409, 'wrong-state');
+    const mixed = withdrawFor(h, s, 'swap', { amount: BID.pay.amount });
+    await expectError(await proveWithdraw(h, s, token, mixed), 422, 'invalid-tx', 'wrong-call');
+    await expectError(await proveWithdraw(h, s, token, mixed, 'swap'), 422, 'invalid-tx', 'wrong-call');
+    // The pay token after a take report: accepted as Bridge back (audit C13); the vault only
+    // accepts it with a coin the temporary wallet really holds.
+    expect((await proveWithdraw(h, s, token, withdrawFor(h, s, 'bridge-back'), 'bridge-back')).status).toBe(200);
   });
 });
 

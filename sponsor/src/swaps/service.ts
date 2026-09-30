@@ -49,6 +49,7 @@ import {
 import { getAddress } from 'ethers';
 
 import { issueSwapToken, tokenMatches } from '../auth/swap-token.js';
+import type { SponsorConfig } from '../config.js';
 import type { Logger } from '../log.js';
 import { FifoLock } from '../queue/fifo-lock.js';
 import type { SponsorStatus } from '../sponsor/session.js';
@@ -98,8 +99,29 @@ export interface SwapServiceConfig {
   /** An `awaiting_funds` swap fails after this long without its funds. */
   fundsWaitSeconds: number;
   maxDepositAttempts: number;
+  /** How often a re-open may re-arm a deposit that failed with its funds still at the address. */
+  maxDepositRearms: number;
   /** Below this, the sponsor spends nothing new (specks). */
   dustLowSpecks: bigint;
+}
+
+/** The service's configuration from the sponsor's (main.ts and the tests share it). */
+export function swapServiceConfig(c: SponsorConfig): SwapServiceConfig {
+  return {
+    network: c.network.name,
+    tokens: c.tokens,
+    bridgeGas: c.bridgeGas,
+    sweepGasLimits: c.swaps.sweepGasLimits,
+    maxSweepWei: c.swaps.maxSweepWei,
+    minOfferTtlSeconds: c.swaps.minOfferTtlSeconds,
+    maxActiveSwapsPerOwner: c.swaps.maxActivePerOwner,
+    proofsPerSwap: c.swaps.proofsPerSwap,
+    depositPollMs: c.swaps.depositPollSeconds * 1000,
+    fundsWaitSeconds: c.swaps.fundsWaitSeconds,
+    maxDepositAttempts: c.swaps.maxDepositAttempts,
+    maxDepositRearms: c.swaps.maxDepositRearms,
+    dustLowSpecks: c.sponsor.dustLowSpecks,
+  };
 }
 
 export interface SwapServiceDeps {
@@ -353,9 +375,19 @@ export class SwapService {
     const { token, hash } = issueSwapToken(this.deps.random);
     rec.tokenHash = hash;
     const now = this.nowS();
-    if (rec.state === 'failed' && rec.reason === 'funds-not-received') {
+    if (rec.state === 'failed' && rec.recoverable === true && rec.deposit) {
+      // The funds wait at the deposit address (or have not arrived yet): wait again. After a failed
+      // deposit, re-arm it: a NEW startDeposit to the same recipient moves them (audit C5).
+      const d = rec.deposit;
+      const rearm = rec.reason !== 'funds-not-received';
+      if (rearm) {
+        d.rearms = (d.rearms ?? 0) + 1;
+        d.attempts = 0;
+        delete d.requestId;
+        delete d.startedAtMs;
+      }
       transition(rec, 'awaiting_funds', now);
-      if (rec.deposit) pushStage(rec.deposit, 'waiting-for-funds', now, { reopened: 'true' });
+      pushStage(d, 'waiting-for-funds', now, { reopened: 'true', ...(rearm ? { rearm: String(d.rearms) } : {}) });
     }
     rec.updatedAt = now;
     this.deps.store.put(rec);
@@ -427,9 +459,8 @@ export class SwapService {
         `a withdrawal is not possible while the swap is ${rec.state}`,
       );
     }
-    if (kind === 'bridge-back' && rec.state === 'taken') {
-      throw new SwapError(409, SWAP_ERRORS.wrongState, 'the offer was taken: there is nothing to bridge back');
-    }
+    // Either kind in minted / taking / taken: a startWithdraw spends the coin the temporary wallet
+    // really holds, so a mistaken "taken" report cannot make the vault pay twice (audit C13).
     return kind === 'swap' ? rec.receive : rec.pay;
   }
 
@@ -584,7 +615,6 @@ export class SwapService {
         : ['bridge-back', 'swap'];
     let firstError: unknown = null;
     for (const kind of kinds) {
-      if (kind === 'bridge-back' && rec.state === 'taken') continue;
       const leg = this.withdrawLeg(rec, kind);
       let rebuilt;
       try {
@@ -632,7 +662,11 @@ export class SwapService {
       transition(rec, 'taken', now);
     } else {
       if (rec.state === 'minted') return rec;
-      if (rec.state !== 'taking') throw new SwapError(409, SWAP_ERRORS.wrongState, `the swap is ${rec.state}`);
+      if (rec.state !== 'taking' && rec.state !== 'taken') {
+        throw new SwapError(409, SWAP_ERRORS.wrongState, `the swap is ${rec.state}`);
+      }
+      // A "taken" report made in error (the take never landed) is undone by this one (audit C13).
+      rec.takeTx = null;
       transition(rec, 'minted', now);
     }
     this.deps.store.put(rec);
@@ -969,15 +1003,7 @@ export class SwapService {
     const now = this.nowS();
     for (const rec of this.deps.store.all()) {
       if (rec.state !== 'awaiting_funds' || this.driving.has(rec.swapId)) continue;
-      const since = [...rec.history].reverse().find((h) => h.state === 'awaiting_funds')?.at ?? rec.createdAt;
-      if (now - since > this.cfg.fundsWaitSeconds) {
-        transition(rec, 'failed', now, {
-          reason: 'funds-not-received',
-          message: 'the deposit address did not receive the funds in time; re-open the swap to keep waiting',
-        });
-        this.persist(rec);
-        continue;
-      }
+      // Without a bridge the address cannot be read: never fail a swap on its age unread.
       if (!be) continue;
       let erc20: bigint;
       let eth: bigint;
@@ -990,7 +1016,20 @@ export class SwapService {
         this.deps.log.warn('deposit address read failed', { swapId: rec.swapId, error: e });
         continue;
       }
-      if (erc20 < BigInt(rec.pay.amount) || eth < BigInt(rec.sweepGas.ethWei)) continue;
+      const tokenThere = erc20 >= BigInt(rec.pay.amount);
+      // The balance first, the age second: a swap whose token reached the address is never failed for
+      // its age, whatever kept the sponsor from starting it (audit C5).
+      const since = [...rec.history].reverse().find((h) => h.state === 'awaiting_funds')?.at ?? rec.createdAt;
+      if (!tokenThere && now - since > this.cfg.fundsWaitSeconds) {
+        transition(rec, 'failed', now, {
+          reason: 'funds-not-received',
+          message: 'the deposit address did not receive the funds in time; re-open the swap to keep waiting',
+          recoverable: true,
+        });
+        this.persist(rec);
+        continue;
+      }
+      if (!tokenThere || eth < BigInt(rec.sweepGas.ethWei)) continue;
       const s = this.deps.sponsor();
       if (!s.synced || (s.dustSpecks !== null && s.dustSpecks < this.cfg.dustLowSpecks)) continue;
       this.stage(rec, rec.deposit!, 'funds-seen', { erc20: erc20.toString(), wei: eth.toString() });
@@ -1027,7 +1066,8 @@ export class SwapService {
           if (d.attempts >= this.cfg.maxDepositAttempts) {
             transition(rec, 'failed', this.nowS(), {
               reason: 'deposit-attempts',
-              message: `the deposit was tried ${d.attempts} times without success`,
+              message: `the deposit was tried ${d.attempts} times without success; the funds wait at the deposit address`,
+              recoverable: (d.rearms ?? 0) < this.cfg.maxDepositRearms,
             });
             this.persist(rec);
             return;
@@ -1140,6 +1180,7 @@ export class SwapService {
       transition(rec, 'failed', now, {
         reason: 'deposit-returned-false',
         message: 'the token refused the vault’s transfer: nothing was minted (the funds stay at the deposit address)',
+        recoverable: (d.rearms ?? 0) < this.cfg.maxDepositRearms,
       });
     }
     this.persist(rec);
@@ -1194,7 +1235,6 @@ export class SwapService {
       delete w.error;
       pushStage(w, 'adopted', this.nowS(), { requestId: w.requestId! });
       const to: SwapState = w.kind === 'swap' ? 'withdrawing' : 'bridging_back';
-      if (rec.state === 'taken' && to === 'bridging_back') continue;
       transition(rec, to, this.nowS());
       this.persist(rec);
       this.spawn(rec.swapId, () => this.resumeWithdraw(rec.swapId));

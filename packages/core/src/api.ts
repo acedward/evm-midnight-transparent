@@ -93,6 +93,35 @@ export const HealthResponseSchema = z.object({
         maxPerDay: z.number().int(),
         paused: z.string().nullable(),
       }),
+      /** The sponsorship budget over the last 24 h (audit C6/C7): DUST paid (specks, decimal
+       *  strings; a budget of "0" means none is set), new swaps opened, and the swaps waiting for
+       *  funds against their global cap. `exhausted`: new swaps are refused until it frees. */
+      budget: z
+        .object({
+          dustSpentSpecks24h: z.string(),
+          dustBudgetSpecks24h: z.string(),
+          swapsOpened24h: z.number().int(),
+          unfundedOpen: z.number().int(),
+          unfundedMax: z.number().int(),
+          exhausted: z.boolean(),
+        })
+        .optional(),
+      /** The vault account's nonces this sponsor holds for its open withdrawal requests (audit
+       *  C2/C3): a reservation lasts until its request settles or the nonce is consumed. `stuck`:
+       *  signed but not mined past the stuck threshold (or never signed past the long one), so the
+       *  next withdrawal replaces it; see deploy/RUNBOOK.md for the operator procedure. */
+      reservations: z
+        .array(
+          z.object({
+            nonce: z.string(),
+            swapId: z.string(),
+            signed: z.boolean(),
+            mined: z.boolean(),
+            stuck: z.boolean(),
+            sinceSeconds: z.number().int(),
+          }),
+        )
+        .optional(),
     })
     .optional(),
 });

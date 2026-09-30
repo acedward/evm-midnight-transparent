@@ -84,6 +84,8 @@ export interface SponsorConfig {
     /** An awaiting_funds swap fails after this long without its funds (re-opening resumes it). */
     fundsWaitSeconds: number;
     maxDepositAttempts: number;
+    /** How often a re-open may re-arm a deposit that failed with its funds at the address (audit C5). */
+    maxDepositRearms: number;
     /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
     sweepGasLimits: Record<string, bigint>;
     /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
@@ -303,6 +305,7 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
       fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_SECONDS', 60),
       maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),
+      maxDepositRearms: int(env.DEPOSIT_MAX_REARMS, 3, 'DEPOSIT_MAX_REARMS', 0, 10),
       sweepGasLimits: (() => {
         try {
           return parseSweepGasLimits(str(env.SWEEP_GAS_LIMITS));

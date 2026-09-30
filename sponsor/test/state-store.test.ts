@@ -51,6 +51,8 @@ describe('the state machine', () => {
         'taking->bridging_back',
         'taking->failed',
         'taken->withdrawing',
+        'taken->bridging_back',
+        'taken->minted',
         'taken->failed',
         'withdrawing->done',
         'withdrawing->minted',
@@ -71,11 +73,15 @@ describe('the state machine', () => {
     }
     expect(TRANSITIONS.done).toEqual([]);
     const rec = { state: 'taken' as SwapState, history: [], updatedAt: 0 } as unknown as SwapRecord;
-    expect(() => transition(rec, 'bridging_back', 1)).toThrow(TransitionError);
-    expect(() => transition(rec, 'minted', 1)).toThrow(TransitionError);
-    transition(rec, 'failed', 2, { reason: 'x', message: 'y' });
-    expect(rec).toMatchObject({ state: 'failed', reason: 'x', message: 'y', updatedAt: 2 });
+    expect(() => transition(rec, 'awaiting_funds', 1)).toThrow(TransitionError);
+    expect(() => transition(rec, 'depositing', 1)).toThrow(TransitionError);
+    expect(() => transition(rec, 'done', 1)).toThrow(TransitionError);
+    transition(rec, 'failed', 2, { reason: 'x', message: 'y', recoverable: true });
+    expect(rec).toMatchObject({ state: 'failed', reason: 'x', message: 'y', updatedAt: 2, recoverable: true });
     expect(rec.history).toEqual([{ state: 'failed', at: 2 }]);
+    transition(rec, 'awaiting_funds', 3);
+    expect(rec.recoverable).toBeUndefined();
+    expect(rec.reason).toBeUndefined();
   });
 });
 
