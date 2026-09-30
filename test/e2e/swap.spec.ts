@@ -211,6 +211,6 @@ test('a refunded withdrawal is rebuilt and resubmitted on its own (Q9 A)', async
   await startAskSwap(page);
   await fundSwap(page);
   await expect(page.getByTestId('swap-page')).toHaveAttribute('data-phase', 'done', { timeout: 40_000 });
-  await expect(page.getByTestId('refunds')).toContainText('1 earlier withdrawal was refunded');
+  await expect(page.getByTestId('refunds')).toContainText('1 earlier withdrawal was refunded or could not start');
   await expect(page.locator('[data-testid=all-hashes] [data-name^=refunded-0]')).toHaveCount(3);
 });

@@ -2,7 +2,7 @@
 // sponsor's view merged into the record, what to do next, what to do with the minted coin, and the
 // six stages' states. Expected values are written out by hand.
 
-import { type BookSnapshot, type SwapOffer, swapIdFromSalt } from '@evm-midnight-transparent/core';
+import type { BookSnapshot, SwapOffer } from '@evm-midnight-transparent/core';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -22,7 +22,7 @@ import {
   lastsLongEnough,
   listOffers,
 } from '../src/swap/offers.js';
-import { type SwapRecord, SwapRecordSchema, isResumable } from '../src/swap/record-shape.js';
+import { type SwapRecord, SwapRecordSchema, isResumable, swapIdOf } from '../src/swap/record-shape.js';
 import type { SwapView } from '../src/swap/sponsor-client.js';
 import { registry } from './swap-fixtures.js';
 
@@ -92,7 +92,7 @@ describe('the offers list', () => {
 
 const H = (c: string) => c.repeat(64);
 const SALT = `0x${H('5')}`;
-const SWAP_ID = swapIdFromSalt(SALT);
+const SWAP_ID = swapIdOf(SALT);
 
 function record(patch: Partial<SwapRecord> = {}): SwapRecord {
   return {

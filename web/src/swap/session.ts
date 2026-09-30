@@ -34,7 +34,6 @@ import {
   newSwapSalt,
   recoverStartSwapSigner,
   startSwapTypedData,
-  swapIdFromSalt,
   swapSeedFromSignature,
 } from '@evm-midnight-transparent/core';
 import { getAddress } from 'ethers';
@@ -43,7 +42,7 @@ import { EvmError, type EvmPort, transferData } from './evm.js';
 import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
 import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner } from './ports.js';
-import { SWAP_RECORD_VERSION, type SwapRecord, isFinished, isRecoverable } from './record-shape.js';
+import { SWAP_RECORD_VERSION, type SwapRecord, isFinished, isRecoverable, swapIdOf } from './record-shape.js';
 import {
   type OpenSwapPayload,
   type OpenSwapResponse,
@@ -159,6 +158,8 @@ export class SwapSession {
   private token: string | null = null;
   /** What "Send funds" may send (P4.2-fix C8). */
   private funding: VerifiedFunding | null = null;
+  /** The sponsor raised the sweep gas after the funds were sent: "Send funds" tops the ETH up. */
+  private topUp = false;
   private wallet: TempWallet | null = null;
   private looping = false;
   private closed = false;
@@ -196,7 +197,7 @@ export class SwapSession {
   /** Start a new swap on `offer`. */
   static begin(offer: SwapOffer, deps: SessionDeps): SwapSession {
     const salt = (deps.newSalt ?? (() => newSwapSalt()))().toLowerCase();
-    const s = new SwapSession(salt, swapIdFromSalt(salt), offer, null, deps);
+    const s = new SwapSession(salt, swapIdOf(salt), offer, null, deps);
     void s.start();
     return s;
   }
@@ -488,6 +489,10 @@ export class SwapSession {
       ]);
       const pendingEth = r.funding.eth?.status === 'sent';
       const pendingToken = r.funding.token?.status === 'sent';
+      if (this.topUp && pendingEth && ethThere < ethWei)
+        throw new SessionError(
+          'Your sweep gas transfer is still pending on Sepolia. Press Send funds again once it is confirmed to top it up.',
+        );
       const needEth = !pendingEth && ethThere < ethWei ? ethWei - ethThere : 0n;
       const needToken = !pendingToken && tokenThere < amount ? amount - tokenThere : 0n;
       // C8: before any of the token goes, the offer must still be live with this swap's terms (once
@@ -543,11 +548,32 @@ export class SwapSession {
           updatedAt: this.deps.now(),
         });
       }
+      this.topUp = false;
       this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
       void this.loop();
     } catch (e) {
       this.set({ status: { kind: 'fund', sending: null }, notice: describe(e) });
     }
+  }
+
+  /** The sponsor RAISED the sweep gas while the swap waits for its funds (the live base fee outgrew
+   *  it; never lowered): adopt it, checked as at open (C8), and have "Send funds" top the ETH up. */
+  private adoptRaisedSweep(g: SweepGas): void {
+    const f = this.funding;
+    if (!f) return;
+    const ethWei = BigInt(g.ethWei);
+    if (ethWei <= f.ethWei) return;
+    if (ethWei !== BigInt(g.gasLimit) * BigInt(g.maxFeePerGas) || ethWei > MAX_SWEEP_WEI) {
+      this.set({ notice: 'The sponsor asks for a sweep gas this page will not send. Nothing more was sent.' });
+      return;
+    }
+    this.funding = { ...f, sweepGas: { gasLimit: g.gasLimit, maxFeePerGas: g.maxFeePerGas, ethWei: g.ethWei }, ethWei };
+    this.topUp = true;
+    this.saveRecord({ ...this.record, deposit: this.depositOf(), updatedAt: this.deps.now() });
+    this.set({
+      notice:
+        'The Sepolia gas price rose, so the bridge needs more sweep gas at the deposit address. Press Send funds to top it up.',
+    });
   }
 
   /** Why funding cannot go on right now (mock mode with a real wallet, or the wallet left Sepolia or
@@ -672,6 +698,7 @@ export class SwapSession {
         }
         this.saveRecord(record);
         this.set({ view });
+        if (view.state === 'awaiting_funds' && view.sweepGas) this.adoptRaisedSweep(view.sweepGas);
         // A funding transfer still pending: read its receipt, whatever the sponsor's state.
         if (record.funding.eth?.status === 'sent' || record.funding.token?.status === 'sent')
           await this.checkReceipts();
@@ -692,7 +719,7 @@ export class SwapSession {
           return;
         }
         if (act === 'fund') {
-          if (this.fundingSent(this.record))
+          if (this.fundingSent(this.record) && !this.topUp)
             this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
           else if (this.snap.status.kind !== 'fund') this.status({ kind: 'fund', sending: null });
         } else if (act === 'wait') {

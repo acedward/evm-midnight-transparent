@@ -14,13 +14,14 @@
 // the page reads them through core's and the wallet's clients, which parse them strictly
 // (web/test/sponsor-client.test.ts checks every answer against core's schemas).
 //
-// And the real sponsor's SEMANTICS (P4.2-fix C1: the mock once counted a refund on the refunded
-// withdrawal itself, which the real sponsor does not, and so the page's specs passed while the page
-// waited forever against the real one): `withdraw.refunds` = the refunds BEFORE the current
-// withdrawal; `withdrawals` = every attempt; `withdrawal = {attempts, last, retry}` says how the
-// latest one ended and whether the page must rebuild; a start that fails after `/withdraw` accepted
-// it (`failFirstStart`) goes back to `minted` with stage `failed`; and a failure can be
-// `recoverable` (C5: a re-open revives it, as the real sponsor revives `funds-not-received`).
+// And the real sponsor's SEMANTICS as the P4.2-fix pass left them (plan "Lane contracts", FS on the
+// fix pass; the audit's C1: the page once waited forever against the real sponsor while these specs
+// passed): `withdrawals` = every attempt; `withdraw.refunds` = the refunded withdrawals up to and
+// including the current one; `withdrawal = {attempts, last, retry}` says how the latest one ended
+// and whether the page must rebuild; a start that fails after `/withdraw` accepted it
+// (`failFirstStart`) goes back to `minted` with stage `failed` and no refund at all (the case the
+// page's counters never saw); a failure can be `recoverable` (C5: a re-open revives it); and the
+// sweep gas may RISE while the swap waits for its funds (`raiseSweepGas`: the page tops up).
 
 import {
   SEPOLIA_CHAIN_ID,
@@ -83,7 +84,7 @@ export interface MockSwap {
   stale: number;
   /** The earlier withdrawals' views (every attempt stays in `withdrawals`, as the real sponsor's). */
   earlier?: NonNullable<SwapView['withdraw']>[];
-  /** Withdrawals refunded so far (the next one's `refunds`, as the real sponsor counts). */
+  /** Withdrawals refunded so far (every `refunds` counts up to and including its own withdrawal). */
   refunded?: number;
   /** How the latest withdrawal ended without a transfer, or null. */
   lastEnding?: 'refunded' | 'start-failed' | 'stale-vault' | null;
@@ -309,7 +310,7 @@ export class MockSponsor {
       ...(w.startTx ? { startTx: w.startTx } : {}),
       ...(w.sepoliaTx ? { sepoliaTx: w.sepoliaTx } : {}),
       ...(w.completeTx ? { completeTx: w.completeTx } : {}),
-      // As the real sponsor: the refunds BEFORE this withdrawal.
+      // As the real sponsor: the refunded withdrawals up to and including this one.
       refunds: w.refunds ?? 0,
     });
     const withdraw = v.withdraw ? wire(v.withdraw) : null;
@@ -458,6 +459,20 @@ export class MockSponsor {
     return json({ swap: this.wireView(s) });
   }
 
+  /** The live base fee outgrew the sweep gas of every swap still waiting for its funds: raise it
+   *  (never lower it), as the real sponsor does (FS C2); the page tops the deposit address up. */
+  raiseSweepGas(): void {
+    for (const s of this.swaps.values()) {
+      if (s.view.state !== 'awaiting_funds') continue;
+      const maxFeePerGas = BigInt(s.sweepGas.maxFeePerGas) * 2n;
+      s.sweepGas = {
+        ...s.sweepGas,
+        maxFeePerGas: maxFeePerGas.toString(),
+        ethWei: (BigInt(s.sweepGas.gasLimit) * maxFeePerGas).toString(),
+      };
+    }
+  }
+
   /** Fail every swap still waiting for its funds (the real sponsor's `funds-not-received` after its
    *  funding window), recoverable or not (C5). */
   failAwaitingFunds(recoverable: boolean): void {
@@ -553,15 +568,17 @@ export class MockSponsor {
       if (next === undefined) {
         if (s.script === 'refund' || s.script === 'failStart') {
           // Refunded to the temporary wallet, or the start never landed (the coin was never spent):
-          // back to `minted` with `withdrawal.retry`; the app rebuilds and retries. As the real
-          // sponsor: the refunded withdrawal's own `refunds` is NOT incremented (it counts the ones
-          // before it); the next withdrawal's is.
+          // back to `minted` with `withdrawal.retry`; the app rebuilds and retries. A refund counts
+          // itself in `refunds`; a failed start is no refund.
           chain.mint(
             s.payload.tempCoinPk,
             w.colour!,
             BigInt(w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount),
           );
-          if (s.script === 'refund') s.refunded = (s.refunded ?? 0) + 1;
+          if (s.script === 'refund') {
+            s.refunded = (s.refunded ?? 0) + 1;
+            w.refunds = s.refunded;
+          }
           s.lastEnding = s.script === 'refund' ? 'refunded' : 'start-failed';
           s.script = null;
           v.state = 'minted';

@@ -15,11 +15,15 @@
 // `recoverable` on a failed swap the sponsor can revive (C5). A version-1 record (written before:
 // its id IS its salt, derivation 1) is read as a legacy version 2 and still resumes.
 
-import { swapIdFromSalt } from '@evm-midnight-transparent/core';
+import { publicSwapId } from '@evm-midnight-transparent/core';
 import { z } from 'zod';
 
 /** The record format's version (inside the store's own schema version 1). */
 export const SWAP_RECORD_VERSION = 2;
+
+/** The swap's PUBLIC id as the page writes it (0x + 64 hex): core's `publicSwapId(salt)`, the
+ *  keccak256 of "evm-midnight-swap/id" and the salt (P4.2-fix C14). */
+export const swapIdOf = (salt: string): string => `0x${publicSwapId(salt)}`;
 
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 const swapId = z.string().regex(/^0x[0-9a-f]{64}$/);
@@ -76,7 +80,7 @@ export type SwapPhase = (typeof SWAP_PHASES)[number];
 const SwapRecordV2 = z
   .object({
     v: z.literal(SWAP_RECORD_VERSION),
-    /** The swap's PUBLIC id, the one the sponsor knows it by: `swapIdFromSalt(salt)` (a legacy
+    /** The swap's PUBLIC id, the one the sponsor knows it by: `swapIdOf(salt)` (a legacy
      *  derivation-1 record: the salt itself). */
     swapId,
     /** The "start swap" salt: 32 random bytes. LOCAL ONLY: never sent, never in a URL or a log. */
@@ -162,7 +166,7 @@ const SwapRecordV2 = z
   .strict()
   .superRefine((r, ctx) => {
     // The id is the salt's (derivation 2), or the salt itself (a legacy derivation-1 record).
-    const want = r.derivation === 1 ? r.salt : swapIdFromSalt(r.salt);
+    const want = r.derivation === 1 ? r.salt : swapIdOf(r.salt);
     if (r.swapId !== want) ctx.addIssue({ code: 'custom', message: "the swap id is not its salt's", path: ['swapId'] });
   });
 

@@ -1,10 +1,9 @@
 // The swap record in the browser store: its strict shape (no secret field fits), the store helpers,
 // and Import accepting only swap records this page writes, filed under their own swap and wallet.
 
-import { swapIdFromSalt } from '@evm-midnight-transparent/core';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { SwapRecordSchema, type SwapRecord } from '../src/swap/record-shape.js';
+import { SwapRecordSchema, type SwapRecord, swapIdOf } from '../src/swap/record-shape.js';
 import { SwapRecordError, readSwapRecord, readSwapRecords, saveSwapRecord } from '../src/swap/records.js';
 import { EXPORT_FORMAT, EXPORT_FORMAT_VERSION, encodeRecord, recordKey } from '../src/store/schema.js';
 import { ImportError, LocalStore } from '../src/store/store.js';
@@ -14,7 +13,7 @@ const H = (c: string) => c.repeat(64);
 const ME = '0x484738A67858305Edfc139B194Ed430Fe4D8e56b';
 const scope = { network: 'stagenet', evmAddress: ME };
 /** A swap's public id from its salt `0x<c…c>` (P4.2-fix C14), and the store key's id (no 0x). */
-const idOf = (c: string) => swapIdFromSalt(`0x${H(c)}`);
+const idOf = (c: string) => swapIdOf(`0x${H(c)}`);
 const keyId = (c: string) => idOf(c).slice(2);
 
 function rec(id: string, createdAt: number, patch: Partial<SwapRecord> = {}): SwapRecord {

@@ -28,7 +28,7 @@ import {
   OPEN_SWAP_ACTION,
   SponsorApiError,
   SponsorClient,
-  WITHDRAWAL_ENDINGS,
+  WITHDRAWAL_LAST,
   payloadHash,
   sponsorActionTypedData,
   type NonceResponse,
@@ -93,6 +93,9 @@ const LegProgressSchema = z.object({
   refunds: z.number().int().nonnegative().optional(),
 });
 
+export const SweepGasSchema = z.object({ gasLimit: decimal, maxFeePerGas: decimal, ethWei: decimal });
+export type SweepGas = z.infer<typeof SweepGasSchema>;
+
 /** `GET /v1/swaps/:id` (L-WEB's reading, item 4). */
 const SwapViewShape = z.object({
   /** The sponsor answers the id without 0x (core `SwapIdSchema`); the page keeps it with. */
@@ -104,12 +107,14 @@ const SwapViewShape = z.object({
   deposit: LegProgressSchema.optional(),
   takeTx: optText,
   withdraw: LegProgressSchema.optional(),
+  /** The sweep gas: it may RISE while the swap waits for its funds (FS's C2); the page tops up. */
+  sweepGas: SweepGasSchema.optional(),
   /** P4.2-fix C1: the latest withdrawal's ending and whether the page must rebuild it (`last`
    *  absent = null: the sponsor's nulls are dropped). An older sponsor sends none. */
   withdrawal: z
     .object({
       attempts: z.number().int().nonnegative(),
-      last: z.enum(WITHDRAWAL_ENDINGS).optional(),
+      last: z.enum(WITHDRAWAL_LAST).optional(),
       retry: z.boolean(),
     })
     .optional(),
@@ -122,9 +127,6 @@ const SwapViewShape = z.object({
 });
 export type SwapView = z.infer<typeof SwapViewShape>;
 export const SwapViewSchema = z.preprocess(dropNulls, SwapViewShape);
-
-export const SweepGasSchema = z.object({ gasLimit: decimal, maxFeePerGas: decimal, ethWei: decimal });
-export type SweepGas = z.infer<typeof SweepGasSchema>;
 
 export const OpenSwapResponseSchema = z.object({
   swapToken: z.string().min(16).max(512),

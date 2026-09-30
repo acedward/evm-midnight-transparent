@@ -14,7 +14,7 @@ import {
   type PillStatus,
 } from '../../design/index.js';
 import { dateText, legText } from '../../swap/display.js';
-import { type SwapRecord, isFinished } from '../../swap/record-shape.js';
+import { type SwapRecord, isRecoverable, isResumable } from '../../swap/record-shape.js';
 import { useSwap } from '../../swap/SwapContext.js';
 
 const PHASE_TEXT: Record<SwapRecord['phase'], string> = {
@@ -50,8 +50,13 @@ export function YourSwaps() {
       >
         {records.map((r) => {
           const s = session(r.swapId);
-          const running = !!s && !s.isClosed;
-          const text = r.outcome === 'bridged-back' ? 'Bridged back' : PHASE_TEXT[r.phase];
+          const running = !!s && !s.isClosed && !s.isStuck;
+          const text =
+            r.outcome === 'bridged-back'
+              ? 'Bridged back'
+              : isRecoverable(r)
+                ? 'Failed: can be resumed'
+                : PHASE_TEXT[r.phase];
           return (
             <tr key={r.swapId} data-testid="swap-record" data-swap-id={r.swapId} data-phase={r.phase}>
               <Cell block>
@@ -72,7 +77,7 @@ export function YourSwaps() {
                 {dateText(r.createdAt)}
               </Cell>
               <Cell label="" align="right">
-                {!isFinished(r) && !running ? (
+                {isResumable(r) && !running ? (
                   <Button
                     size="small"
                     data-testid="record-resume"
@@ -95,7 +100,8 @@ export function YourSwaps() {
         })}
       </StatementTable>
       <p className="table-note">
-        These records hold no key. To continue a swap in another browser, export them under{' '}
+        These records hold no key. Each holds its swap&apos;s salt, which Resume needs: keep an export private, and only
+        sign a swap&apos;s start message in this app. To continue a swap in another browser, export them under{' '}
         <a href="#local">Local data</a>.
       </p>
     </Panel>

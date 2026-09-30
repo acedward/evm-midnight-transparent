@@ -17,7 +17,8 @@
 #   run-live.sh phase <e2|e3> <offerId> [import]   the Playwright phase, in the web container's
 #                                         network namespace (the site is http://127.0.0.1:8080); e2 with
 #                                         an export file (in the state directory) continues that swap
-#   run-live.sh temp-check <swapId> <name>   the swap's temporary wallet, re-derived in-process
+#   run-live.sh temp-check <salt> <name> [derivation]   the swap's temporary wallet, re-derived in-process
+#                                            (the record's salt and derivation; P3's swaps: salt = id, 1)
 #   run-live.sh competitor-fund <offerId> E.3: the G-TAKE gate's `fund` for a competitor wallet
 #                                         (derived from the test EVM key with its own salt; the
 #                                         funding wallet sends exactly the offer's wanted amount).
@@ -320,13 +321,14 @@ PY
     ;;
 
   temp-check)
-    swap="${1:?swapId}"
+    salt="${1:?salt}"
     name="${2:-temp-check}"
+    derivation="${3:-2}"
     sync_tree >/dev/null
     docker run --rm --name "$P-temp-check" --init -v "$CHECK-app:/app" -v "$CHECK-bun:/opt/bun:ro" \
       -v "$SEPOLIA_FILE:/secrets/sepolia:ro" -v "$EVIDENCE:/evidence" \
       -e LIVE_KEY_FILE=/secrets/sepolia -e LIVE_OUT_DIR=/evidence -w /app "$RUNNER_IMAGE" \
-      /opt/bun/bun test/live/temp-check.ts "$swap" "$name"
+      /opt/bun/bun test/live/temp-check.ts "$salt" "$name" "$derivation"
     ;;
 
   competitor-fund)

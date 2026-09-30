@@ -14,7 +14,7 @@
 //                 resume all land on the right step;
 //   stageStates   the six stages the page shows, and which one is current.
 
-import type { WithdrawalSignal } from '@evm-midnight-transparent/core';
+import type { WithdrawalLast } from '@evm-midnight-transparent/core';
 
 import type { SwapPhase, SwapRecord } from './record-shape.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
@@ -67,16 +67,17 @@ export interface WithdrawalStatus {
   /** The page must build a withdrawal now (none yet, or the latest ended without a transfer). */
   rebuild: boolean;
   /** How the latest one ended, when it ended without a transfer. */
-  last: WithdrawalSignal['last'];
+  last: WithdrawalLast | null;
 }
 
-const ENDED_STAGES: Readonly<Record<string, WithdrawalSignal['last']>> = {
+const ENDED_STAGES: Readonly<Record<string, WithdrawalLast>> = {
   refunded: 'refunded',
   failed: 'start-failed',
 };
 
-/** The sponsor's word on the withdrawals (P4.2-fix C1). Never the page's own counters: the real
- *  sponsor's `withdraw.refunds` counts the refunds BEFORE the latest attempt (the audit's F-A1). */
+/** The sponsor's word on the withdrawals (P4.2-fix C1). Never the page's own counters: they missed
+ *  every failed start, and the sponsor's `withdraw.refunds` once counted only the refunds BEFORE the
+ *  latest attempt (the audit's F-A1). */
 export function withdrawalStatus(view: SwapView): WithdrawalStatus {
   const s = view.withdrawal;
   if (s) {
@@ -84,7 +85,8 @@ export function withdrawalStatus(view: SwapView): WithdrawalStatus {
     const ended = s.attempts > 0 ? s.attempts - (last === null ? 1 : 0) : 0;
     return { ended, rebuild: s.retry || s.attempts === 0, last };
   }
-  // A sponsor without the signal: the latest withdrawal's stage says whether it ended.
+  // A sponsor without the signal (before P4.2-fix, whose `refunds` counted the refunds BEFORE the
+  // withdrawal): the latest withdrawal's stage says whether it ended.
   const w = view.withdraw;
   if (!w) return { ended: 0, rebuild: true, last: null };
   const last = ENDED_STAGES[w.stage ?? ''] ?? null;

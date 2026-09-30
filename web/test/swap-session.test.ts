@@ -3,17 +3,13 @@
 // after the tab closed, and the page's refusals (a deposit address it did not compute, an offer that
 // is gone, not enough funds). The records it writes hold no secret and survive Export/Import.
 
-import {
-  KernelClient,
-  START_SWAP_PURPOSE_V2,
-  swapIdFromSalt,
-  swapSeedFromSignature,
-} from '@evm-midnight-transparent/core';
+import { KernelClient, START_SWAP_PURPOSE_V2, swapSeedFromSignature } from '@evm-midnight-transparent/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { transferData } from '../src/swap/evm.js';
 import { MockChain } from '../src/swap/mock/chain.js';
 import type { MockEnvironment } from '../src/swap/mock/index.js';
+import { swapIdOf } from '../src/swap/record-shape.js';
 import { readSwapRecords, saveSwapRecord } from '../src/swap/records.js';
 import { type SessionDeps, SwapSession } from '../src/swap/session.js';
 import { LocalStore } from '../src/store/store.js';
@@ -461,14 +457,13 @@ describe('P4.2-fix C1: a withdrawal that ended without a transfer, against the r
     expect(env.sponsor.requests.filter((q) => q.path.endsWith('/withdraw')).length).toBe(2);
   });
 
-  it('a refund: the mock counts refunds as the real sponsor does (before the withdrawal), and the page still retries', async () => {
+  it('a refund: the page retries from the sponsor signal, whatever `refunds` counts', async () => {
     env = mockEnv({ scenario: { refundFirstWithdrawal: true } });
     const offer = await askOffer(env);
     const signer = testSigner();
     const s = track(SwapSession.begin(offer, deps(signer, new FakeSepolia(signer.address))));
     await waitFor(() => statusOf(s).kind === 'fund', 5_000);
     await s.sendFunds();
-    // Right after the refund the sponsor's view has refunds 0 on the refunded withdrawal and the signal.
     await waitFor(
       () => (env.sponsor.views()[0]?.withdraw?.stage === 'refunded' ? true : statusOf(s).kind === 'done'),
       15_000,
@@ -572,6 +567,57 @@ describe('P4.2-fix C8: Send funds uses only the sponsor answer, checked, never t
     expect(evm.sent).toEqual([]);
     expect(s.getSnapshot().notice).toMatch(/no longer live/);
     expect(statusOf(s)).toEqual({ kind: 'fund', sending: null });
+  });
+});
+
+describe('P4.2-fix C8 with FS C2: a sweep gas the sponsor raises while it waits for the funds', () => {
+  it('is adopted (checked, never lowered) and Send funds tops the ETH up: no token twice', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address, { tokens: { USDC: 1_040_000n } });
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    env.controls.raiseSweepGas(); // before the page funds: it sends the raised amount at once
+    await waitFor(() => BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei) === first * 2n, 5_000, 'the raise');
+    await s.sendFunds();
+    expect(evm.sent.map((t) => t.value ?? 0n)).toEqual([first * 2n, 0n]);
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap');
+  });
+
+  it('after the funds went: the fund step comes back and only the missing ETH is sent', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    // The sponsor has not seen the funds yet: hold its watch by hiding the deposit address's ETH.
+    env.setEvmReader({ ethBalance: async () => 0n, erc20Balance: async () => 0n });
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    await s.sendFunds();
+    expect(evm.sent).toHaveLength(2);
+    env.controls.raiseSweepGas();
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000, 'the fund step again');
+    expect(s.getSnapshot().notice).toMatch(/gas price rose/);
+    env.setEvmReader(evm);
+    await s.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([first, 'token', first]);
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap');
+  });
+
+  it('a sweep gas above what the page sends, or not gasLimit x maxFeePerGas, is refused', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const before = s.getSnapshot().record!.deposit.sweepGas;
+    for (let i = 0; i < 7; i++) env.controls.raiseSweepGas(); // 2^7 × 0.0001625 ETH > the page's 0.003 cap
+    await waitFor(() => /will not send/.test(s.getSnapshot().notice ?? ''), 5_000, 'the refusal');
+    expect(s.getSnapshot().record!.deposit.sweepGas).toEqual(before);
   });
 });
 
@@ -701,7 +747,7 @@ describe('P4.2-fix C14 and F-A14: the salt stays in the page, the seed is not ke
     await s.sendFunds();
     await waitFor(() => statusOf(s).kind === 'done', 10_000);
 
-    const id = swapIdFromSalt(salt);
+    const id = swapIdOf(salt);
     expect(s.getSnapshot().swapId).toBe(id);
     const r = s.getSnapshot().record!;
     expect(r).toMatchObject({ v: 2, swapId: id, salt, derivation: 2 });
