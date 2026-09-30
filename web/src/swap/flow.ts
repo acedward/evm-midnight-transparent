@@ -13,10 +13,16 @@
 //                 from the state's name, so a refund (back to `minted`, Q9 A), a failed start and a
 //                 resume all land on the right step;
 //   stageStates   the six stages the page shows, and which one is current.
+//
+// A PARTIAL deposit (P4.2-fix3 S2, ./partial.ts; the sponsor's state `partial`: part of the pay
+// amount minted to the temporary wallet, the rest still at the deposit address) is its own next
+// action: the user chooses "Wait for the rest" or "Bridge back" what arrived; the page never waits
+// for it silently, and never sends the token again.
 
 import type { WithdrawalLast } from '@evm-midnight-transparent/core';
 
 import { clockText } from './display.js';
+import { bridgeBackAmount, partialOf, partialRecord } from './partial.js';
 
 import type { SwapPhase, SwapRecord } from './record-shape.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
@@ -45,6 +51,9 @@ function phaseFor(record: SwapRecord, view: SwapView): SwapPhase {
       return 'funding';
     case 'depositing':
       return 'bridging-in';
+    case 'partial':
+      // S2: part of the funds is in the temporary wallet; the rest bridges in, or it all goes back.
+      return record.choice === 'bridge-back' ? 'bridging-back' : 'bridging-in';
     case 'minted':
     case 'taking':
     case 'taken':
@@ -77,6 +86,10 @@ const ENDED_STAGES: Readonly<Record<string, WithdrawalLast>> = {
   failed: 'start-failed',
 };
 
+/** A withdrawal that moved the funds and is closed (the real sponsor's `completed`, the mock's
+ *  `settled`). */
+const SETTLED_STAGES = new Set(['completed', 'settled']);
+
 /** The sponsor's word on the withdrawals (P4.2-fix C1). Never the page's own counters: they missed
  *  every failed start, and the sponsor's `withdraw.refunds` once counted only the refunds BEFORE the
  *  latest attempt (the audit's F-A1). */
@@ -84,8 +97,17 @@ export function withdrawalStatus(view: SwapView): WithdrawalStatus {
   const s = view.withdrawal;
   if (s) {
     const last = s.last ?? null;
-    const ended = s.attempts > 0 ? s.attempts - (last === null ? 1 : 0) : 0;
-    return { ended, rebuild: s.retry || s.attempts === 0, last };
+    // Every attempt but a running or settled latest one ended without a transfer, except an EARLIER
+    // one that settled: a Bridge back of a partial deposit is followed by another one for the rest
+    // (P4.2-fix3 S2); the sponsor's `withdrawals` list names them.
+    const settledEarlier = (view.withdrawals ?? [])
+      .slice(0, -1)
+      .filter((w) => SETTLED_STAGES.has(w.stage ?? '')).length;
+    const ended = s.attempts > 0 ? Math.max(0, s.attempts - (last === null ? 1 : 0) - settledEarlier) : 0;
+    // In `partial` no withdrawal runs (a running one is `bridging_back`): after a settled Bridge back
+    // of what arrived, the next part is bridged back too (S2).
+    const nextPart = view.state === 'partial' && last === null && SETTLED_STAGES.has(view.withdraw?.stage ?? '');
+    return { ended, rebuild: s.retry || s.attempts === 0 || nextPart, last };
   }
   // A sponsor without the signal (before P4.2-fix, whose `refunds` counted the refunds BEFORE the
   // withdrawal): the latest withdrawal's stage says whether it ended.
@@ -143,8 +165,18 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
 
   const take =
     view.takeTx && !record.take.tx && HASH.test(view.takeTx) ? { ...record.take, tx: view.takeTx } : record.take;
-  const phase = phaseFor({ ...record, take }, view);
-  const next: SwapRecord = { ...record, bridgeIn, bridgeOut, take, phase, updatedAt: now };
+  // S2: a partial deposit, as the sponsor reports it now (on `partial`). Once the sponsor says the
+  // temporary wallet holds the whole amount (`minted` and on: the rest arrived) it is over; while
+  // the rest bridges in, while a Bridge back of what arrived runs, and after it, the last report
+  // stays on the record (the page says what came back and what stayed).
+  const reported = partialRecord(record, view);
+  const whole = ['minted', 'taking', 'taken', 'withdrawing'].includes(view.state);
+  const partial = reported ?? (whole ? undefined : record.partial);
+  const base: SwapRecord = { ...record, bridgeIn, bridgeOut, take };
+  if (partial) base.partial = partial;
+  else delete base.partial;
+  const phase = phaseFor(base, view);
+  const next: SwapRecord = { ...base, phase, updatedAt: now };
   if (view.state === 'done')
     next.outcome = view.outcome ?? (record.choice === 'bridge-back' ? 'bridged-back' : 'swapped');
   if (view.state === 'failed') {
@@ -172,6 +204,9 @@ export function revivalNote(view: SwapView, now: number): string | null {
 export type NextAction =
   /** The sponsor waits for the funds: the page offers "Send funds" (or waits for its receipts). */
   | 'fund'
+  /** A partial deposit (S2): the user chooses "Wait for the rest" or "Bridge back" what arrived; while
+   *  the rest is awaited, only the sweep ETH may be topped up (never the token). */
+  | 'partial'
   /** The sponsor is working (bridge-in, or a withdrawal): poll again. */
   | 'wait'
   /** The coin is minted: read the temporary wallet (`afterMint`). */
@@ -184,6 +219,13 @@ export function nextAction(record: SwapRecord, view: SwapView): NextAction {
   switch (view.state) {
     case 'awaiting_funds':
       return 'fund';
+    case 'partial': {
+      // S2: the user chose to bridge back what arrived, and the temporary wallet holds some of it:
+      // build that withdrawal. Otherwise the choice, or the wait for the rest.
+      const p = partialOf(view, BigInt(record.offer.pay.amount));
+      if (p?.canBridgeBack && record.choice === 'bridge-back') return 'after-mint';
+      return 'partial';
+    }
     case 'depositing':
     case 'withdrawing':
     case 'bridging_back':
@@ -219,6 +261,11 @@ export function afterMint(
   const receiveHeld = held(record.offer.receive.colour) >= BigInt(record.offer.receive.amount);
   const payHeld = held(record.offer.pay.colour) >= BigInt(record.offer.pay.amount);
   if (!withdrawal.rebuild) return 'wait-withdrawal';
+  // S2: Bridge back of a partial deposit: what the temporary wallet received, once it shows there.
+  if (record.partial && record.choice === 'bridge-back') {
+    const amount = bridgeBackAmount(record);
+    return amount > 0n && held(record.offer.pay.colour) >= amount ? 'withdraw-pay' : 'wait-coin';
+  }
   if (receiveHeld) return 'withdraw-receive';
   if (payHeld) {
     if (record.choice === 'bridge-back') return 'withdraw-pay';
@@ -301,6 +348,9 @@ export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Reado
     abandoning: 'The sweep did not happen: closing the request',
     abandoned: 'The sweep did not happen: the deposit will be retried',
     'completed-foreign': 'Another request swept the deposit address: the sponsor completed it',
+    // P4.2-fix3 S2 (FS3 item 8): part of the pay amount reached the temporary wallet.
+    partial: 'Part of your deposit reached the temporary wallet',
+    'rearm-wait': 'Waiting to start the deposit of the rest (the sponsor paces them)',
     closed: 'Deposit request closed',
   },
   withdraw: {

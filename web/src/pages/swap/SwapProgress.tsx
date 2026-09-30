@@ -1,6 +1,7 @@
 // One swap's page: six stages with every hash as it lands (spec US1), "Swap is not available" with
-// Bridge back (Q6), the determinism warning (Q4), refund retries (Q9 A), and Resume for a swap that
-// is not running in this tab (US2.2).
+// Bridge back (Q6), the determinism warning (Q4), refund retries (Q9 A), Resume for a swap that is
+// not running in this tab (US2.2), and a PARTIAL deposit (P4.2-fix3 S2): what arrived, what is
+// missing, "Wait for the rest" or "Bridge back" what arrived.
 
 import type { NetworkProfile } from '@evm-midnight-transparent/core';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -23,6 +24,7 @@ import { amountText, clockText, elapsedText, ethText, legText } from '../../swap
 import { type StageKey, bridgeInStartedAt, stageStates, stageTitle } from '../../swap/flow.js';
 import { bridgeRequestUrl, midnightTxUrl, sepoliaAddressUrl, sepoliaTxUrl } from '../../swap/links.js';
 import { BRIDGE_IN_ESTIMATE_MIN } from '../../swap/offers.js';
+import { partialOf } from '../../swap/partial.js';
 import { type SwapRecord, isFinished, isResumable } from '../../swap/record-shape.js';
 import type { SessionSnapshot, SessionStatus, SwapSession } from '../../swap/session.js';
 import { useSession, useSwap } from '../../swap/SwapContext.js';
@@ -109,6 +111,8 @@ function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): st
     case 'opening':
       return 'Opening the swap with the sponsor…';
     case 'fund':
+      // S2: on a partial deposit only the sweep gas is ever asked for (never the token again).
+      if (record?.partial && !s.sending) return 'Top up the sweep gas: the bridge needs it to bring in the rest.';
       return s.sending === 'confirming'
         ? 'Waiting for the sweep gas transfer to be confirmed on Sepolia before the token transfer.'
         : s.sending
@@ -118,6 +122,8 @@ function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): st
       return `${s.what}…`;
     case 'unavailable':
       return 'Swap is not available.';
+    case 'partial':
+      return 'Only part of your deposit reached the temporary wallet: choose below.';
     case 'done':
       return record?.outcome === 'bridged-back' ? 'Bridged back.' : 'Done.';
     case 'error':
@@ -241,6 +247,11 @@ export function SwapProgress({ swapId }: { swapId: string }) {
   const resumable = !!record && isResumable(record);
   const unavailable = record?.phase === 'unavailable';
   const back = record?.choice === 'bridge-back';
+  // P4.2-fix3 S2: part of the pay amount is in the temporary wallet, the rest at the deposit address.
+  const partial = record?.partial ?? null;
+  const partialOpen = !!partial && !back && !finished;
+  // The sponsor's live report (its options, the deposit address's balance, a paced start).
+  const live = record && snap?.view ? partialOf(snap.view, BigInt(record.offer.pay.amount)) : null;
 
   const startDetail = (
     <>
@@ -340,7 +351,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           {fundingPaused}
         </p>
       )}
-      {status?.kind === 'fund' && (
+      {status?.kind === 'fund' && !partial && (
         <ButtonRow stretch>
           <Button
             data-testid="send-funds"
@@ -363,6 +374,109 @@ export function SwapProgress({ swapId }: { swapId: string }) {
   );
 
   const inStart = record ? bridgeInStartedAt(record) : undefined;
+  const payPart = (amount: string) => (record ? legText({ ...record.offer.pay, amount }) : '');
+  const topUp = status?.kind === 'fund' && (
+    <ButtonRow className="gap-top">
+      <Button
+        data-testid="partial-top-up"
+        disabled={fundStatus !== null || fundingPaused !== null}
+        onClick={() => void session?.sendFunds()}
+      >
+        {fundStatus === 'eth' ? 'Confirm the sweep gas in your wallet…' : 'Top up the sweep gas'}
+      </Button>
+    </ButtonRow>
+  );
+  const partialDetail = record && partial && partialOpen && (
+    <Notice
+      tone="warning"
+      title="Only part of your deposit arrived."
+      data-testid="partial-deposit"
+      data-wait={partial.wait ? 'yes' : 'no'}
+      className="gap-top"
+    >
+      Another bridge request for this swap swept part of the deposit address before the sponsor&apos;s own (anyone can
+      start one), so the bridge minted only that part. Your tokens are safe, and nothing is sent from your wallet unless
+      you press a button here.
+      <ul className="tx-list gap-top">
+        <li className="tx-line" data-testid="partial-arrived">
+          <span className="tx-label">In the temporary Midnight wallet</span>{' '}
+          <strong className="num">{payPart(partial.minted)}</strong>
+        </li>
+        <li className="tx-line" data-testid="partial-missing">
+          <span className="tx-label">Still to bridge in from the deposit address</span>{' '}
+          <strong className="num">{payPart(partial.remaining)}</strong>
+          {live?.atAddress !== null && live?.atAddress !== undefined && (
+            <span className="sub multiline" data-testid="partial-at-address">
+              The deposit address held {payPart(live.atAddress.toString())} when the sponsor last looked.
+            </span>
+          )}
+        </li>
+      </ul>
+      {partial.wait ? (
+        <p className="gap-top" data-testid="partial-waiting">
+          <strong>Waiting for the rest.</strong> The sponsor bridges the remaining {payPart(partial.remaining)} in from
+          the deposit address by itself (about {BRIDGE_IN_ESTIMATE_MIN} minutes once it starts
+          {live?.retryAt ? `; it starts from ${clockText(live.retryAt)}` : ''}), then the swap goes on. Your{' '}
+          {record.offer.pay.symbol} is not sent again.
+        </p>
+      ) : (
+        live?.canWait !== false && (
+          <p className="gap-top">
+            <strong>Wait for the rest</strong>: the sponsor bridges the remaining {payPart(partial.remaining)} in from
+            the deposit address by itself, then the swap goes on. Your {record.offer.pay.symbol} is not sent again; if
+            the deposit address lacks sweep gas, you are asked to top up the ETH only.
+          </p>
+        )
+      )}
+      <p className="small">
+        <strong>Bridge back</strong> returns the {payPart(partial.minted)} in the temporary wallet to your address on
+        Sepolia now. The swap does not happen: the remaining {payPart(partial.remaining)} at the deposit address is then
+        bridged into the temporary wallet (you may be asked to top up the sweep gas) and back to you too. This page
+        never sends your {record.offer.pay.symbol} again.
+      </p>
+      {topUp}
+      {running && snap?.view && !live ? (
+        <p className="gap-top" data-testid="partial-rest-running">
+          The sponsor is bridging in the rest from the deposit address.
+        </p>
+      ) : (
+        <ButtonRow className="gap-top">
+          {!partial.wait && live?.canWait !== false && (
+            <Button
+              data-testid="partial-wait"
+              disabled={status?.kind !== 'partial' || !live?.canWait}
+              onClick={() => session?.waitForRest()}
+            >
+              Wait for the rest
+            </Button>
+          )}
+          <Button
+            data-testid="partial-bridge-back"
+            disabled={!session?.partialChoiceOpen}
+            onClick={() => session?.bridgeBack()}
+          >
+            Bridge back {payPart(partial.minted)}
+          </Button>
+        </ButtonRow>
+      )}
+      {!running && <p className="small">Resume the swap first (above).</p>}
+    </Notice>
+  );
+  // S2 after "Bridge back": what came back, and the rest on its way in to be bridged back too.
+  const partialBackDetail = record && partial && back && !finished && (
+    <Notice tone="info" className="gap-top" data-testid="partial-back">
+      Only part of your deposit arrived, and you chose to bridge it back.{' '}
+      {partial.minted === '0' ? (
+        <>
+          The part that arrived is on its way back. The remaining {payPart(partial.remaining)} at the deposit address is
+          bridged into the temporary wallet first, then back to you. Your {record.offer.pay.symbol} is not sent again.
+        </>
+      ) : (
+        <>{payPart(partial.minted)} is being bridged back from the temporary wallet.</>
+      )}
+      {topUp}
+    </Notice>
+  );
   const bridgeInDetail = record && (
     <>
       <p className="small">
@@ -378,6 +492,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           </>
         ) : null}
       </p>
+      {partialDetail}
       <SubStages stages={record.bridgeIn.stages} testId="bridge-in-stages" leg="deposit" />
       <ul className="tx-list">
         <TxLine name="request" label="Request" hash={record.bridgeIn.requestId} kind="request" network={network} />
@@ -408,7 +523,13 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           {!running && <p className="small">Resume the swap first (above).</p>}
         </Notice>
       )}
-      {back && !unavailable && <p>The offer was not available; you chose to bridge your tokens back.</p>}
+      {back && !unavailable && (
+        <p>
+          {partial
+            ? 'Only part of your deposit arrived; you chose to bridge back what arrived.'
+            : 'The offer was not available; you chose to bridge your tokens back.'}
+        </p>
+      )}
       {status?.kind === 'working' && record.phase === 'taking' && <p>{status.what}…</p>}
       {!unavailable && !back && <p className="small">Taken through the exchange, which pays the fee.</p>}
       <ul className="tx-list">
@@ -417,14 +538,22 @@ export function SwapProgress({ swapId }: { swapId: string }) {
     </>
   );
 
-  const outLeg = record ? (back ? record.offer.pay : record.offer.receive) : null;
+  // A Bridge back of a partial deposit returns what arrived, in parts (S2).
+  const outLeg = record
+    ? back
+      ? partial && partial.minted !== '0' && !finished
+        ? { ...record.offer.pay, amount: partial.minted }
+        : record.offer.pay
+      : record.offer.receive
+    : null;
   const bridgeOutDetail = record && outLeg && (
     <>
+      {partialBackDetail}
       <p className="small">
         {legText(outLeg)} to your address: it arrives about a minute after the withdrawal starts; the bridge closes the
         request about 17 minutes later.
       </p>
-      {record.bridgeOut.sepoliaTx && (
+      {record.bridgeOut.sepoliaTx && !(back && partial) && (
         <p data-testid="arrived">
           <strong>
             {legText(outLeg)} {back ? 'came back' : 'arrived'} on Sepolia.
@@ -456,7 +585,9 @@ export function SwapProgress({ swapId }: { swapId: string }) {
   const doneDetail = record?.phase === 'done' && (
     <p data-testid="done-summary">
       {record.outcome === 'bridged-back'
-        ? `The swap did not happen: ${legText(record.offer.pay)} came back to your address.`
+        ? partial && partial.remaining !== '0'
+          ? `The swap did not happen: ${payPart(partial.minted)} came back to your address. The other ${payPart(partial.remaining)} did not reach the temporary wallet: the sponsor found none of it at the deposit address ${record.deposit.address}.`
+          : `The swap did not happen: ${legText(record.offer.pay)} came back to your address${partial ? ', in parts' : ''}.`
         : `You paid ${legText(record.offer.pay)} and received ${legText(record.offer.receive)}.`}{' '}
       The temporary wallet is empty.
     </p>
@@ -466,7 +597,12 @@ export function SwapProgress({ swapId }: { swapId: string }) {
     start: 'Start swap',
     fund: 'Send funds',
     'bridge-in': `Bridge in${pay ? ` ${pay.midnightName}` : ''}`,
-    take: unavailable || back ? 'Swap is not available' : 'Take the offer',
+    take:
+      back && partial
+        ? 'Not taken: part of the deposit arrived'
+        : unavailable || back
+          ? 'Swap is not available'
+          : 'Take the offer',
     'bridge-out': back || unavailable ? 'Bridge back' : `Bridge out${receive ? ` ${receive.midnightName}` : ''}`,
     done: 'Done',
   };

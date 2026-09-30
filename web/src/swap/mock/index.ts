@@ -54,6 +54,10 @@ export interface MockControls {
   failDeposit(recoverable: boolean): void;
   /** Double the sweep gas of every swap still waiting for its funds (the base fee rose). */
   raiseSweepGas(): void;
+  /** Another party's request swept `units` base units of the pay token off every deposit address
+   *  and won the sweep race; the sponsor completed it: a PARTIAL deposit (P4.2-fix3 S2). The spec
+   *  moves the units (and the ETH the sweep used) off the address in its fake Sepolia. */
+  partialSweep(units: number | string): void;
   setStepMs(ms: number): void;
   /** Answer every exchange request with this HTTP status (null: back up). */
   setKernelDown(status: number | null): void;
@@ -153,6 +157,10 @@ export function createMockEnvironment(input: {
     },
     raiseSweepGas: () => {
       sponsor.raiseSweepGas();
+      persist();
+    },
+    partialSweep: (units) => {
+      sponsor.partialSweep(BigInt(units));
       persist();
     },
     setStepMs: (ms) => {

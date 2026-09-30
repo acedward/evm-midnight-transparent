@@ -53,12 +53,19 @@ export function YourSwaps() {
           const running = !!s && !s.isClosed && !s.isStuck;
           const text =
             r.outcome === 'bridged-back'
-              ? 'Bridged back'
-              : isRecoverable(r)
-                ? 'Failed: can be resumed'
-                : isRecoverableUnknown(r)
-                  ? 'Failed: resume to ask the sponsor'
-                  : PHASE_TEXT[r.phase];
+              ? r.partial
+                ? 'Bridged back what arrived'
+                : 'Bridged back'
+              : r.partial && r.choice === 'swap' && r.phase === 'bridging-in'
+                ? // P4.2-fix3 S2: part of the deposit arrived; the swap page asks what to do.
+                  r.partial.wait
+                  ? 'Part arrived: waiting for the rest'
+                  : 'Part of the deposit arrived: choose'
+                : isRecoverable(r)
+                  ? 'Failed: can be resumed'
+                  : isRecoverableUnknown(r)
+                    ? 'Failed: resume to ask the sponsor'
+                    : PHASE_TEXT[r.phase];
           return (
             <tr key={r.swapId} data-testid="swap-record" data-swap-id={r.swapId} data-phase={r.phase}>
               <Cell block>
