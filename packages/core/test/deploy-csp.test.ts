@@ -77,4 +77,9 @@ describe('the default Content-Security-Policy of the web bundle (audit C15)', ()
     expect(entry).toMatch(/''\)\s*\n\s*policy="\$\(emt_default_csp /);
     expect(deploy('compose.yml')).toMatch(/WEB_CONTENT_SECURITY_POLICY: \$\{WEB_CONTENT_SECURITY_POLICY:-\}/);
   });
+
+  it('the native nginx site in deploy/SYSTEMD.md carries exactly the same policy', () => {
+    const { policy } = csp('stagenet', '/sponsor');
+    expect(deploy('SYSTEMD.md')).toContain(`add_header Content-Security-Policy "${policy}" always;`);
+  });
 });

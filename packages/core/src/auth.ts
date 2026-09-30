@@ -18,7 +18,8 @@
 // matches, which the app switches to first.
 //
 // L-SPONSOR (plan 00048, "Lane contracts"): ONE action, `open-swap`, signed once per swap. Its
-// `swap` is the swap id (the "start swap" salt) and its payload is ./swap-api.ts
+// `swap` is the swap's PUBLIC id (./swap-key.ts `publicSwapId(salt)`; the salt itself never leaves the
+// browser) and its payload is ./swap-api.ts
 // `OpenSwapPayload`; every later call of that swap is authorised by the bearer token the sponsor
 // answers with. A message naming any other action still parses (so a signature made for something
 // else is refused as `wrong-action`, never mistaken for a malformed body).
