@@ -63,6 +63,10 @@ export interface RelayOutcome extends Attestation {
   attestationAfterMs: number;
 }
 
+/** The time to live of the DUST balancing the sponsor adds to a withdrawal (ms): the merged
+ *  transaction cannot be included after it (audit R5, S1). */
+export const WITHDRAW_TX_TTL_MS = 60_000;
+
 /** A submission that failed BEFORE the transaction reached the node (the DUST balancing or the
  *  proofs): conclusive, nothing can land (audit R5). Any other submission error leaves the outcome
  *  uncertain until the request id settles it. */
@@ -117,9 +121,21 @@ export interface RequestDetail {
   evmNonce: bigint;
   gasLimit: bigint;
   maxFeePerGas: bigint;
+  /** The EIP-1559 tip the signed transaction will carry (audit S3: both fee fields are checked). */
+  maxPriorityFeePerGas?: bigint;
+}
+
+/** The chain position a read reflects: the indexer's block at the time of the read (audit S1). */
+export interface ReadWatermark {
+  height: number;
+  /** The block's timestamp, ms. */
+  timeMs: number;
 }
 
 export interface OpenRequests {
+  /** The indexer block the requests were read at (the vault state AS OF this block). Absent when the
+   *  backend cannot tell: such a read never establishes that a request is absent (audit S1). */
+  asOf?: ReadWatermark;
   ids: string[];
   pathOf(requestId: string): string | undefined;
   /** The request's transaction fields (undefined when they cannot be read). */
@@ -175,8 +191,10 @@ export interface SwapBackend {
    *  sent): the calls' public transcripts, and the request it would create. */
   rebuildWithdraw(args: WithdrawCallArgs): Promise<RebuiltWithdraw>;
   /** Add DUST to the browser's bound `startWithdraw` (DUST-only balancing, then merge), submit it and
-   *  wait until it is final. Throws NotSubmittedError when it failed before reaching the node. */
-  submitWithdraw(finalTx: Uint8Array): Promise<MidnightTxFacts>;
+   *  wait until it is final. Throws NotSubmittedError when it failed before reaching the node.
+   *  `onExpiry` is told, BEFORE the transaction is handed to the node, the last moment it can be
+   *  included (the DUST balancing's time to live, ms; audit S1). */
+  submitWithdraw(finalTx: Uint8Array, hooks?: { onExpiry?: (expiresAtMs: number) => void }): Promise<MidnightTxFacts>;
 }
 
 /** Proves on the sponsor's proof server, with the sponsor's key directory. */

@@ -30,6 +30,7 @@ import type {
   MidnightTxFacts,
   OpenRequests,
   RebuiltWithdraw,
+  ReadWatermark,
   RelayOutcome,
   RequestDetail,
   SwapBackend,
@@ -96,10 +97,37 @@ export function requestDetail(record: Any): RequestDetail | undefined {
       evmNonce: BigInt(p.nonce),
       gasLimit: BigInt(p.gasLimit),
       maxFeePerGas: BigInt(p.maxFeePerGas),
+      maxPriorityFeePerGas: BigInt(p.maxPriorityFeePerGas),
     };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The indexer's latest block: its height and timestamp (ms). The vault's requests are then read AS OF
+ * that block, so a read that does not show a request says "absent at this block", never "absent" on
+ * an indexer that silently lags (audit S1). Throws when the answer is not a block.
+ */
+export async function indexerHead(
+  indexerUrl: string,
+  fetchFn: (url: string, init: RequestInit) => Promise<Response> = fetch,
+): Promise<ReadWatermark> {
+  const res = await fetchFn(indexerUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'query SPONSOR_HEAD { block { height timestamp } }' }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`the indexer answered ${res.status}`);
+  const body = (await res.json()) as { data?: { block?: { height?: unknown; timestamp?: unknown } | null } };
+  const b = body.data?.block;
+  const height = Number(b?.height);
+  const timeMs = Number(b?.timestamp);
+  if (!Number.isSafeInteger(height) || height < 0 || !Number.isSafeInteger(timeMs) || timeMs <= 0) {
+    throw new Error('the indexer did not answer with a block');
+  }
+  return { height, timeMs };
 }
 
 /** Load the vault and its keys, verify them against the chain, and compose the backend. Throws a
@@ -181,10 +209,14 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   };
 
   const openRequests = async (kind: 'deposit' | 'withdraw'): Promise<OpenRequests> => {
-    const state = await pdp.queryContractState(vault);
+    // The head first, then the vault's state AS OF that block: the read carries its own watermark
+    // (audit S1).
+    const asOf = await indexerHead(o.network.midnight.indexerUrl);
+    const state = await pdp.queryContractState(vault, { type: 'blockHeight', blockHeight: asOf.height });
     if (!state) throw new Error('no contract state at the vault');
     const records = await vaultOpenRequests(rt, state.data, kind);
     return {
+      asOf,
       ids: [...records.keys()],
       pathOf: (id) => {
         const p = records.get(norm(id))?.path;
@@ -351,10 +383,10 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
       return { calls: r.calls, callsDigest: r.callsDigest, outputs: r.outputs, requestId: r.requestId };
     },
 
-    submitWithdraw: (finalTx) =>
+    submitWithdraw: (finalTx, hooks) =>
       withProviders(async (_providers, opened) => {
         const tx = (ledger.Transaction as Any).deserialize('signature', 'proof', 'binding', finalTx);
-        const { txId } = await addDustAndSubmit(opened, tx);
+        const { txId } = await addDustAndSubmit(opened, tx, undefined, hooks?.onExpiry);
         return facts(txId);
       }),
   };

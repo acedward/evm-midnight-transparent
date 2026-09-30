@@ -108,6 +108,8 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
       evmNonce: B31.evmNonce,
       gasLimit: DEFAULT_EVM_GAS.gasLimit,
       maxFeePerGas: DEFAULT_EVM_GAS.maxFeePerGas,
+      // Both fee fields (audit S3).
+      maxPriorityFeePerGas: DEFAULT_EVM_GAS.maxPriorityFeePerGas,
     });
     expect(requestDetail({ txParams: { to: 'x' } })).toBeUndefined();
     expect(rebuilt.calls.map((c) => c.entryPoint)).toEqual(['startWithdraw', 'signBidirectional']);

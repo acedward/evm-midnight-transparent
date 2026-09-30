@@ -10,9 +10,10 @@
 //     spends into the offer) and -receive (the coin it takes out), nothing else. The offer's own
 //     imbalances were checked against the swap's terms when it opened, and its maker transaction
 //     against the offer id (sha256 of its bytes), so this transaction balances this offer;
-//   - its coins (audit C4): the wallet's coin in, the maker's coin out, at most one change coin
-//     besides ((1,1), (1,2) or (2,1)); none of a contract. A separately balanced transfer needs one
-//     more coin in and out, so it never fits (net imbalances cannot see it);
+//   - its coins (audit C4, S2): the wallet's coins in (up to MAX_COINS: a partial deposit leaves the
+//     wallet the pay amount in two or more coins), the received coin out and at most one change coin;
+//     none of a contract. A separately balanced transfer to someone else would need an output that is
+//     not the wallet's, which the recipient rule below refuses;
 //   - its recipients (audit R1, F-B21): EVERY output is a coin of the temporary wallet. `/prove`
 //     discloses each (nonce, colour, value) as `walletOutputs`, the sponsor recomputes each one's
 //     commitment with the temporary coin public key (ledger-v9 `coinCommitment`), and an output
@@ -36,15 +37,32 @@
 //   - every segment balanced in every shielded colour (the wallet spends its coin into the
 //     contract's output), no other colour moved, no unshielded offer, no DUST (the sponsor adds
 //     it), no fallible shielded offer, at most MAX_COINS inputs and outputs;
-//   - its coins (audit C4): the coin handed to the vault is exactly the rebuild's output (same
-//     commitment, owned by the vault), the wallet's coin in, at most one change coin out or a
-//     second coin in; no contract's coin spent or paid otherwise;
+//   - its coins (audit C4, S2): the coin handed to the vault is exactly the rebuild's output (same
+//     commitment, owned by the vault), the wallet's coins in (up to MAX_COINS), at most one change coin
+//     out; no contract's coin spent or paid otherwise;
 //   - its change (audit R1, F-B21): any output besides the vault's coin is a disclosed coin of the
 //     temporary wallet (`walletOutputs`, recomputed with its coin public key), so an oversized coin
 //     cannot pay the remainder to someone else as "change". `/withdraw` must then carry EXACTLY the
 //     transaction `/prove` validated, apart from proofs and the binding: the sponsor keeps the
 //     whole proof-erased serialisation and compares it byte for byte (every input, output,
 //     recipient ciphertext, call and transcript), not a digest.
+//
+// INPUTS — ACCEPTED POLICY (audit S7 / F-B36; the orchestrator's disposition, plan 00048 P4.2-fix3):
+// the rules bind every OUTPUT to the temporary wallet (or to the vault's coin), but they do NOT bind
+// the shielded INPUTS to the temporary wallet: a shielded input carries only a nullifier, which does
+// not reveal its owner, and the sponsor holds no key to tell. This is accepted, narrowed as follows:
+//   - spending a coin needs its owner's secret key (the spend proof shows the nullifier comes from a
+//     coin whose owner key the prover holds), so an input the temporary wallet does not own can only
+//     be the CALLER'S OWN money: no one's coin can be spent without its owner;
+//   - every output is the temporary wallet's (disclosed and recomputed with its coin public key) or,
+//     for a withdrawal, exactly the vault coin of this swap's leg, whose transfer goes to the swap's
+//     owner (the destination is in the transcript the sponsor rebuilt). So a third-party-funded input
+//     can only DONATE value to this swap's temporary wallet or pay this swap's own leg to its owner;
+//   - what the sponsor gives is unchanged by whose coin it is: proof time (bounded by the proof
+//     budgets and MAX_COINS) and, for a withdrawal, the DUST of one start of this swap's own leg
+//     (bounded per attempt and by the daily budget), which it would pay for the swap's own coin too.
+// So an input allow-list would add no protection for anyone's funds or the sponsor's budget. The
+// policy is: inputs are any non-contract coins the caller can spend, up to MAX_COINS.
 
 import type { InvalidTxDetail } from '@evm-midnight-transparent/core';
 
@@ -105,25 +123,26 @@ function walletOnly(
 }
 
 /**
- * The take's coins (audit C4): the wallet's pay coin(s) in, the maker's coin out, and at most one
- * change coin besides: (1 in, 1 out), (1 in, 2 out) or (2 in, 1 out). A separately balanced transfer
- * needs one more coin in AND one more out, so it never fits. No contract's coin.
+ * The take's coins (audit C4, S2): the wallet's pay coins in (1 to MAX_COINS: a partial deposit leaves
+ * the pay amount in two or more coins), the received coin out and at most one change coin (1 or 2
+ * outputs), every output the wallet's (below). No contract's coin. The inputs are the caller's own
+ * (the header's accepted policy, audit S7).
  */
 function takeCoins(s: TxSummary, wallet: WalletCommitments | undefined): void {
   const { inputs, outputs } = s.shielded;
   if (inputs.some((i) => i.contract !== null) || outputs.some((o) => o.contract !== null)) {
     fail('contract-coin', 'a take moves no contract’s coin');
   }
-  if (inputs.length < 1 || outputs.length < 1 || inputs.length + outputs.length > 3) {
-    fail('extra-coins', 'a take spends the wallet’s coin and receives the maker’s, with at most one change coin');
+  if (inputs.length < 1 || inputs.length > MAX_COINS || outputs.length < 1 || outputs.length > 2) {
+    fail('extra-coins', 'a take spends the wallet’s coins and receives the maker’s, with at most one change coin');
   }
   walletOnly(outputs, wallet, 'the take');
 }
 
 /**
- * The withdrawal's coins (audit C4): the coin handed to the vault is exactly the output the
+ * The withdrawal's coins (audit C4, S2): the coin handed to the vault is exactly the output the
  * sponsor's rebuild creates (same commitment: the coin's nonce, colour and value, owned by the
- * vault); besides it, the wallet's coin in, and at most one change coin out or a second coin in.
+ * vault); besides it, the wallet's coins in (1 to MAX_COINS) and at most one change coin out.
  */
 function withdrawCoins(
   s: TxSummary,
@@ -141,8 +160,8 @@ function withdrawCoins(
   const extra = outputs.filter((o) => !wanted.has(key(o)));
   if (extra.some((o) => o.contract !== null))
     fail('contract-coin', 'the transaction pays a contract outside the withdrawal');
-  if (inputs.length < 1 || inputs.length + extra.length > 2) {
-    fail('extra-coins', 'a withdrawal spends the wallet’s coin, with at most one change coin (or a second coin in)');
+  if (inputs.length < 1 || inputs.length > MAX_COINS || extra.length > 1) {
+    fail('extra-coins', 'a withdrawal spends the wallet’s coins, with at most one change coin');
   }
   walletOnly(extra, wallet, 'the withdrawal');
 }

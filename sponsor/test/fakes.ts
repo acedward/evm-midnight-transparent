@@ -202,6 +202,7 @@ export interface FakeRequest {
   amount: bigint;
   gasLimit: bigint;
   maxFeePerGas: bigint;
+  maxPriorityFeePerGas?: bigint;
 }
 
 /** What the next relay of a request does. */
@@ -233,6 +234,12 @@ export class FakeVault implements SwapBackend {
   submitFailure: 'not-submitted' | 'lost-landed' | 'lost' | null = null;
   /** Attestations that already verify for a request (settled or not), by request id. */
   attestations = new Map<string, AttestedKind>();
+  /** The clock the vault's reads are stamped with (the harness sets the fake clock), and how far the
+   *  indexer's latest block lags behind it (audit S1). */
+  clock: () => number = Date.now;
+  indexerLagMs = 0;
+  /** An attestation lookup that fails (audit S1: it never settles anything). */
+  attestationFails = false;
   private seq = 0;
 
   depositAddress(coinPk: string) {
@@ -243,7 +250,9 @@ export class FakeVault implements SwapBackend {
   }
   async openRequests(kind: BridgeKind): Promise<OpenRequests> {
     const mine = [...this.requests.values()].filter((r) => r.kind === kind);
+    const timeMs = this.clock() - this.indexerLagMs;
     return {
+      asOf: { height: Math.floor(timeMs / 6000), timeMs },
       ids: mine.map((r) => r.id),
       pathOf: (id) => this.requests.get(id)?.path,
       detailOf: (id) => {
@@ -255,6 +264,7 @@ export class FakeVault implements SwapBackend {
               evmNonce: r.evmNonce,
               gasLimit: r.gasLimit,
               maxFeePerGas: r.maxFeePerGas,
+              ...(r.maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas: r.maxPriorityFeePerGas } : {}),
             }
           : undefined;
       },
@@ -290,6 +300,7 @@ export class FakeVault implements SwapBackend {
       amount: i.amount,
       gasLimit: i.gas.gasLimit,
       maxFeePerGas: i.gas.maxFeePerGas,
+      maxPriorityFeePerGas: i.gas.maxPriorityFeePerGas,
     });
     this.startNonces.push({ kind: 'deposit', nonce: i.evmNonce });
     this.version++;
@@ -347,6 +358,7 @@ export class FakeVault implements SwapBackend {
     };
   }
   async attestation(_kind: BridgeKind, requestId: string): Promise<Attestation | null> {
+    if (this.attestationFails) throw new Error('the MPC output cache is unreachable');
     const kind = this.attestations.get(requestId);
     return kind ? { kind, event: { requestId }, serializedOutput: new Uint8Array([kind === 'success' ? 1 : 0]) } : null;
   }
@@ -389,13 +401,17 @@ export class FakeVault implements SwapBackend {
   /** The request ids of the startWithdraws submitted, in order. */
   readonly submitted: string[] = [];
   pendingWithdrawArgs = new Map<string, WithdrawCallArgs>();
-  async submitWithdraw(finalTx: Uint8Array): Promise<MidnightTxFacts> {
+  async submitWithdraw(
+    finalTx: Uint8Array,
+    hooks?: { onExpiry?: (expiresAtMs: number) => void },
+  ): Promise<MidnightTxFacts> {
     const s = fakeInspect(finalTx);
     const args = this.pendingWithdrawArgs.get(s.callsDigest);
     if (!args) throw new Error('the fake vault does not know this withdrawal (register its args first)');
     const failure = this.submitFailure;
     this.submitFailure = null;
     if (failure === 'not-submitted') throw new NotSubmittedError('the DUST balancing failed');
+    hooks?.onExpiry?.(this.clock() + 60_000);
     if (failure === 'lost') throw new Error('the node did not answer (the transaction was not included)');
     const id = sha(`withdraw:${s.callsDigest}`);
     this.submitted.push(id);

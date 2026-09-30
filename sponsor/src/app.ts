@@ -91,7 +91,7 @@ function defaultClientAddress(trustProxy: boolean): (c: Context) => string {
 export function createApp(deps: AppDeps): Hono {
   const { config, log, swaps } = deps;
   const address = deps.clientAddress ?? defaultClientAddress(config.trustProxy);
-  // Every per-client limit counts an IPv6 client by its /64 (audit R4, F-A21).
+  // Every per-client limit counts an IPv6 client by its /48 (audit R4 F-A21, S5 F-A31).
   const clientAddress = (c: Context) => clientKeyOf(address(c));
   const limits = config.limits;
   const readLimiter = new RateLimiter(limits.readsPerMinute);

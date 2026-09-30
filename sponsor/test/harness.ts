@@ -111,6 +111,7 @@ export function harness(
   const store = opts.store ?? new MemorySwapStore();
   const sponsor = new FakeSponsor();
   const now = { ms: Date.now() };
+  vault.clock = () => now.ms;
   const swaps = new SwapService({
     config: {
       ...swapServiceConfig(config),

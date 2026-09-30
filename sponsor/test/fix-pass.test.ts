@@ -830,7 +830,9 @@ describe('C4: the sponsor binds every shielded coin, not only the calls and the 
     const w = await paramsAndBuild(h, s, token, 'swap');
     const res = await proveWithdraw(h, s, token, { ...w, tx: withExtraTransfer(w.tx) });
     expect(res.status).toBe(422);
-    expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('extra-coins');
+    // Since P4.2-fix3 (audit S2) the wallet may spend up to MAX_COINS coins, so the appended coin in
+    // passes the count; the appended coin OUT is not the wallet's disclosed one (audit R1).
+    expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('undisclosed-output');
     expect(h.prover.proved).toHaveLength(1); // the take's only
     expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
   });
@@ -866,7 +868,8 @@ describe('C4: the sponsor binds every shielded coin, not only the calls and the 
       m.token,
     );
     expect(extra.status).toBe(422);
-    expect(((await extra.json()) as { error: { detail: string } }).error.detail).toBe('extra-coins');
+    // The appended coin out is not the wallet's (audit R1; the input count is MAX_COINS since S2).
+    expect(((await extra.json()) as { error: { detail: string } }).error.detail).toBe('undisclosed-output');
     // One change coin, disclosed as the temporary wallet's (audit R1).
     const changeCoin = { nonce: hex32('change'), colour: BID.pay.token.midnightColour, value: '5' };
     const change = summaryWith(t.tx, {

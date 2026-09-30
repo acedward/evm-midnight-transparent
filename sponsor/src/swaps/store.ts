@@ -6,8 +6,13 @@
 // no seed or secret key ever reaches the sponsor. The JSON file is written atomically (a temporary
 // file, fsync, rename) with mode 600 in a directory of mode 700, after every change.
 //
-// Retention: finished swaps (done, failed) are dropped `retainDays` after their last change. Swaps
-// still in flight are never dropped: the temporary wallet may hold funds the user comes back for.
+// Retention: finished swaps are dropped `retainDays` after their last change, but only those with
+// nothing left to recover (./model.ts `retentionMayDrop`, audit S4): `done`, or a failure no re-open
+// can revive, with no withdrawal attempt still unresolved or re-checked, no unsettled deposit request,
+// and no funds by the sponsor's accounting or at the deposit address as last read. A recoverable
+// failure is never dropped by age (the never-funded ones go through `SwapService.pruneUnfunded`, which
+// reads the address first). Swaps still in flight are never dropped: the temporary wallet may hold
+// funds the user comes back for.
 
 import {
   chmodSync,
@@ -22,7 +27,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 
-import { isTerminal, type SwapRecord } from './model.js';
+import { retentionMayDrop, type SwapRecord } from './model.js';
 
 export interface SwapStore {
   get(swapId: string): SwapRecord | undefined;
@@ -33,7 +38,7 @@ export interface SwapStore {
   put(rec: SwapRecord): void;
   /** Remove one swap, and persist. */
   delete(swapId: string): void;
-  /** Drop finished swaps older than the retention; returns how many. */
+  /** Drop finished swaps older than the retention that have nothing left to recover; returns how many. */
   prune(nowSeconds: number): number;
 }
 
@@ -69,7 +74,7 @@ export class MemorySwapStore implements SwapStore {
   prune(nowSeconds: number) {
     let n = 0;
     for (const [id, r] of this.swaps) {
-      if (isTerminal(r.state) && nowSeconds - r.updatedAt > this.retainDays * 86_400) {
+      if (nowSeconds - r.updatedAt > this.retainDays * 86_400 && retentionMayDrop(r, nowSeconds * 1000)) {
         this.swaps.delete(id);
         n++;
       }

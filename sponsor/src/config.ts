@@ -80,7 +80,9 @@ export interface SponsorConfig {
     maxActivePerOwner: number;
     /** New swaps per EVM address in any 24 hours, whatever became of them (audit C7). */
     maxPerOwnerPerDay: number;
-    /** Swaps waiting for funds that have received nothing, all addresses together (audit C6). */
+    /** Swaps waiting for funds (the whole pay amount not yet at their address), all addresses
+     *  together (audit C6). A backstop only since P4.2-fix3 (audit S5): the deposit reads are budgeted
+     *  per pass, and the per-client (/48) and per-owner caps are the admission. */
     maxUnfunded: number;
     /** Proofs per swap and purpose (take, withdraw) in any 24 hours; the withdraw budget is also
      *  renewed for each new attempt after a refund or a failed start (audit C11, R3). */
@@ -106,7 +108,7 @@ export interface SponsorConfig {
      *  24 hours (audit C5, R3: paced, never a lifetime cap), and the pause between two re-arms. */
     depositRearmsPerDay: number;
     depositRearmCooldownSeconds: number;
-    /** Swaps waiting for funds that have received nothing, per client (IPv4 address or IPv6 /64). */
+    /** Swaps waiting for funds (not yet the whole pay amount at the address), per client (IPv4 address or IPv6 /48). */
     maxUnfundedPerClient: number;
     /** How long an open reuses its read of the owner's Sepolia balances (audit R4). */
     ownerBalanceCacheSeconds: number;
@@ -115,6 +117,9 @@ export interface SponsorConfig {
     /** A page looking at a swap brings its next deposit-address read forward, never closer than this
      *  to the last one (audit R4: page reads cannot reset the backoff). */
     pollNudgeMinSeconds: number;
+    /** How often the vault's open deposit requests are read for every swap waiting for funds or
+     *  `partial`, whatever their addresses show (a sweep between two polls; audit S2). */
+    reconcileSeconds: number;
     /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
     sweepGasLimits: Record<string, bigint>;
     /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
@@ -148,6 +153,12 @@ export interface SponsorConfig {
   /** A withdrawal whose submission's outcome is unknown, whose request is neither in the vault nor
    *  attested this long after it was sent, did not land (audit R5). */
   withdrawUncertainSeconds: number;
+  /** "Not included" needs a vault read at an indexer block at least this far past the submission's
+   *  expiry (its DUST intent's time to live): a lagging indexer never decides it (audit S1). */
+  withdrawExpiryMarginSeconds: number;
+  /** An attempt judged not included is re-checked by its request id this long, and adopted if it
+   *  landed after all (audit S1). */
+  withdrawRecheckSeconds: number;
   /** A replacement of a stuck transfer outbids every transfer holding its nonce by at least this
    *  percent on BOTH fee fields (the pools' replacement increment; audit R2). */
   bridgeReplacementBumpPercent: number;
@@ -352,7 +363,7 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       minOfferTtlSeconds: int(env.SWAP_MIN_OFFER_TTL_SECONDS, 1800, 'SWAP_MIN_OFFER_TTL_SECONDS', 0, 86_400),
       maxActivePerOwner: int(env.SWAP_MAX_ACTIVE_PER_OWNER, 3, 'SWAP_MAX_ACTIVE_PER_OWNER', 1, 100),
       maxPerOwnerPerDay: int(env.SWAP_MAX_PER_OWNER_PER_DAY, 10, 'SWAP_MAX_PER_OWNER_PER_DAY', 1, 10_000),
-      maxUnfunded: int(env.SWAP_MAX_UNFUNDED, 100, 'SWAP_MAX_UNFUNDED', 1, 100_000),
+      maxUnfunded: int(env.SWAP_MAX_UNFUNDED, 1_000, 'SWAP_MAX_UNFUNDED', 1, 100_000),
       proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
       // SWAP_PROOFS_TOTAL_PER_SWAP (the lifetime cap before P4.2-fix2) is read as the daily budget.
       proofsPerSwapPerDay: int(
@@ -395,6 +406,7 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       ),
       pollMaxReadsPerPass: int(env.DEPOSIT_POLL_MAX_READS, 120, 'DEPOSIT_POLL_MAX_READS', 2, 100_000),
       pollNudgeMinSeconds: int(env.DEPOSIT_POLL_NUDGE_MIN_SECONDS, 60, 'DEPOSIT_POLL_NUDGE_MIN_SECONDS', 0, 3_600),
+      reconcileSeconds: int(env.DEPOSIT_RECONCILE_SECONDS, 120, 'DEPOSIT_RECONCILE_SECONDS', 15, 3_600),
       sweepGasLimits: (() => {
         try {
           return parseSweepGasLimits(str(env.SWEEP_GAS_LIMITS));
@@ -434,6 +446,14 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       1_200,
     ),
     withdrawUncertainSeconds: int(env.WITHDRAW_UNCERTAIN_SECONDS, 900, 'WITHDRAW_UNCERTAIN_SECONDS', 300, 86_400),
+    withdrawExpiryMarginSeconds: int(
+      env.WITHDRAW_EXPIRY_MARGIN_SECONDS,
+      120,
+      'WITHDRAW_EXPIRY_MARGIN_SECONDS',
+      30,
+      3_600,
+    ),
+    withdrawRecheckSeconds: int(env.WITHDRAW_RECHECK_SECONDS, 86_400, 'WITHDRAW_RECHECK_SECONDS', 3_600, 7 * 86_400),
     bridgeReplacementBumpPercent: int(
       env.BRIDGE_EVM_REPLACEMENT_BUMP_PERCENT,
       10,

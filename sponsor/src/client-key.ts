@@ -1,6 +1,8 @@
 // The key a client is counted under for the per-client limits (plan 00048 P4.2-fix2, audit R4 /
-// F-A21): an IPv4 address as it is, an IPv6 address by its /64 prefix. One subscriber usually holds
-// a whole /64, so counting single IPv6 addresses would let one client rotate through 2^64 of them.
+// F-A21; P4.2-fix3, audit S5 / F-A31): an IPv4 address as it is, an IPv6 address by its /48 prefix.
+// One subscriber usually holds a whole /64, and a /48 is a site's (or a free tunnel broker's)
+// allocation: counting by /64 let one client with a /48 act as 65,536 clients, so the per-client caps
+// and rate limits count the /48. Clients behind one /48 share its allowance.
 // An IPv4-mapped IPv6 address (`::ffff:192.0.2.1`) counts as its IPv4 address. Anything that does
 // not parse (e.g. "unknown") is counted as itself.
 
@@ -43,7 +45,7 @@ export function clientKeyOf(address: string): string {
     return [g[6]! >> 8, g[6]! & 0xff, g[7]! >> 8, g[7]! & 0xff].join('.');
   }
   return `${g
-    .slice(0, 4)
+    .slice(0, 3)
     .map((x) => x.toString(16))
-    .join(':')}::/64`;
+    .join(':')}::/48`;
 }
