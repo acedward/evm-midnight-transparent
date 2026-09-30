@@ -35,6 +35,7 @@ import {
   submitToBatcher,
 } from '@evm-midnight-transparent/core';
 
+import { walletOutputsFromKeys, type WalletOutput } from './outputs.js';
 import { type ProvingService } from './prover.js';
 import { internalsOf, type TempWallet } from './temp-wallet.js';
 import {
@@ -171,6 +172,9 @@ export interface TakeDraft {
   /** The balancing transaction with its proofs erased, hex: every input, output (recipient,
    *  ciphertext), and offer as built. A proven answer must erase to exactly this (P4.2-fix C10). */
   readonly erased: string;
+  /** Every coin the take pays to this wallet (the received coin and its change): `/prove` discloses
+   *  them (P4.2-fix2 R1). */
+  readonly walletOutputs: readonly WalletOutput[];
   /** Give the booked coins back to the wallet (the take is abandoned). Idempotent. */
   release(): Promise<void>;
   readonly released: boolean;
@@ -206,6 +210,7 @@ export async function buildTake(wallet: TempWallet, offerBech32: string): Promis
       makerTx,
       identifiers: balancing.identifiers().map(String),
       erased: erasedHex(balancing),
+      walletOutputs: walletOutputsFromKeys(keys.shieldedSecretKeys, balancing),
       release,
       get released() {
         return released;

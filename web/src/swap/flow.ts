@@ -16,6 +16,8 @@
 
 import type { WithdrawalLast } from '@evm-midnight-transparent/core';
 
+import { clockText } from './display.js';
+
 import type { SwapPhase, SwapRecord } from './record-shape.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
 
@@ -147,15 +149,24 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
     next.outcome = view.outcome ?? (record.choice === 'bridge-back' ? 'bridged-back' : 'swapped');
   if (view.state === 'failed') {
     next.error = (view.message ?? view.reason ?? 'The sponsor stopped this swap.').slice(0, 500);
-    // P4.2-fix C5: a failure the sponsor can revive by a re-open; the page offers Resume.
-    if (view.recoverable === true) next.recoverable = true;
-    else delete next.recoverable;
+    // P4.2-fix C5: a failure the sponsor can revive by a re-open; the page offers Resume. Its "no" is
+    // kept as `false` (P4.2-fix2 R3): a record without the field is one the sponsor was not asked
+    // about yet (written before), and the page offers Resume for it.
+    next.recoverable = view.recoverable === true;
   } else if (record.phase === 'failed') {
     // Revived by a re-open: the failure is over.
     delete next.error;
     delete next.recoverable;
   }
   return next;
+}
+
+/** A recoverable failure the sponsor revives only after its re-arm cooldown (`retryAt`, FS2 R3):
+ *  the sentence that says from when a Resume works; null otherwise. */
+export function revivalNote(view: SwapView, now: number): string | null {
+  if (view.state !== 'failed' || view.recoverable !== true || view.retryAt === undefined) return null;
+  const at = view.retryAt * 1000;
+  return at > now ? `The sponsor can revive this swap from ${clockText(at)}: resume it then.` : null;
 }
 
 export type NextAction =
@@ -274,6 +285,7 @@ export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Reado
   deposit: {
     'waiting-for-funds': 'Waiting for your funds at the deposit address',
     'funds-seen': 'Your funds reached the deposit address',
+    'budget-wait': "Waiting for room in the sponsor's daily budget",
     starting: 'Starting the deposit on Midnight',
     adopted: 'Deposit found on Midnight',
     started: 'Deposit started on Midnight',
@@ -288,12 +300,15 @@ export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Reado
     settled: 'Minted to the temporary wallet',
     abandoning: 'The sweep did not happen: closing the request',
     abandoned: 'The sweep did not happen: the deposit will be retried',
+    'completed-foreign': 'Another request swept the deposit address: the sponsor completed it',
     closed: 'Deposit request closed',
   },
   withdraw: {
     queued: 'Waiting for the withdrawal lane',
     starting: 'Starting the withdrawal on Midnight',
     submitting: 'Submitting the withdrawal on Midnight',
+    'submission-uncertain': 'Checking whether the withdrawal reached Midnight',
+    adopted: 'Withdrawal found on Midnight',
     started: 'Withdrawal started on Midnight',
     resumed: 'Withdrawal resumed by the sponsor',
     'mpc-signed': 'Transfer signed by the MPC network',

@@ -5,8 +5,12 @@
 // keccak256 of the first signature), so the determinism and resume checks run for real against the
 // test wallet; and the deposit address (core's `swapDepositAddress`, the vault's derivation). Mock:
 // the "keys" are hashes of the seed, the transactions are tagged JSON (./tx.ts), the chain is
-// ./chain.ts. Like the real module, a draft books its coin until it is released or finalized, so a
-// second build while one is outstanding is refused.
+// ./chain.ts. Like the real module, a draft books its coin (the SDK's pending spend) until it is
+// released or the chain spends it: finalizing a draft does NOT give the coin back, and the wallet's
+// balances leave booked coins out (the real `balances` are the available coins only). So a
+// withdrawal the sponsor accepted and whose start then failed keeps its coin booked until the page
+// releases the draft, exactly as the real wallet does (P4.2-fix2 R3, the audit's F-B24: the mock
+// once released at finalize, which hid that the page never released it).
 
 import {
   type NetworkProfile,
@@ -52,12 +56,33 @@ export function mockWalletModule(
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const { profile } = options;
   const stats: MockWalletStats = { drafts: 0, released: 0 };
-  /** Wallets with a draft that is neither released nor finalized. */
-  const booked = new Set<string>();
 
-  const draftFor = (coinPk: string, id: string) => {
+  /** Each wallet's state: its balances as of its last sync, and the coins its drafts booked (by
+   *  draft id), as the real wallet's pending spends. */
+  interface WalletState {
+    synced: Record<string, bigint>;
+    booked: Map<string, { colour: string; amount: bigint }>;
+  }
+  const states = new WeakMap<TempWallet, WalletState>();
+  const stateOf = (w: TempWallet) => {
+    const st = states.get(w);
+    if (!st) throw new MockChainError('not a mock temporary wallet, or it is closed');
+    return st;
+  };
+  const bookedOf = (st: WalletState, colour: string) =>
+    [...st.booked.values()].filter((b) => b.colour === colour).reduce((a, b) => a + b.amount, 0n);
+  /** What a new draft may spend of `colour`: the synced balance less the booked coins. */
+  const available = (st: WalletState, colour: string) => (st.synced[colour] ?? 0n) - bookedOf(st, colour);
+
+  const draftFor = (wallet: TempWallet, coin: { colour: string; amount: bigint }) => {
+    const st = stateOf(wallet);
+    if (bookedOf(st, coin.colour) > 0n && available(st, coin.colour) < coin.amount)
+      throw new MockChainError('a coin is booked by another draft');
+    if (available(st, coin.colour) < coin.amount)
+      throw new MockChainError('insufficient-funds: the temporary wallet does not hold that coin');
     stats.drafts++;
-    booked.add(coinPk);
+    const id = randomHex();
+    st.booked.set(id, coin);
     let released = false;
     return {
       id,
@@ -65,7 +90,7 @@ export function mockWalletModule(
         if (released) return;
         released = true;
         stats.released++;
-        booked.delete(coinPk);
+        st.booked.delete(id);
       },
       get released() {
         return released;
@@ -96,23 +121,34 @@ export function mockWalletModule(
       if (!/^[0-9a-f]{64}$/.test(seed)) throw new MockChainError('the seed must be 64 hex');
       const coinPk = h(`emt-mock-coin-pk:${seed}`);
       const encPk = h(`emt-mock-enc-pk:${seed}`);
-      let synced: Record<string, bigint> = {};
-      return {
+      const st: WalletState = { synced: {}, booked: new Map() };
+      const wallet: TempWallet = {
         coinPk,
         encPk,
         shieldedAddress: formatShieldedAddress({ coinPublicKey: coinPk, encryptionPublicKey: encPk }, profile.name),
         async sync() {
           await sleep(options.syncMs());
-          synced = Object.fromEntries(chain.balances(coinPk));
+          // A booked coin the chain has spent is no longer pending (the real wallet sees its nullifier).
+          for (const id of [...st.booked.keys()]) if (chain.isSpent(id)) st.booked.delete(id);
+          st.synced = Object.fromEntries(chain.balances(coinPk));
           return { ms: options.syncMs() };
         },
         async balances() {
-          return { ...synced };
+          // The available coins: booked ones left out, as the SDK's `balances`.
+          const out: Record<string, bigint> = {};
+          for (const colour of Object.keys(st.synced)) {
+            const v = available(st, colour);
+            if (v > 0n) out[colour] = v;
+          }
+          return out;
         },
         async close() {
-          synced = {};
+          st.synced = {};
+          st.booked.clear();
         },
       };
+      states.set(wallet, st);
+      return wallet;
     },
 
     depositAddressFor: (coinPk) => swapDepositAddress(profile, coinPk),
@@ -121,12 +157,11 @@ export function mockWalletModule(
       const offerId = MockChain.offerIdOfBech32(offerBech32);
       const offer = offerId ? chain.offer(offerId) : undefined;
       if (!offerId || !offer) throw new MockChainError('not a mock offer');
-      if (booked.has(wallet.coinPk)) throw new MockChainError('a coin is booked by another draft');
       const want = offer.wants[0]!;
-      if ((chain.balances(wallet.coinPk).get(want.token) ?? 0n) < want.amount)
-        throw new MockChainError('insufficient-funds: the temporary wallet does not hold what the offer wants');
-      const d = draftFor(wallet.coinPk, randomHex());
+      const d = draftFor(wallet, { colour: want.token, amount: want.amount });
       const give = offer.gives[0]!;
+      // The received coin (mock coins are exact: no change), disclosed to `/prove` (P4.2-fix2 R1).
+      const received = { nonce: randomHex(), colour: give.token, value: give.amount };
       // Like the real module: the id and the terms of the offer AS SERVED (P4.2-fix C10).
       return Object.assign(d, {
         offerId,
@@ -134,7 +169,14 @@ export function mockWalletModule(
           give: [{ colour: want.token, amount: want.amount }],
           receive: [{ colour: give.token, amount: give.amount }],
         },
-        tx: encodeMockTx({ kind: 'take', coinPk: wallet.coinPk, offerId, draft: d.id }),
+        walletOutputs: [received],
+        tx: encodeMockTx({
+          kind: 'take',
+          coinPk: wallet.coinPk,
+          offerId,
+          draft: d.id,
+          outputs: [{ ...received, value: received.value.toString() }],
+        }),
       });
     },
 
@@ -144,7 +186,8 @@ export function mockWalletModule(
       if (d.released) throw new MockChainError('this take was released; build it again');
       if (!tx?.proven || tx.kind !== 'take' || tx.draft !== d.id)
         throw new MockChainError('the proven transaction is not this take');
-      booked.delete(tx.coinPk);
+      // Like the real finalizer: it checks and merges; the coin stays booked until the take lands
+      // (the chain spends it) or the page releases the draft.
       return { tx: encodeMockTx({ ...tx, merged: true }) };
     },
 
@@ -166,6 +209,7 @@ export function mockWalletModule(
       const want = offer.wants[0]!;
       const give = offer.gives[0]!;
       chain.burn(tx.coinPk, want.token, want.amount);
+      chain.markSpent(tx.draft);
       chain.mint(tx.coinPk, give.token, give.amount);
       const transactionHash = chain.newHash('take');
       chain.recordTake(tx.coinPk, transactionHash);
@@ -174,15 +218,14 @@ export function mockWalletModule(
     },
 
     async buildWithdraw(wallet: TempWallet, p: WithdrawParams): Promise<WithdrawDraft> {
-      if (booked.has(wallet.coinPk)) throw new MockChainError('a coin is booked by another draft');
       if (p.refundRecipient !== wallet.coinPk) throw new MockChainError('the refund recipient is not this wallet');
-      if ((chain.balances(wallet.coinPk).get(p.colour) ?? 0n) < p.amount)
-        throw new MockChainError('insufficient-funds: the temporary wallet does not hold that coin');
-      const d = draftFor(wallet.coinPk, randomHex());
+      const d = draftFor(wallet, { colour: p.colour, amount: p.amount });
       const coinNonce = randomHex();
       return Object.assign(d, {
         coinNonce,
         evmNonce: p.evmNonce,
+        // A mock coin is exact: no change comes back (P4.2-fix2 R1).
+        walletOutputs: [],
         tx: encodeMockTx({
           kind: 'withdraw',
           coinPk: wallet.coinPk,
@@ -192,6 +235,7 @@ export function mockWalletModule(
           coinNonce,
           evmNonce: p.evmNonce.toString(),
           draft: d.id,
+          outputs: [],
         }),
       });
     },
@@ -202,7 +246,8 @@ export function mockWalletModule(
       if (d.released) throw new MockChainError('this withdrawal was released; build it again');
       if (!tx?.proven || tx.kind !== 'withdraw' || tx.draft !== d.id)
         throw new MockChainError('the proven transaction is not this withdrawal');
-      booked.delete(tx.coinPk);
+      // Like the real finalizer: it checks and binds; the coin stays booked until the sponsor's start
+      // lands (the chain spends it) or the page releases the draft.
       return { tx: encodeMockTx({ ...tx, bound: true }) };
     },
   };

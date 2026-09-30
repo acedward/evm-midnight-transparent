@@ -34,6 +34,53 @@ describe('the sponsor client', () => {
     expect(JSON.parse(String(init!.body))).toEqual({ purpose: 'take', tx: '0102' });
   });
 
+  it('discloses the wallet outputs with a proof (P4.2-fix2 R1): decimal values, lowercase hex', async () => {
+    const f = fetchReturning(200, { tx: 'ab' });
+    const c = sponsorClient({ baseUrl: 'https://s', swapId: SWAP, swapToken: TOKEN, fetchImpl: f as never });
+    const out = { nonce: `0x${'1A'.repeat(32)}`, colour: '2b'.repeat(32), value: 18_446_744_073_709_551_615n };
+    await c.prove('take', '01', undefined, { walletOutputs: [out] });
+    expect(JSON.parse(String(f.mock.calls[0]![1]!.body))).toEqual({
+      purpose: 'take',
+      tx: '01',
+      walletOutputs: [{ nonce: '1a'.repeat(32), colour: '2b'.repeat(32), value: '18446744073709551615' }],
+    });
+    await c.prove('withdraw', '01', { coinNonce: 'cc'.repeat(32), evmNonce: 9n }, { walletOutputs: [] });
+    expect(JSON.parse(String(f.mock.calls[1]![1]!.body))).toMatchObject({ purpose: 'withdraw', walletOutputs: [] });
+    await expect(c.prove('take', '01', undefined, { walletOutputs: [{ ...out, nonce: 'ab' }] })).rejects.toMatchObject({
+      code: 'bad-request',
+    });
+  });
+
+  it('a sponsor before P4.2-fix2 (strict schema, 400 bad-request): the proof is asked once more without the field', async () => {
+    const f = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init!.body)) as Record<string, unknown>;
+      return 'walletOutputs' in body
+        ? new Response(
+            JSON.stringify({ error: { code: 'bad-request', message: 'the request does not have the expected shape' } }),
+            { status: 400 },
+          )
+        : new Response(JSON.stringify({ tx: 'cd' }), { status: 200 });
+    });
+    const c = sponsorClient({ baseUrl: 'https://s', swapId: SWAP, swapToken: TOKEN, fetchImpl: f as never });
+    const out = { nonce: '1a'.repeat(32), colour: '2b'.repeat(32), value: 1n };
+    expect(await c.prove('take', '01', undefined, { walletOutputs: [out] })).toBe('cd');
+    expect(f).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(f.mock.calls[1]![1]!.body))).toEqual({ purpose: 'take', tx: '01' });
+    // Any other refusal is final: no second request.
+    const g = fetchReturning(422, { error: { code: 'invalid-tx', message: 'no', detail: 'undisclosed-output' } });
+    const d = sponsorClient({ baseUrl: 'https://s', swapId: SWAP, swapToken: TOKEN, fetchImpl: g as never });
+    await expect(d.prove('take', '01', undefined, { walletOutputs: [out] })).rejects.toMatchObject({
+      status: 422,
+      code: 'invalid-tx',
+    });
+    expect(g).toHaveBeenCalledTimes(1);
+    // Without a disclosure, a 400 is final too.
+    const h = fetchReturning(400, { error: { code: 'bad-request', message: 'no' } });
+    const e = sponsorClient({ baseUrl: 'https://s', swapId: SWAP, swapToken: TOKEN, fetchImpl: h as never });
+    await expect(e.prove('take', '01')).rejects.toMatchObject({ status: 400 });
+    expect(h).toHaveBeenCalledTimes(1);
+  });
+
   it('POSTs /withdraw and returns the answer', async () => {
     const f = fetchReturning(200, { swap: { state: 'withdrawing' } });
     const c = sponsorClient({

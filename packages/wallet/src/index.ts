@@ -11,6 +11,7 @@
 
 export * from './browser.js';
 export * from './keys.js';
+export * from './outputs.js';
 export * from './prover.js';
 export * from './shielded.js';
 export * from './sponsor-client.js';

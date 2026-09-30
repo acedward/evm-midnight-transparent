@@ -15,6 +15,8 @@ export interface MockTx {
   evmNonce?: string;
   /** The draft this transaction was built as (the real module checks identifiers the same way). */
   draft?: string;
+  /** The coins it pays back to the temporary wallet (a take's received coin; P4.2-fix2 R1). */
+  outputs?: Array<{ nonce: string; colour: string; value: string }>;
   proven?: true;
   /** A take merged into the maker's transaction (`finalizeTake`). */
   merged?: true;

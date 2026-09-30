@@ -357,6 +357,38 @@ describe("the sponsor's own wire (core swap-api.ts, L-SPONSOR)", () => {
     expect(CoreProveRequestSchema.safeParse(bodies[0]).success).toBe(true);
     expect(CoreTakeReportSchema.safeParse(bodies[1]).success).toBe(true);
   });
+
+  it('passes the wallet outputs with a proof (P4.2-fix2 R1); a sponsor from before is asked again without them', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    // A sponsor at b6b5347: core's strict prove schema refuses the unknown field with 400 bad-request.
+    const before = new HttpSponsorApi('https://sponsor.invalid', {
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        bodies.push(body);
+        return CoreProveRequestSchema.safeParse(body).success
+          ? new Response(JSON.stringify({ tx: 'ab' }))
+          : new Response(
+              JSON.stringify({
+                error: { code: 'bad-request', message: 'the request does not have the expected shape' },
+              }),
+              { status: 400 },
+            );
+      },
+    });
+    const walletOutputs = [{ nonce: H64('1'), colour: H64('b'), value: 100_000_000n }];
+    expect(await before.prove(`0x${H64('5')}`, 't', { purpose: 'take', tx: 'ab', walletOutputs })).toEqual({
+      tx: 'ab',
+    });
+    expect(bodies[0]).toEqual({
+      purpose: 'take',
+      tx: 'ab',
+      walletOutputs: [{ nonce: H64('1'), colour: H64('b'), value: '100000000' }],
+    });
+    // The first body is exactly the disclosure; if core does not know the field yet, the second is
+    // the same request without it, and the proof still comes back.
+    if (bodies.length === 2) expect(bodies[1]).toEqual({ purpose: 'take', tx: 'ab' });
+    else expect(bodies).toHaveLength(1);
+  });
 });
 
 describe('the site config', () => {

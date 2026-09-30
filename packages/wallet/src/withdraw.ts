@@ -32,6 +32,7 @@ import {
 } from '@evm-midnight-transparent/core';
 import { getAddress } from 'ethers';
 
+import { walletOutputsFromKeys, type WalletOutput } from './outputs.js';
 import { internalsOf, type Eip1193Request, type TempWallet } from './temp-wallet.js';
 import {
   assertSameAsDraft,
@@ -211,6 +212,9 @@ export interface WithdrawDraft {
    *  amount, colour, destination, nonce, gas, refund recipient) and every Zswap input and output. A
    *  proven answer must erase to exactly this (P4.2-fix C10). */
   readonly erased: string;
+  /** The change the withdrawal pays back to this wallet (none when the coin was exact): `/prove`
+   *  discloses it (P4.2-fix2 R1). */
+  readonly walletOutputs: readonly WalletOutput[];
   readonly buildMs: number;
   readonly balanceMs: number;
   /** Give the booked coins back to the wallet (the withdrawal is abandoned). Idempotent. */
@@ -369,6 +373,7 @@ export async function buildWithdraw(
       singleton,
       identifiers: merged.identifiers().map(String),
       erased: erasedHex(merged),
+      walletOutputs: walletOutputsFromKeys(keys.shieldedSecretKeys, merged),
       buildMs,
       balanceMs,
       release,

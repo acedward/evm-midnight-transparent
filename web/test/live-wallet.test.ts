@@ -64,7 +64,13 @@ describe('the live wiring (P3): the real wallet module, loaded lazily', () => {
     expect(lazy.depositAddressFor(coinPk)).toBe(swapDepositAddress(STAGENET, coinPk));
     expect(loads).toBe(0);
     // A synchronous call before any load is refused (it never happens in a swap: build comes first).
-    const draft = { tx: 'ab', offerId: '00'.repeat(32), terms: { give: [], receive: [] }, release: async () => {} };
+    const draft = {
+      tx: 'ab',
+      offerId: '00'.repeat(32),
+      terms: { give: [], receive: [] },
+      walletOutputs: [],
+      release: async () => {},
+    };
     expect(() => lazy.finalizeTake(draft, 'cd')).toThrow(WalletModuleUnavailable);
     const signer = testSigner();
     const salt = `0x${'5b'.repeat(32)}`;
