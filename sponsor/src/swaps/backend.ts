@@ -88,9 +88,22 @@ export interface RebuiltWithdraw {
   requestId: string;
 }
 
+/** What an open request asks the MPC to sign, as the vault stores it. */
+export interface RequestDetail {
+  /** The ERC20 the signed transaction calls (0x…, checksum not guaranteed). */
+  erc20: string;
+  /** The `transfer` amount in its calldata. */
+  amount: bigint;
+  evmNonce: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
+}
+
 export interface OpenRequests {
   ids: string[];
   pathOf(requestId: string): string | undefined;
+  /** The request's transaction fields (undefined when they cannot be read). */
+  detailOf(requestId: string): RequestDetail | undefined;
 }
 
 export interface SwapBackend {

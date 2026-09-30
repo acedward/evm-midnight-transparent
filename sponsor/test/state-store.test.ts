@@ -173,7 +173,17 @@ describe('restarts: the service resumes every swap in flight from its recorded r
     transition(rec, 'withdrawing', rec.updatedAt);
     // (the request as the vault holds it after the start)
     const requestId = 'ab'.repeat(32);
-    vault.requests.set(requestId, { kind: 'withdraw', id: requestId, path: 'vault', evmNonce: 9n, signer: VAULT_EVM });
+    vault.requests.set(requestId, {
+      kind: 'withdraw',
+      id: requestId,
+      path: 'vault',
+      evmNonce: 9n,
+      signer: VAULT_EVM,
+      erc20: tok('USDC').sepoliaAddress,
+      amount: 1_000_000n,
+      gasLimit: 100_000n,
+      maxFeePerGas: 10_000_000_000n,
+    });
     rec.withdrawals.push({
       kind: 'swap',
       colour: tok('USDC').midnightColour,

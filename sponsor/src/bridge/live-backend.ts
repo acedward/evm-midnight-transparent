@@ -31,6 +31,7 @@ import type {
   OpenRequests,
   RebuiltWithdraw,
   RelayOutcome,
+  RequestDetail,
   SwapBackend,
   SwapProver,
   WithdrawCallArgs,
@@ -76,6 +77,28 @@ export interface LiveBackend {
 }
 
 const norm = (h: string) => h.replace(/^0x/i, '').toLowerCase();
+
+/**
+ * The transaction fields of a vault request (a Signet `SignBidirectionalEvent` whose txParams are an
+ * `EvmType2TxParams<2, 0, 0>`: `to` = the ERC20, calldata `transfer(address, amount)` with the amount
+ * as its second 32-byte word). Undefined when the record does not have that shape.
+ */
+export function requestDetail(record: Any): RequestDetail | undefined {
+  try {
+    const p = record?.txParams;
+    const words = p?.calldata?.is_some ? p.calldata.value?.words : undefined;
+    if (!(p?.to instanceof Uint8Array) || !Array.isArray(words) || !(words[1] instanceof Uint8Array)) return undefined;
+    return {
+      erc20: `0x${Buffer.from(p.to).toString('hex')}`,
+      amount: BigInt(`0x${Buffer.from(words[1]).toString('hex') || '0'}`),
+      evmNonce: BigInt(p.nonce),
+      gasLimit: BigInt(p.gasLimit),
+      maxFeePerGas: BigInt(p.maxFeePerGas),
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Load the vault and its keys, verify them against the chain, and compose the backend. Throws a
  *  BridgeConfigError when the keys are not the deployed ones (the sponsor then bridges nothing). */
@@ -159,6 +182,7 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         const p = records.get(norm(id))?.path;
         return p === undefined ? undefined : p instanceof Uint8Array ? Buffer.from(p).toString('hex') : norm(String(p));
       },
+      detailOf: (id) => requestDetail(records.get(norm(id))),
     };
   };
 

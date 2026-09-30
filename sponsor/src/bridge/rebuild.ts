@@ -53,7 +53,7 @@ export async function rebuildStartWithdraw(
   reader: VaultStateReader,
   vault: string,
   a: WithdrawCallArgs,
-): Promise<RebuiltWithdraw & { block: { hash: string; height: number } }> {
+): Promise<RebuiltWithdraw & { block: { hash: string; height: number }; request: unknown }> {
   const { createUnprovenCallTxFromInitialStates } = await import('@midnight-ntwrk/midnight-js-contracts');
   const block = await reader.queryBlock();
   if (!block) throw new Error('the indexer returned no block');
@@ -90,11 +90,11 @@ export async function rebuildStartWithdraw(
   // The request the call creates: the vault stores it under its request nonce, then increments it.
   const next = rt.ledger(call.public.nextContractState);
   const requestNonce = BigInt(next.signetRequestNonce) - 1n;
-  const ours: string[] = [];
+  const ours: [string, unknown][] = [];
   for (const [k, v] of next.withdrawEventMap as Iterable<[Uint8Array, Any]>) {
-    if (BigInt(v.requestNonce) === requestNonce) ours.push(norm(Buffer.from(k).toString('hex')));
+    if (BigInt(v.requestNonce) === requestNonce) ours.push([norm(Buffer.from(k).toString('hex')), v]);
   }
   if (ours.length !== 1) throw new Error(`expected one new withdraw request, found ${ours.length}`);
-  return { calls: s.calls, callsDigest: s.callsDigest, requestId: ours[0]!, block };
+  return { calls: s.calls, callsDigest: s.callsDigest, requestId: ours[0]![0], block, request: ours[0]![1] };
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */

@@ -6,6 +6,7 @@
 import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transparent/core';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { StaleCloser } from '../src/swaps/stale.js';
 import { VAULT_EVM } from './fakes.js';
 import {
   BID,
@@ -539,5 +540,95 @@ describe('C7: a sponsorship budget', () => {
     expect((await openMany(hh, 2, 'after-loop')).map((o) => o.status)).toEqual([201, 503]);
     hh.now.ms += 86_400_000 + 1_000;
     expect(hh.swaps.budgetStatus().dustSpentSpecks24h).toBe('0');
+  });
+});
+
+// ── C12 ────────────────────────────────────────────────────────────────────────
+
+describe('C12: the sponsor adopts only requests that are this swap’s, and adoption obeys the closer’s caps', () => {
+  it('an attacker’s 1-unit startDeposit to the swap’s recipient is not adopted: the sponsor starts its own', async () => {
+    const s = bidSwap(h);
+    const o = await openSwap(h, s);
+    fund(h, o);
+    const attacker = await h.vault.startDeposit({
+      recipientCoinPk: s.payload.tempCoinPk,
+      erc20: o.erc20Address,
+      amount: 1n,
+      gas: { gasLimit: 65_000n, maxFeePerGas: 9_000_000_000n, maxPriorityFeePerGas: 3_000_000_000n, keyVersion: 1n },
+      evmNonce: 0n,
+    });
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    const rec = h.store.get(s.swapId)!;
+    expect(rec.deposit!.requestId).not.toBe(attacker.requestId);
+    expect(rec.deposit!.stages.map((x) => x.stage)).not.toContain('adopted');
+    expect(h.vault.log.filter((l) => l.startsWith('startDeposit'))).toHaveLength(2);
+    expect(rec.state).toBe('minted');
+  });
+
+  it('nor one for another token of the same amount', async () => {
+    const s = bidSwap(h);
+    const o = await openSwap(h, s);
+    fund(h, o);
+    const other = await h.vault.startDeposit({
+      recipientCoinPk: s.payload.tempCoinPk,
+      erc20: tok('stkB').sepoliaAddress,
+      amount: BigInt(o.amount),
+      gas: { gasLimit: 65_000n, maxFeePerGas: 2_500_000_000n, maxPriorityFeePerGas: 500_000_000n, keyVersion: 1n },
+      evmNonce: 0n,
+    });
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!.deposit!.requestId).not.toBe(other.requestId);
+  });
+
+  it('a late withdrawal start is adopted only within the closer’s daily cap and DUST reserve, and counts as a spend', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+    const submit = h.vault.submitWithdraw.bind(h.vault);
+    h.vault.submitWithdraw = async () => {
+      throw new Error('the node timed out');
+    };
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token)).status).toBe(202);
+    await h.swaps.idle();
+    const failed = h.store.get(s.swapId)!;
+    expect(failed.state).toBe('minted');
+    const requestId = failed.withdrawals.at(-1)!.requestId!;
+    // ... but the start landed after all
+    h.vault.submitWithdraw = submit;
+    h.vault.requests.set(requestId, {
+      kind: 'withdraw',
+      id: requestId,
+      path: 'vault',
+      evmNonce: w.evmNonce,
+      signer: VAULT_EVM,
+      erc20: tok('USDC').sepoliaAddress,
+      amount: BID.receive.amount,
+      gasLimit: 100_000n,
+      maxFeePerGas: 10_000_000_000n,
+    });
+    const closerWith = (maxPerDay: number, dust: bigint) =>
+      new StaleCloser({
+        config: { enabled: true, intervalMs: 1000, staleAfterMs: 900_000, maxPerDay, minSponsorDustSpecks: 10n ** 16n },
+        service: h.swaps,
+        sponsor: () => ({ configured: true, state: 'synced', synced: true, dustSpecks: dust }),
+        log: h.log,
+        now: () => h.now.ms,
+      });
+    const capped = closerWith(0, 10n ** 20n);
+    await capped.scan();
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!.state).toBe('minted');
+    expect(capped.status().paused).toMatch(/cap/);
+    const poor = closerWith(5, 10n ** 15n);
+    await poor.scan();
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!.state).toBe('minted');
+    const ok = closerWith(5, 10n ** 20n);
+    await ok.scan();
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!).toMatchObject({ state: 'done', outcome: 'swapped' });
+    expect(ok.status().closed24h).toBe(1);
   });
 });

@@ -142,12 +142,16 @@ export class FakeEvm implements EvmReader {
 
 // ── The vault ──────────────────────────────────────────────────────────────────
 
-interface FakeRequest {
+export interface FakeRequest {
   kind: BridgeKind;
   id: string;
   path: string;
   evmNonce: bigint;
   signer: string;
+  erc20: string;
+  amount: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
 }
 
 /** What the next relay of a request does. */
@@ -184,7 +188,22 @@ export class FakeVault implements SwapBackend {
   }
   async openRequests(kind: BridgeKind): Promise<OpenRequests> {
     const mine = [...this.requests.values()].filter((r) => r.kind === kind);
-    return { ids: mine.map((r) => r.id), pathOf: (id) => this.requests.get(id)?.path };
+    return {
+      ids: mine.map((r) => r.id),
+      pathOf: (id) => this.requests.get(id)?.path,
+      detailOf: (id) => {
+        const r = this.requests.get(id);
+        return r
+          ? {
+              erc20: r.erc20,
+              amount: r.amount,
+              evmNonce: r.evmNonce,
+              gasLimit: r.gasLimit,
+              maxFeePerGas: r.maxFeePerGas,
+            }
+          : undefined;
+      },
+    };
   }
   private facts(label: string): MidnightTxFacts {
     const n = ++this.seq;
@@ -212,6 +231,10 @@ export class FakeVault implements SwapBackend {
       path: this.depositPathHex(i.recipientCoinPk),
       evmNonce: i.evmNonce,
       signer,
+      erc20: i.erc20,
+      amount: i.amount,
+      gasLimit: i.gas.gasLimit,
+      maxFeePerGas: i.gas.maxFeePerGas,
     });
     this.startNonces.push({ kind: 'deposit', nonce: i.evmNonce });
     this.version++;
@@ -318,7 +341,17 @@ export class FakeVault implements SwapBackend {
     this.submitted.push(id);
     this.log.push(`startWithdraw nonce=${args.evmNonce} amount=${args.amount}`);
     this.startNonces.push({ kind: 'withdraw', nonce: args.evmNonce });
-    this.requests.set(id, { kind: 'withdraw', id, path: 'vault', evmNonce: args.evmNonce, signer: VAULT_EVM });
+    this.requests.set(id, {
+      kind: 'withdraw',
+      id,
+      path: 'vault',
+      evmNonce: args.evmNonce,
+      signer: VAULT_EVM,
+      erc20: args.erc20,
+      amount: args.amount,
+      gasLimit: args.gas.gasLimit,
+      maxFeePerGas: args.gas.maxFeePerGas,
+    });
     this.version++;
     return this.facts('startWithdraw');
   }

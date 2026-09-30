@@ -24,6 +24,7 @@ import {
   walletWithCoins,
   type VaultFixture,
 } from '../../packages/wallet/test/helpers.js';
+import { requestDetail } from '../src/bridge/live-backend.js';
 import { rebuildStartWithdraw } from '../src/bridge/rebuild.js';
 import type { WithdrawCallArgs } from '../src/swaps/backend.js';
 import { inspectTransaction, makerImbalances } from '../src/validate/inspect.js';
@@ -99,6 +100,16 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
       argsFor(wallet, draft.coinNonce),
     );
     expect(rebuilt.requestId).toBe(B31.requestId);
+    // The request record as the vault stores it: its transaction fields, read by the live
+    // backend's requestDetail (the deposit adoption rule of audit C12 reads the same shape).
+    expect(requestDetail(rebuilt.request)).toEqual({
+      erc20: STKA_ERC20.toLowerCase(),
+      amount: B31.amount,
+      evmNonce: B31.evmNonce,
+      gasLimit: DEFAULT_EVM_GAS.gasLimit,
+      maxFeePerGas: DEFAULT_EVM_GAS.maxFeePerGas,
+    });
+    expect(requestDetail({ txParams: { to: 'x' } })).toBeUndefined();
     expect(rebuilt.calls.map((c) => c.entryPoint)).toEqual(['startWithdraw', 'signBidirectional']);
     expect(summary.calls).toEqual(rebuilt.calls);
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');

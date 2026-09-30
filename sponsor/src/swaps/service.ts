@@ -1363,10 +1363,27 @@ export class SwapService {
     let resumed = d.requestId !== undefined;
     if (!d.requestId) {
       try {
-        // An earlier start of this swap may be open already (a crash after it landed): adopt it.
+        // An earlier start of this swap may be open already (a crash after it landed): adopt it, but
+        // only a request that moves THIS swap's token and amount: `startDeposit` is permissionless,
+        // so anyone can open a request for this recipient (audit C12, F-A7).
         const path = be.depositPathHex(rec.tempCoinPk);
         const open = await be.openRequests('deposit');
-        const mine = open.ids.filter((id) => open.pathOf(id) === path);
+        const ours = (id: string) => {
+          const dt = open.detailOf(id);
+          return (
+            dt !== undefined &&
+            dt.erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase() &&
+            dt.amount === BigInt(rec.pay.amount)
+          );
+        };
+        const forPath = open.ids.filter((id) => open.pathOf(id) === path);
+        const mine = forPath.filter(ours);
+        if (forPath.length > mine.length) {
+          this.deps.log.warn('open deposit requests for this recipient that are not this swap’s', {
+            swapId,
+            requests: forPath.filter((id) => !ours(id)),
+          });
+        }
         if (mine.length > 0) {
           d.requestId = mine[0]!;
           resumed = true;
@@ -1522,7 +1539,7 @@ export class SwapService {
    * A withdrawal that failed before its start was confirmed, whose predicted request is open in
    * the vault after all (the start landed late): adopt it and drive it. Returns the adopted swaps.
    */
-  async adoptLateStarts(sinceS: number): Promise<string[]> {
+  async adoptLateStarts(sinceS: number, limit = Number.POSITIVE_INFINITY): Promise<string[]> {
     const be = this.deps.backend();
     if (!be) return [];
     const candidates = this.deps.store.all().filter((r) => {
@@ -1539,6 +1556,7 @@ export class SwapService {
     const open = await be.openRequests('withdraw');
     const adopted: string[] = [];
     for (const rec of candidates) {
+      if (adopted.length >= limit) break;
       const w = currentWithdrawal(rec)!;
       if (!open.ids.includes(w.requestId!)) continue;
       delete w.error;
