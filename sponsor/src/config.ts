@@ -3,8 +3,8 @@
 // settings; L-SPONSOR added the swap settings (data directory, vault key directory, sweep gas,
 // swap limits, the stale closer). Every variable is listed in sponsor/README.md.
 //
-// Secrets never come from plain env values in production: pass the PATH of a file
-// (SPONSOR_SEED_FILE, SEPOLIA_RPC_URL_FILE), which a deployment mounts read-only. Secrets are
+// Secrets never come from plain env values on a live network (refused: audit F-A17): pass the PATH
+// of a file (SPONSOR_SEED_FILE, SEPOLIA_RPC_URL_FILE), which a deployment mounts read-only. Secrets are
 // returned separately from the config, are registered with the log redactor at startup, and
 // never appear in /health, /v1/config or any log line.
 
@@ -174,10 +174,11 @@ const big = (v: string | undefined, dflt: bigint, name: string): bigint => {
 const str = (v: string | undefined): string | undefined => (v === undefined || v.trim() === '' ? undefined : v.trim());
 
 /**
- * Read a secret from `<NAME>_FILE` (preferred) or, for local development only, `<NAME>`.
- * Returns null when neither is set.
+ * Read a secret from `<NAME>_FILE` (preferred) or, on the local network only, `<NAME>`: a plain
+ * environment value is visible in `docker inspect` and the process table, so a live network refuses
+ * it (audit F-A17). Returns null when neither is set.
  */
-function secret(env: Env, readFile: ReadFile, name: string): string | null {
+function secret(env: Env, readFile: ReadFile, name: string, allowPlain: boolean): string | null {
   const file = str(env[`${name}_FILE`]);
   if (file) {
     let text: string;
@@ -188,7 +189,13 @@ function secret(env: Env, readFile: ReadFile, name: string): string | null {
     }
     return text;
   }
-  return str(env[name]) ?? null;
+  const plain = str(env[name]);
+  if (plain !== undefined && !allowPlain) {
+    throw new ConfigError(
+      `${name} must come from ${name}_FILE on a live network (a plain value is visible in docker inspect)`,
+    );
+  }
+  return plain ?? null;
 }
 
 /**
@@ -381,9 +388,10 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
     logLevel,
   };
 
-  const sponsorSeedSource = secret(env, readFile, 'SPONSOR_SEED');
+  const plainSecrets = network.name === 'undeployed';
+  const sponsorSeedSource = secret(env, readFile, 'SPONSOR_SEED', plainSecrets);
   const sponsorSeedHex = sponsorSeedSource === null ? null : parseSponsorSeed(sponsorSeedSource);
-  const sepoliaRpcUrl = secret(env, readFile, 'SEPOLIA_RPC_URL')?.trim() ?? null;
+  const sepoliaRpcUrl = secret(env, readFile, 'SEPOLIA_RPC_URL', plainSecrets)?.trim() ?? null;
   if (sepoliaRpcUrl !== null) {
     try {
       new URL(sepoliaRpcUrl);

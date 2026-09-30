@@ -3,13 +3,20 @@
 // names its row; each test failed before its fix (several started from auditor A's probes,
 // evidence/00048-evm-midnight-transparent/p4-audit/probes-a/audit-a.test.ts).
 
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transparent/core';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { loadConfig } from '../src/config.js';
 import { StaleCloser } from '../src/swaps/stale.js';
 import { VAULT_EVM, gate, summaryWith } from './fakes.js';
 import {
   BID,
+  LOCAL_TOKENS,
   bidSwap,
   bidTake,
   fund,
@@ -855,5 +862,70 @@ describe('C4: the sponsor binds every shielded coin, not only the calls and the 
     const res = await post(h, SWAP_PATHS.swaps, await openBody(h, s));
     expect(res.status).toBe(422);
     expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('maker-tx');
+  });
+});
+
+// ── C16: F-A17 ────────────────────────────────────────────────────────────────
+
+describe('C16 F-A17: plain-environment secrets are refused on a live network', () => {
+  it('refuses SPONSOR_SEED and SEPOLIA_RPC_URL as plain values on stagenet; takes their _FILE forms', () => {
+    const seed = 'ab'.repeat(32);
+    expect(() => loadConfig({ SPONSOR_NETWORK: 'stagenet', SPONSOR_SEED: seed }, () => '')).toThrow(
+      /SPONSOR_SEED_FILE/,
+    );
+    expect(() =>
+      loadConfig({ SPONSOR_NETWORK: 'stagenet', SEPOLIA_RPC_URL: 'https://rpc.example.org' }, () => ''),
+    ).toThrow(/SEPOLIA_RPC_URL_FILE/);
+    const files: Record<string, string> = { '/s/seed': seed, '/s/rpc': 'https://rpc.example.org' };
+    const ok = loadConfig(
+      { SPONSOR_NETWORK: 'stagenet', SPONSOR_SEED_FILE: '/s/seed', SEPOLIA_RPC_URL_FILE: '/s/rpc' },
+      (f) => files[f]!,
+    );
+    expect(ok.secrets).toMatchObject({ sponsorSeedHex: seed, sepoliaRpcUrl: 'https://rpc.example.org' });
+    // The local network (tests, smoke runs) may still pass them plainly.
+    const local = loadConfig({ SPONSOR_NETWORK: 'undeployed', TOKENS_FILE: '/t', SPONSOR_SEED: seed }, () =>
+      JSON.stringify(LOCAL_TOKENS),
+    );
+    expect(local.secrets.sponsorSeedHex).toBe(seed);
+  });
+});
+
+// ── C16: F-A16 ────────────────────────────────────────────────────────────────
+
+describe('C16 F-A16: the key directory’s compiled JavaScript is pinned before the sponsor runs it', () => {
+  const vendored = (b: string) =>
+    readFileSync(new URL(`../../packages/wallet/src/vendor/vault/${b}/contract/index.js`, import.meta.url));
+  const keyDir = (tamper?: string) => {
+    const dir = mkdtempSync(join(tmpdir(), 'aa00048-fs-keys-'));
+    for (const b of ['Erc20Vault', 'SignetSigner']) {
+      mkdirSync(join(dir, b, 'contract'), { recursive: true });
+      writeFileSync(join(dir, b, 'contract', 'index.js'), vendored(b));
+    }
+    if (tamper) {
+      writeFileSync(
+        join(dir, tamper, 'contract', 'index.js'),
+        'globalThis.__emtTamperedModuleRan = true;\nexport const Contract = class {};\n',
+      );
+    }
+    return dir;
+  };
+
+  it('pins exactly the reviewed build (the wallet’s vendored copies of the audited vault compile)', async () => {
+    const { VAULT_MODULE_SHA256 } = await import('../src/bridge/vault.js');
+    const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+    expect(VAULT_MODULE_SHA256).toEqual({
+      'Erc20Vault/contract/index.js': sha(vendored('Erc20Vault')),
+      'SignetSigner/contract/index.js': sha(vendored('SignetSigner')),
+    });
+  });
+
+  it('refuses a tampered Erc20Vault or SignetSigner module before importing it', async () => {
+    const { loadVault } = await import('../src/bridge/vault.js');
+    for (const tampered of ['Erc20Vault', 'SignetSigner']) {
+      const dir = keyDir(tampered);
+      await expect(loadVault(dir)).rejects.toThrow(/not the reviewed build/);
+      expect((globalThis as { __emtTamperedModuleRan?: boolean }).__emtTamperedModuleRan).toBeUndefined();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

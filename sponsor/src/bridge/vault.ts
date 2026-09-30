@@ -58,7 +58,41 @@ export const BRIDGE_CIRCUITS = [
   'refundWithdraw',
 ] as const;
 
+/**
+ * SHA-256 of the compiled modules the sponsor runs from the key directory: passport 6c7505a compiled
+ * with compactc 0.34.0 (deploy/vault-keys builds exactly these bytes; the wallet vendors the same
+ * files, packages/wallet/src/vendor/vault/PROVENANCE.md). The directory's verifier keys are checked
+ * against the chain, but its JavaScript runs inside the sponsor, next to its seed, so it is checked
+ * here before it is imported (audit F-A16). A re-pin of the vault changes these, in review.
+ */
+export const VAULT_MODULE_SHA256: Readonly<Record<string, string>> = Object.freeze({
+  'Erc20Vault/contract/index.js': 'd98e12adb189430b1cc28ff3a6007d7007a7e3c86e718ac92cba51dab4359296',
+  'SignetSigner/contract/index.js': '61464470a693cda984e77062536450ccc5e9221ea5be68281a2784f75b5f6a95',
+});
+
+export class VaultModuleError extends Error {
+  override name = 'VaultModuleError';
+}
+
+/** Throws VaultModuleError unless every pinned module of `managedDir` is the reviewed build. */
+export function checkVaultModules(managedDir: string): void {
+  for (const [rel, want] of Object.entries(VAULT_MODULE_SHA256)) {
+    let got: string;
+    try {
+      got = sha256(readFileSync(join(managedDir, rel)));
+    } catch {
+      throw new VaultModuleError(`${rel} is missing from the vault key directory`);
+    }
+    if (got !== want) {
+      throw new VaultModuleError(
+        `${rel} is not the reviewed build (sha256 ${got.slice(0, 12)}…, expected ${want.slice(0, 12)}…): refusing to run it`,
+      );
+    }
+  }
+}
+
 export async function loadVault(managedDir: string): Promise<VaultRuntime> {
+  checkVaultModules(managedDir);
   const [{ CompiledContract }, zk] = await Promise.all([
     import('@midnight-ntwrk/compact-js'),
     import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),

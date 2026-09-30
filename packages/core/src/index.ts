@@ -1,5 +1,8 @@
 // @evm-midnight-transparent/core: environment-neutral code shared by the web app and the sponsor.
 
+// First: zod's settings, before any schema below is built (./zod-config.ts).
+import './zod-config.js';
+
 export * from './amount.js';
 export * from './api.js';
 export * from './auth.js';

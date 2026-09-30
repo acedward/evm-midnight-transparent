@@ -55,11 +55,18 @@ phrase="$(for i in $(seq 1 24); do printf '%s ' "${words[$((RANDOM % ${#words[@]
   echo "rpc = \"https://sepolia.infura.io/v3/$(rnd 16)\""
   echo "privateKey: \"0x$(rnd 32)\""
 } >"$selftest/fake.env"
+# A secret pasted into the lockfile is caught too (audit F-A18: bun.lock is skipped by the generic
+# rule only, never by the custom ones).
+echo "  mnemonic: \"${phrase% }\"" >"$selftest/bun.lock"
 echo "secret-scan: self-test of the custom rules"
 rules="$( (gitleaks_run dir test-results/secret-scan-selftest --verbose 2>&1 || true) | grep -o 'RuleID: *[a-z0-9-]*' | awk '{print $2}' | sort -u | tr '\n' ' ')"
 for rule in env-style-wallet-secret bip39-mnemonic-labelled keyed-rpc-url labelled-hex-private-key; do
   case " $rules " in *" $rule "*) ;; *) echo "secret-scan: self-test FAILED: rule $rule did not catch its planted fake" >&2; exit 2 ;; esac
 done
+if ! (gitleaks_run dir test-results/secret-scan-selftest --verbose 2>&1 || true) | grep -Eq 'File: +test-results/secret-scan-selftest/bun\.lock'; then
+  echo "secret-scan: self-test FAILED: the mnemonic planted in a bun.lock was not caught" >&2
+  exit 2
+fi
 echo "secret-scan: self-test PASS (every custom rule caught its planted fake)"
 cleanup
 

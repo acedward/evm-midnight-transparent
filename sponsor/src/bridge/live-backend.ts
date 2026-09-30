@@ -42,6 +42,7 @@ import { relayLoop } from './relay-loop.js';
 import {
   addDustAndSubmit,
   callVault,
+  checkVaultModules,
   loadVault,
   openRequests as vaultOpenRequests,
   publicDataProviderFor,
@@ -119,6 +120,12 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   const vault = norm(b.vaultAddress);
   const singleton = norm(b.signetSingleton);
   const root = sdk.normaliseSecp256k1PublicKey(b.mpcRootPublicKey);
+  try {
+    checkVaultModules(o.managedDir);
+  } catch (e) {
+    // A key directory whose JavaScript is not the reviewed build: the bridge stays off (audit F-A16).
+    throw new BridgeConfigError((e as Error).message);
+  }
   const rt: VaultRuntime = await loadVault(o.managedDir);
   const endpoints = {
     networkId: o.network.midnightNetworkId,
