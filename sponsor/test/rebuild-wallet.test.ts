@@ -27,7 +27,7 @@ import {
 import { requestDetail } from '../src/bridge/live-backend.js';
 import { rebuildStartWithdraw } from '../src/bridge/rebuild.js';
 import type { WithdrawCallArgs } from '../src/swaps/backend.js';
-import { inspectTransaction, makerImbalances } from '../src/validate/inspect.js';
+import { inspectTransaction, makerImbalances, summarise } from '../src/validate/inspect.js';
 import { InvalidTxError, validateTake, validateWithdraw } from '../src/validate/rules.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -113,6 +113,16 @@ describe('the sponsor’s rebuild equals the wallet’s build (recorded stagenet
     expect(rebuilt.calls.map((c) => c.entryPoint)).toEqual(['startWithdraw', 'signBidirectional']);
     expect(summary.calls).toEqual(rebuilt.calls);
     expect(detailOf(() => validateWithdraw(summary, rebuilt, WSTKA))).toBe('accepted');
+    // Audit C4: the coin the wallet hands to the vault is exactly the rebuild's (same commitment,
+    // owned by the vault), and the transaction's structure digest (calls, segments, every coin) is
+    // what /withdraw must carry: erasing the proof material and binding keep it.
+    expect(rebuilt.outputs).toHaveLength(1);
+    expect(rebuilt.outputs[0]!.contract).toBe(VAULT);
+    expect(summary.shielded.outputs.filter((o) => o.contract !== null)).toEqual(rebuilt.outputs);
+    expect(summary.shielded.inputs).toHaveLength(1);
+    const tx = l.Transaction.deserialize('signature', 'pre-proof', 'pre-binding', hexToBytes(draft.tx)) as any;
+    expect(summarise(tx.eraseProofs()).structureDigest).toBe(summary.structureDigest);
+    expect(summarise(tx.bind()).structureDigest).toBe(summary.structureDigest);
     await draft.release();
     await wallet.close();
   });
@@ -159,6 +169,19 @@ describe('G-BRIDGE’s live startWithdraw (the transaction the sponsor paid DUST
     // The shape rules accept it (its own calls as the expected ones): nothing in the rules refuses a real startWithdraw.
     expect(
       detailOf(() => validateWithdraw(summary, { calls: summary.calls, callsDigest: summary.callsDigest }, WSTKA)),
+    ).toBe('accepted');
+    // Audit C4's coin rule on the live transaction: one coin in, one coin out, owned by the vault.
+    const vaultCoins = summary.shielded.outputs.filter((o) => o.contract !== null);
+    expect(vaultCoins).toEqual([{ commitment: expect.stringMatching(/^[0-9a-f]{64}$/), contract: VAULT }]);
+    expect(summary.shielded.inputs).toHaveLength(1);
+    expect(
+      detailOf(() =>
+        validateWithdraw(
+          summary,
+          { calls: summary.calls, callsDigest: summary.callsDigest, outputs: vaultCoins },
+          WSTKA,
+        ),
+      ),
     ).toBe('accepted');
     // ...and it is a finalized transaction, not an unproven one.
     expect(() => l.Transaction.deserialize('signature', 'proof', 'binding', hexToBytes(hex))).not.toThrow();

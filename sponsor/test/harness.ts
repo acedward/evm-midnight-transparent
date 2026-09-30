@@ -122,6 +122,7 @@ export function harness(
     offers,
     inspect: (bytes) => fakeInspect(bytes),
     makerImbalances: offers.makerImbalances,
+    makerTxId: offers.makerTxId,
     sponsor: () => sponsor.status(),
     log,
     now: () => now.ms,
@@ -277,6 +278,11 @@ export function withdrawFor(
 ) {
   const leg = kind === 'swap' ? BID.receive : BID.pay;
   const coinNonce = over.coinNonce ?? hex32(`coin-nonce-${kind}`);
+  const coin = {
+    coinNonce,
+    colour: over.colour ?? leg.token.midnightColour,
+    amount: over.amount ?? leg.amount,
+  };
   const evmNonce = over.evmNonce ?? 9n;
   const calls = fakeWithdrawCalls(
     {
@@ -297,5 +303,5 @@ export function withdrawFor(
     },
     h.vault.version,
   );
-  return { calls, coinNonce, evmNonce, tx: withdrawTx(calls) };
+  return { calls, coinNonce, evmNonce, tx: withdrawTx(calls, {}, coin) };
 }

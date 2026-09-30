@@ -340,7 +340,7 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
 
     async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
       const r = await rebuildStartWithdraw({ compiledContract: rt.compiledContract, ledger: rt.ledger }, pdp, vault, a);
-      return { calls: r.calls, callsDigest: r.callsDigest, requestId: r.requestId };
+      return { calls: r.calls, callsDigest: r.callsDigest, outputs: r.outputs, requestId: r.requestId };
     },
 
     submitWithdraw: (finalTx) =>

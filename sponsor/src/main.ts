@@ -6,6 +6,7 @@
 // key volume and Passport runtime.
 
 import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { KernelClient, decodeOffer } from '@evm-midnight-transparent/core';
@@ -132,6 +133,7 @@ async function main(): Promise<void> {
     offers: { offer: (id) => kernel.offer(id), status: (id) => kernel.offerStatus(id) },
     inspect: (bytes, stage) => inspectTransaction(bytes, stage).summary,
     makerImbalances: (offer) => makerImbalances(decodeOffer(offer)),
+    makerTxId: (offer) => createHash('sha256').update(decodeOffer(offer)).digest('hex'),
     sponsor: () => sponsor.status(),
     log: log.child({ component: 'swaps' }),
   });

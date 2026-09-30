@@ -87,6 +87,8 @@ export interface WithdrawCallArgs {
 export interface RebuiltWithdraw {
   calls: CallSummary[];
   callsDigest: string;
+  /** The coins the call hands to contracts (the vault's): commitment and owner. */
+  outputs: { commitment: string; contract: string | null }[];
   /** The request the call creates (read from the call's own next contract state). */
   requestId: string;
 }

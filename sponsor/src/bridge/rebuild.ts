@@ -95,6 +95,13 @@ export async function rebuildStartWithdraw(
     if (BigInt(v.requestNonce) === requestNonce) ours.push([norm(Buffer.from(k).toString('hex')), v]);
   }
   if (ours.length !== 1) throw new Error(`expected one new withdraw request, found ${ours.length}`);
-  return { calls: s.calls, callsDigest: s.callsDigest, requestId: ours[0]![0], block, request: ours[0]![1] };
+  return {
+    calls: s.calls,
+    callsDigest: s.callsDigest,
+    outputs: s.shielded.outputs.filter((o) => o.contract !== null),
+    requestId: ours[0]![0],
+    block,
+    request: ours[0]![1],
+  };
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */

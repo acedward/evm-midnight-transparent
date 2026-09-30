@@ -190,6 +190,8 @@ export interface SwapServiceDeps {
   inspect: (bytes: Uint8Array, stage: 'unproven' | 'final') => TxSummary;
   /** The segment-0 shielded imbalances of a maker's `swapoffer1…` transaction. */
   makerImbalances: (offerBech32: string) => Record<string, bigint>;
+  /** sha256 (hex) of a maker's `swapoffer1…` transaction bytes: the kernel's offer id (audit C4). */
+  makerTxId: (offerBech32: string) => string;
   sponsor: () => SponsorStatus;
   log: Logger;
   /** ms. */
@@ -601,11 +603,16 @@ export class SwapService {
       throw mismatch('pay', 'the offer does not want what the swap pays');
     }
     let maker: Record<string, bigint>;
+    let makerId: string;
     try {
       maker = this.deps.makerImbalances(offer.offerBech32);
+      makerId = this.deps.makerTxId(offer.offerBech32);
     } catch {
       throw mismatch('maker-tx', 'the offer’s transaction cannot be read');
     }
+    // The kernel names an offer by the sha256 of its maker transaction's bytes: the bytes served
+    // must be the offer this swap signed for, so the take is bound to that transaction (audit C4).
+    if (makerId !== p.offerId) throw mismatch('maker-tx', 'the offer’s transaction is not the one its id names');
     const expected: Record<string, bigint> = {
       [p.receive.colour]: BigInt(p.receive.amount),
       [p.pay.colour]: -BigInt(p.pay.amount),
@@ -1078,6 +1085,7 @@ export class SwapService {
       rec.provenWithdraw = {
         kind,
         callsDigest: summary.callsDigest,
+        structureDigest: summary.structureDigest,
         coinNonce: req.coinNonce,
         evmNonce: evmNonce.toString(),
         gas: gasRecord(offeredGas),
@@ -1151,7 +1159,12 @@ export class SwapService {
     if (!proven) throw new SwapError(409, SWAP_ERRORS.notProven, 'prove this withdrawal on the sponsor first');
     const bytes = hexBytes(txHex);
     const summary = this.inspect(bytes, 'final');
-    if (summary.callsDigest !== proven.callsDigest) {
+    if (
+      summary.callsDigest !== proven.callsDigest ||
+      (proven.structureDigest !== undefined && summary.structureDigest !== proven.structureDigest)
+    ) {
+      // The same calls AND the same coins as the proven transaction: only proofs and the binding
+      // may differ (audit C4).
       throw new SwapError(409, SWAP_ERRORS.notProven, 'this is not the withdrawal the sponsor proved');
     }
     const leg = this.withdrawLeg(rec, proven.kind);

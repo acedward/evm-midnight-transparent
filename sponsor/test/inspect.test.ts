@@ -107,6 +107,13 @@ describe('the shielded side', () => {
     expect(
       detailOf(() => validateTake(summary, { pay: { colour: A, amount: 1000n }, receive: { colour: B, amount: 5n } })),
     ).toBe('wrong-offer');
+    // audit C4: every shielded coin is read (commitments of users' coins: no contract) and bound
+    // into the structure digest, which a proof-erased copy keeps
+    expect(summary.shielded.inputs).toEqual([]);
+    expect(summary.shielded.outputs).toHaveLength(2);
+    for (const o of summary.shielded.outputs)
+      expect(o).toMatchObject({ commitment: expect.stringMatching(/^[0-9a-f]{64}$/), contract: null });
+    expect(summary.structureDigest).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('reads a maker offer’s imbalances from its finalized bytes', () => {

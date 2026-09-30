@@ -40,8 +40,18 @@ export interface TxSummary {
   imbalances: Record<string, Record<string, bigint>>;
   /** Non-zero UNSHIELDED imbalances, any segment. */
   unshieldedImbalances: number;
-  /** sha256 over every call's digest, in order: what `/withdraw` must match. */
+  /** sha256 over every call's digest, in order. */
   callsDigest: string;
+  /** Every intent's segment id (0 = the guaranteed section), ascending. */
+  segments: number[];
+  /** The guaranteed shielded offer's coins: input nullifiers and output commitments, each with the
+   *  contract that owns it (null for a user's coin; audit C4). */
+  shielded: {
+    inputs: { nullifier: string; contract: string | null }[];
+    outputs: { commitment: string; contract: string | null }[];
+  };
+  /** ./summary.ts `structureDigestOf`: what `/withdraw` must match. */
+  structureDigest: string;
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -159,6 +169,17 @@ export function callDigest(call: {
       }),
     ),
   );
+}
+
+/**
+ * sha256 over everything a proof or a binding cannot change: the calls' digest, the intents' segment
+ * ids, and every guaranteed shielded coin (input nullifiers, output commitments, each with the
+ * contract owning it), sorted. `/withdraw` must carry the structure the sponsor proved (audit C4).
+ */
+export function structureDigestOf(s: Pick<TxSummary, 'callsDigest' | 'segments' | 'shielded'>): string {
+  const ins = s.shielded.inputs.map((i) => `${i.nullifier}/${i.contract ?? ''}`).sort();
+  const outs = s.shielded.outputs.map((o) => `${o.commitment}/${o.contract ?? ''}`).sort();
+  return sha256(JSON.stringify({ calls: s.callsDigest, segments: [...s.segments].sort((a, b) => a - b), ins, outs }));
 }
 
 export const callsDigestOf = (calls: readonly CallSummary[]): string =>

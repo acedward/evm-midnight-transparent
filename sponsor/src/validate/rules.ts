@@ -8,8 +8,11 @@
 //   - a guaranteed shielded offer of at most MAX_COINS inputs and outputs, no transients;
 //   - its segment-0 imbalances are EXACTLY the complement of the maker's: +pay (the coin it
 //     spends into the offer) and -receive (the coin it takes out), nothing else. The offer's own
-//     imbalances were checked against the swap's terms when it opened, so this transaction
-//     balances this offer and no other.
+//     imbalances were checked against the swap's terms when it opened, and its maker transaction
+//     against the offer id (sha256 of its bytes), so this transaction balances this offer;
+//   - its coins (audit C4): the wallet's coin in, the maker's coin out, at most one change coin
+//     besides ((1,1), (1,2) or (2,1)); none of a contract. A separately balanced transfer needs one
+//     more coin in and out, so it never fits (net imbalances cannot see it).
 //
 // WITHDRAW (/prove purpose "withdraw", and /withdraw): the temporary wallet's `startWithdraw`.
 //   - one intent, holding exactly the calls the sponsor itself rebuilt from the swap's values (the
@@ -20,7 +23,12 @@
 //     wallet as refund recipient, the sponsor's gas policy, the EVM nonce);
 //   - every segment balanced in every shielded colour (the wallet spends its coin into the
 //     contract's output), no other colour moved, no unshielded offer, no DUST (the sponsor adds
-//     it), no fallible shielded offer, at most MAX_COINS inputs and outputs.
+//     it), no fallible shielded offer, at most MAX_COINS inputs and outputs;
+//   - its coins (audit C4): the coin handed to the vault is exactly the rebuild's output (same
+//     commitment, owned by the vault), the wallet's coin in, at most one change coin out or a
+//     second coin in; no contract's coin spent or paid otherwise. `/withdraw` must then carry the
+//     proven transaction's exact structure (calls, segments, every coin: ./summary.ts
+//     `structureDigestOf`), apart from proofs and the binding.
 
 import type { InvalidTxDetail } from '@evm-midnight-transparent/core';
 
@@ -62,6 +70,46 @@ export interface LegTerms {
   amount: bigint;
 }
 
+/**
+ * The take's coins (audit C4): the wallet's pay coin(s) in, the maker's coin out, and at most one
+ * change coin besides: (1 in, 1 out), (1 in, 2 out) or (2 in, 1 out). A separately balanced transfer
+ * needs one more coin in AND one more out, so it never fits. No contract's coin.
+ */
+function takeCoins(s: TxSummary): void {
+  const { inputs, outputs } = s.shielded;
+  if (inputs.some((i) => i.contract !== null) || outputs.some((o) => o.contract !== null)) {
+    fail('contract-coin', 'a take moves no contract’s coin');
+  }
+  if (inputs.length < 1 || outputs.length < 1 || inputs.length + outputs.length > 3) {
+    fail('extra-coins', 'a take spends the wallet’s coin and receives the maker’s, with at most one change coin');
+  }
+}
+
+/**
+ * The withdrawal's coins (audit C4): the coin handed to the vault is exactly the output the
+ * sponsor's rebuild creates (same commitment: the coin's nonce, colour and value, owned by the
+ * vault); besides it, the wallet's coin in, and at most one change coin out or a second coin in.
+ */
+function withdrawCoins(
+  s: TxSummary,
+  contractOutputs: readonly { commitment: string; contract: string | null }[],
+): void {
+  const { inputs, outputs } = s.shielded;
+  const key = (o: { commitment: string; contract: string | null }) => `${o.commitment}/${o.contract ?? ''}`;
+  if (inputs.some((i) => i.contract !== null)) fail('contract-coin', 'a withdrawal spends no contract’s coin');
+  const wanted = new Set(contractOutputs.map(key));
+  for (const k of wanted) {
+    if (!outputs.some((o) => key(o) === k))
+      fail('missing-output', 'the coin handed to the vault is not this withdrawal’s');
+  }
+  const extra = outputs.filter((o) => !wanted.has(key(o)));
+  if (extra.some((o) => o.contract !== null))
+    fail('contract-coin', 'the transaction pays a contract outside the withdrawal');
+  if (inputs.length < 1 || inputs.length + extra.length > 2) {
+    fail('extra-coins', 'a withdrawal spends the wallet’s coin, with at most one change coin (or a second coin in)');
+  }
+}
+
 /** A take for a swap that pays `pay` and receives `receive`. */
 export function validateTake(s: TxSummary, terms: { pay: LegTerms; receive: LegTerms }): void {
   commonShape(s, false);
@@ -83,12 +131,15 @@ export function validateTake(s: TxSummary, terms: { pay: LegTerms; receive: LegT
   for (const [colour, want] of Object.entries(expected)) {
     if (imb[colour] !== want) fail('wrong-amount', 'the transaction balances this offer with other amounts');
   }
+  takeCoins(s);
 }
 
-/** The calls a withdrawal must carry: the sponsor's own rebuild of `startWithdraw` (and its callee). */
+/** The calls a withdrawal must carry: the sponsor's own rebuild of `startWithdraw` (and its callee),
+ *  and, when given, the coins the rebuild hands to the vault (checked coin by coin). */
 export interface ExpectedCalls {
   calls: CallSummary[];
   callsDigest: string;
+  outputs?: readonly { commitment: string; contract: string | null }[];
 }
 
 export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: string): void {
@@ -116,6 +167,7 @@ export function validateWithdraw(s: TxSummary, expected: ExpectedCalls, colour: 
     }
   }
   if (s.callsDigest !== expected.callsDigest) fail('wrong-call', 'the calls differ from the expected startWithdraw');
+  if (expected.outputs) withdrawCoins(s, expected.outputs);
   for (const segment of Object.values(s.imbalances)) {
     for (const [c, v] of Object.entries(segment)) {
       if (v === 0n) continue;

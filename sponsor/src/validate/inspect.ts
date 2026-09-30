@@ -14,6 +14,7 @@ import {
   callsDigestOf,
   entryPointText,
   normaliseAddress,
+  structureDigestOf,
   type CallSummary,
   type TxSummary,
 } from './summary.js';
@@ -93,6 +94,18 @@ export function summarise(tx: Any): TxSummary {
     unshieldedImbalances += i.unshielded;
   }
   const g = tx.guaranteedOffer as Any;
+  const owner = (c: unknown) => (c === undefined || c === null ? null : normaliseAddress(String(c)));
+  const shielded: TxSummary['shielded'] = {
+    inputs: ((g?.inputs ?? []) as Any[]).map((i) => ({
+      nullifier: String(i.nullifier),
+      contract: owner(i.contractAddress),
+    })),
+    outputs: ((g?.outputs ?? []) as Any[]).map((o) => ({
+      commitment: String(o.commitment),
+      contract: owner(o.contractAddress),
+    })),
+  };
+  const callsDigest = callsDigestOf(calls);
   return {
     intents: intents.size,
     calls,
@@ -104,7 +117,10 @@ export function summarise(tx: Any): TxSummary {
     guaranteed: g ? { inputs: g.inputs.length, outputs: g.outputs.length, transients: g.transients.length } : null,
     imbalances,
     unshieldedImbalances,
-    callsDigest: callsDigestOf(calls),
+    callsDigest,
+    segments,
+    shielded,
+    structureDigest: structureDigestOf({ callsDigest, segments, shielded }),
   };
 }
 

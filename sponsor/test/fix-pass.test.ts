@@ -7,7 +7,7 @@ import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transpa
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { StaleCloser } from '../src/swaps/stale.js';
-import { VAULT_EVM, gate } from './fakes.js';
+import { VAULT_EVM, gate, summaryWith } from './fakes.js';
 import {
   BID,
   bidSwap,
@@ -781,5 +781,79 @@ describe('C3: a withdrawal whose start landed keeps its EVM nonce until it settl
     // a restart: a new service over the same store and chain
     const h2 = harness({ store: h.store, vault: h.vault, offers: h.offers });
     expect((await paramsAndBuild(h2, b.s, b.token, 'swap', 'b2')).evmNonce).toBe(10n);
+  });
+});
+
+// ── C4 ─────────────────────────────────────────────────────────────────────────
+
+/** A separately balanced transfer someone appends: one more coin in, one more coin out. */
+const withExtraTransfer = (s: ReturnType<typeof bidTake>) => {
+  const shielded = {
+    inputs: [...s.shielded.inputs, { nullifier: 'ee'.repeat(32), contract: null }],
+    outputs: [...s.shielded.outputs, { commitment: 'ff'.repeat(32), contract: null }],
+  };
+  return summaryWith(s, shielded);
+};
+
+describe('C4: the sponsor binds every shielded coin, not only the calls and the net imbalances', () => {
+  it('/prove withdraw refuses the withdrawal with a separately balanced transfer appended (and proves nothing)', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    const res = await proveWithdraw(h, s, token, { ...w, tx: withExtraTransfer(w.tx) });
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('extra-coins');
+    expect(h.prover.proved).toHaveLength(1); // the take's only
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+  });
+
+  it('/prove withdraw refuses a transaction whose coin for the vault is not this withdrawal’s', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    const otherCoin = summaryWith(w.tx, {
+      inputs: w.tx.shielded.inputs,
+      outputs: [{ commitment: '12'.repeat(32), contract: w.tx.shielded.outputs[0]!.contract }],
+    });
+    const res = await proveWithdraw(h, s, token, { ...w, tx: otherCoin });
+    expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('missing-output');
+  });
+
+  it('/withdraw refuses a transaction that differs from the proven one in its coins (the same calls)', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+    const res = await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(withExtraTransfer(w.tx)) }, token);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('not-proven');
+    expect(h.vault.submitted).toHaveLength(0);
+  });
+
+  it('/prove take refuses a take with an extra balanced transfer; one change coin is fine', async () => {
+    const m = await mintedSwap(h);
+    const extra = await post(
+      h,
+      SWAP_PATHS.prove(m.s.swapId),
+      { purpose: 'take', tx: txHex(withExtraTransfer(bidTake())) },
+      m.token,
+    );
+    expect(extra.status).toBe(422);
+    expect(((await extra.json()) as { error: { detail: string } }).error.detail).toBe('extra-coins');
+    const change = summaryWith(bidTake(), {
+      inputs: [{ nullifier: '01'.repeat(32), contract: null }],
+      outputs: [
+        { commitment: '02'.repeat(32), contract: null },
+        { commitment: '03'.repeat(32), contract: null },
+      ],
+    });
+    expect((await post(h, SWAP_PATHS.prove(m.s.swapId), { purpose: 'take', tx: txHex(change) }, m.token)).status).toBe(
+      200,
+    );
+  });
+
+  it('open refuses an offer whose maker transaction is not the one its id names (offerId = sha256 of its bytes)', async () => {
+    const s = bidSwap(h);
+    h.offers.makerIds.set(`swapoffer1${BID.offerId}`, 'ab'.repeat(32)); // the kernel serves other bytes
+    const res = await post(h, SWAP_PATHS.swaps, await openBody(h, s));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: { detail: string } }).error.detail).toBe('maker-tx');
   });
 });

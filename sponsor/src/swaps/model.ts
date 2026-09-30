@@ -113,6 +113,9 @@ export interface WithdrawOffer {
 export interface ProvenWithdraw {
   kind: WithdrawKind;
   callsDigest: string;
+  /** The proven transaction's structure (calls, segments, every shielded coin): `/withdraw` must
+   *  carry exactly this one, apart from proofs and binding (audit C4). */
+  structureDigest?: string;
   coinNonce: string;
   evmNonce: string;
   gas?: GasRecord;
