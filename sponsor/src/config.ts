@@ -122,9 +122,17 @@ export interface SponsorConfig {
   appName: string;
   /** Health reports low gas when the vault's EVM account holds less than this (wei). */
   vaultGasLowWei: bigint;
-  /** The Sepolia gas fields a withdrawal signs (the MPC signs them verbatim). A withdrawal's gas is
-   *  paid from the vault's shared EVM account, so the sponsor accepts no other values. */
+  /** The Sepolia gas fields a withdrawal signs (the MPC signs them verbatim), paid from the vault's
+   *  shared EVM account. `maxFeePerGas` is the FLOOR: each withdrawal signs max(floor, 2 × the live
+   *  base fee + tip), sized when withdraw-params hands it out (audit C2). */
   bridgeGas: EvmGasPolicy;
+  /** The most a withdrawal's `maxFeePerGas` may be: above it, withdrawals wait for cheaper gas. */
+  bridgeMaxFeeCapWei: bigint;
+  /** A signed transfer still not mined after this long, with the base fee above its cap, is stuck:
+   *  the next withdrawal takes its nonce (a replacement; audit C2). */
+  withdrawStuckAfterSeconds: number;
+  /** A started withdrawal the MPC has not signed after this long is stale the same way. */
+  withdrawUnsignedStaleSeconds: number;
   healthCacheSeconds: number;
   logLevel: LogLevel;
 }
@@ -361,6 +369,14 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       ),
       keyVersion: DEFAULT_EVM_GAS.keyVersion,
     },
+    bridgeMaxFeeCapWei: big(env.BRIDGE_EVM_MAX_FEE_CAP_WEI, 100_000_000_000n, 'BRIDGE_EVM_MAX_FEE_CAP_WEI'),
+    withdrawStuckAfterSeconds: int(env.WITHDRAW_STUCK_AFTER_SECONDS, 1_800, 'WITHDRAW_STUCK_AFTER_SECONDS', 60),
+    withdrawUnsignedStaleSeconds: int(
+      env.WITHDRAW_UNSIGNED_STALE_SECONDS,
+      7_200,
+      'WITHDRAW_UNSIGNED_STALE_SECONDS',
+      1_200,
+    ),
     healthCacheSeconds: int(env.HEALTH_CACHE_SECONDS, 15, 'HEALTH_CACHE_SECONDS', 0, 600),
     logLevel,
   };

@@ -38,6 +38,7 @@ import type {
 } from '../swaps/backend.js';
 import { jsonRpcEvmReader } from './evm.js';
 import { rebuildStartWithdraw } from './rebuild.js';
+import { relayLoop } from './relay-loop.js';
 import {
   addDustAndSubmit,
   callVault,
@@ -232,34 +233,77 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         return { ...(await facts(out.txId, out.status, out.txHash)), requestId: out.requestId };
       }),
 
+    // The sponsor's own bounded loop (./relay-loop.ts, audit C2) over the vendored relayer's
+    // reader and attestation check; one JSON-RPC provider per call, destroyed when it returns.
     async relay(i) {
-      const r = await relayer.relayRequest({
+      const id = norm(i.requestId);
+      const reader = relayer.makeReader({
         publicDataProvider: pdp,
         indexerUrl: o.network.midnight.indexerUrl,
         requesterContractAddress: vault,
         requesterRequestsPath: i.kind === 'deposit' ? [0] : [2],
         signetContractAddress: singleton,
-        requestId: norm(i.requestId),
-        expectedSigner: i.expectedSigner,
-        mpcResponseKey: responseKey,
-        responseSchema,
-        evmRpcUrl: o.evmRpcUrl,
-        outputCache: { networkId: o.network.midnightNetworkId, cacheUrl: b.mpcOutputCacheUrl },
-        signatureTimeoutMs: i.signatureTimeoutMs,
-        intervalMs: 15_000,
-        onProgress: (p) => i.onProgress(p as never),
-        log: (line: string) => o.log.info('relayer', { requestId: i.requestId, line: line.trim() }),
-      });
-      const out: RelayOutcome = {
-        kind: r.kind,
-        event: r.event,
-        serializedOutput: r.serializedOutput,
-        signedTxHash: r.signedTxHash,
-        signatureAfterMs: r.signatureAfterMs,
-        attestationAfterMs: r.attestationAfterMs,
-        ...(r.evmTxHash ? { evmTxHash: r.evmTxHash } : {}),
-      };
-      return out;
+      }) as Any;
+      const cache = new sdk.MpcOutputCacheReader({
+        networkId: o.network.midnightNetworkId,
+        cacheUrl: b.mpcOutputCacheUrl,
+        signetContractAddress: singleton,
+      } as never) as Any;
+      const { JsonRpcProvider } = await import('ethers');
+      const provider = new JsonRpcProvider(o.evmRpcUrl, undefined, { staticNetwork: true });
+      try {
+        const r = await relayLoop(
+          {
+            now: () => Date.now(),
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+            log: (line) => o.log.info('relayer', { requestId: i.requestId, line }),
+            signedTx: async (rid, signer) => {
+              const tx: Any = await reader.getSignedEvmTransaction(rid as never, signer);
+              if (!tx) return undefined;
+              return {
+                hash: String(tx.hash),
+                from: String(tx.from),
+                nonce: Number(tx.nonce),
+                maxFeePerGas: BigInt(tx.maxFeePerGas ?? 0),
+                serialized: String(tx.serialized),
+              };
+            },
+            receipt: async (hash) => {
+              const rc = await provider.getTransactionReceipt(hash);
+              return rc ? { hash: rc.hash, blockNumber: rc.blockNumber, status: rc.status } : null;
+            },
+            latestNonce: (address) => provider.getTransactionCount(address, 'latest'),
+            broadcast: async (serialized) => {
+              await provider.broadcastTransaction(serialized);
+            },
+            finalizedBlock: async () => (await provider.getBlock('finalized'))?.number ?? null,
+            cachedOutput: (rid) => cache.fetchSerializedOutput(rid) as Promise<Uint8Array | undefined>,
+            posts: (rid) => reader.getRespondBidirectionalEvents(rid as never) as Promise<readonly unknown[]>,
+            find: (rid, posts, cached) => relayer.findAttestation(rid, posts, responseKey, responseSchema, cached),
+          },
+          {
+            requestId: id,
+            expectedSigner: i.expectedSigner,
+            signatureTimeoutMs: i.signatureTimeoutMs,
+            attestationTimeoutMs: i.attestationTimeoutMs ?? relayer.DEFAULT_ATTESTATION_TIMEOUT_MS,
+            intervalMs: 15_000,
+            rebroadcastMs: 60_000,
+            onProgress: (p) => i.onProgress(p),
+          },
+        );
+        const out: RelayOutcome = {
+          kind: r.kind,
+          event: sdk.respondBidirectionalEventToCircuitInput(r.post as never),
+          serializedOutput: r.serializedOutput,
+          signedTxHash: r.signedTxHash,
+          signatureAfterMs: r.signatureAfterMs,
+          attestationAfterMs: r.attestationAfterMs,
+          ...(r.evmTxHash ? { evmTxHash: r.evmTxHash } : {}),
+        };
+        return out;
+      } finally {
+        provider.destroy();
+      }
     },
 
     attestation,

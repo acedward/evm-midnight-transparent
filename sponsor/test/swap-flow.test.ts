@@ -566,16 +566,16 @@ describe('the ONE withdrawal lane (the vault account’s nonce)', () => {
     h.vault.defaultRelay = { beforeBroadcast: hold.promise };
     await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token);
     await post(h, SWAP_PATHS.withdraw(b.s.swapId), { tx: txHex(wb.tx) }, b.token);
-    // a holds the lane until its transfer is broadcast; b waits
+    // a's start holds nonce 9 from the moment it lands (its persisted reservation) and frees the lane
+    // at once; b, signed for 9 too, is refused at the head before anything is paid (audit C2, C3)
     await new Promise((r) => setTimeout(r, 20));
-    expect(h.swaps.lanes().withdrawal).toEqual({ running: 1, waiting: 1 });
+    expect(h.swaps.lanes().withdrawal).toEqual({ running: 0, waiting: 0 });
     expect(h.vault.submitted).toHaveLength(1);
-    hold.open();
-    await h.swaps.idle();
-    // b's nonce 9 was consumed by a: refused before anything was paid
-    expect(h.store.get(a.s.swapId)!.state).toBe('done');
     expect(h.store.get(b.s.swapId)!.state).toBe('minted');
     expect(h.store.get(b.s.swapId)!.withdrawals.at(-1)!.error!.code).toBe('stale-evm-nonce');
+    hold.open();
+    await h.swaps.idle();
+    expect(h.store.get(a.s.swapId)!.state).toBe('done');
     expect(h.vault.startNonces.filter((x) => x.kind === 'withdraw').map((x) => x.nonce)).toEqual([9n]);
     // b rebuilds on the next nonce and goes
     h.vault.defaultRelay = {};
@@ -593,7 +593,7 @@ describe('the ONE withdrawal lane (the vault account’s nonce)', () => {
     expect(new Set(nonces).size).toBe(nonces.length);
   });
 
-  it('withdraw-params promises the next nonce while a start holds the lane; that withdrawal waits and starts after the broadcast', async () => {
+  it('withdraw-params promises the next nonce while a started transfer is not mined; that withdrawal starts at once', async () => {
     const { a, b } = await twoTaken();
     const wa = withdrawFor(h, a.s, 'swap', { coinNonce: hex32('a') });
     await proveWithdraw(h, a.s, a.token, wa);
@@ -611,15 +611,14 @@ describe('the ONE withdrawal lane (the vault account’s nonce)', () => {
     expect((await proveWithdraw(h, b.s, b.token, wb)).status).toBe(200);
     await post(h, SWAP_PATHS.withdraw(b.s.swapId), { tx: txHex(wb.tx) }, b.token);
     await new Promise((r) => setTimeout(r, 20));
-    expect(h.vault.submitted).toHaveLength(1);
+    // a's start holds nonce 9; the lane is free, so b starts with 10 before a's transfer is mined
+    expect(h.vault.submitted).toHaveLength(2);
     hold.open();
     await new Promise((r) => setTimeout(r, 20));
-    // a's transfer is broadcast: the lane is free, b starts while a still waits for its attestation
-    expect(h.vault.submitted).toHaveLength(2);
     const order = h.vault.log.filter((l) => l.startsWith('broadcast withdraw') || l.startsWith('startWithdraw'));
     expect(order[0]).toMatch(/^startWithdraw nonce=9/);
-    expect(order[1]).toMatch(/^broadcast withdraw .* nonce=9/);
-    expect(order[2]).toMatch(/^startWithdraw nonce=10/);
+    expect(order[1]).toMatch(/^startWithdraw nonce=10/);
+    expect(order.slice(2).every((l) => l.startsWith('broadcast withdraw'))).toBe(true);
     attest.open();
     await h.swaps.idle();
     expect(h.store.get(a.s.swapId)!.state).toBe('done');

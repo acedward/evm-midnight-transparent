@@ -37,7 +37,23 @@ export interface LegRecord {
   decimals: number;
 }
 
-export interface DepositRecord {
+/** The EIP-1559 fee fields a request signs (decimal strings). */
+export interface GasRecord {
+  gasLimit: string;
+  maxFeePerGas: string;
+  maxPriorityFeePerGas: string;
+}
+
+/** The relay's progress on the signed Sepolia transfer (both legs; audit C2, C3). */
+interface TransferProgress {
+  /** ms: when the MPC's signature was first seen. */
+  signedAtMs?: number;
+  signedTxHash?: string;
+  /** ms: when the transfer's receipt was first seen. */
+  minedAtMs?: number;
+}
+
+export interface DepositRecord extends TransferProgress {
   stage: string;
   stages: StageEntry[];
   attempts: number;
@@ -56,7 +72,7 @@ export interface DepositRecord {
   seenAt?: number;
 }
 
-export interface WithdrawRecord {
+export interface WithdrawRecord extends TransferProgress {
   kind: WithdrawKind;
   colour: string;
   amount: string;
@@ -67,6 +83,8 @@ export interface WithdrawRecord {
   evmNonce: string;
   /** The nonce of the coin the call hands to the vault (public: a call argument). */
   coinNonce: string;
+  /** The transfer's fee fields, sized from the live base fee at withdraw-params (audit C2). */
+  gas?: GasRecord;
   /** The request the call creates (predicted from the call's own next state, before it is sent). */
   requestId?: string;
   startTx?: string;
@@ -86,6 +104,8 @@ export interface WithdrawOffer {
   evmNonce: string;
   /** A digest of the vault's contract state when the parameters were handed out. */
   vaultMark?: string;
+  /** The fee fields handed out (sized from the live base fee; audit C2). */
+  gas?: GasRecord;
   at: number;
 }
 
@@ -95,6 +115,7 @@ export interface ProvenWithdraw {
   callsDigest: string;
   coinNonce: string;
   evmNonce: string;
+  gas?: GasRecord;
   at: number;
 }
 

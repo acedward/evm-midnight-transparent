@@ -22,9 +22,12 @@ export interface EvmReader {
 
 export type BridgeKind = 'deposit' | 'withdraw';
 
-/** One stage of the relayer loop, as the vault's `relayRequest` reports it. */
+/** One stage of the relayer loop (../bridge/relay-loop.ts). */
 export type RelayProgress =
-  | { stage: 'signed'; signedTxHash: string; from: string; nonce: number; afterMs: number }
+  | { stage: 'signed'; signedTxHash: string; from: string; nonce: number; afterMs: number; maxFeePerGas?: bigint }
+  /** The signed transfer was broadcast and is not mined yet (reported once; it is broadcast again
+   *  until it is mined or its nonce is consumed). */
+  | { stage: 'pending'; signedTxHash: string; nonce: number; afterMs: number }
   | {
       stage: 'broadcast';
       evmTxHash: string;
@@ -125,12 +128,15 @@ export interface SwapBackend {
     gas: EvmGasPolicy;
     evmNonce: bigint;
   }): Promise<MidnightTxFacts & { requestId: string }>;
-  /** The relayer loop for one request (resumable: re-running it with the same id is safe). */
+  /** The relayer loop for one request (resumable: re-running it with the same id is safe). It never
+   *  waits without a deadline: it throws once the signature or the attestation is overdue. */
   relay(input: {
     kind: BridgeKind;
     requestId: string;
     expectedSigner: string;
     signatureTimeoutMs: number;
+    /** Counted from the signature; the backend's default when absent. */
+    attestationTimeoutMs?: number;
     onProgress: (p: RelayProgress) => void;
   }): Promise<RelayOutcome>;
   /** The request's attestation if one already verifies, without waiting or broadcasting. */

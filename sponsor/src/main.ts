@@ -165,6 +165,7 @@ async function main(): Promise<void> {
         swaps: swaps.countsByState(),
         mpc: swaps.mpcStatus(),
         budget: swaps.budgetStatus(),
+        reservations: swaps.reservationsStatus(),
         staleCloser: {
           enabled: cs.enabled,
           lastScanAt: cs.lastScanAt,

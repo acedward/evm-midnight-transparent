@@ -7,7 +7,7 @@ import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transpa
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { StaleCloser } from '../src/swaps/stale.js';
-import { VAULT_EVM } from './fakes.js';
+import { VAULT_EVM, gate } from './fakes.js';
 import {
   BID,
   bidSwap,
@@ -630,5 +630,156 @@ describe('C12: the sponsor adopts only requests that are this swap’s, and adop
     await h.swaps.idle();
     expect(h.store.get(s.swapId)!).toMatchObject({ state: 'done', outcome: 'swapped' });
     expect(ok.status().closed24h).toBe(1);
+  });
+});
+
+// ── C2 / C3 ────────────────────────────────────────────────────────────────────
+
+const GWEI = 1_000_000_000n;
+const tick = () => new Promise((r) => setTimeout(r, 20));
+
+/** Two swaps that have taken their offer (A and B), ready to withdraw. */
+async function twoTaken(hh: Harness) {
+  const a = await takenSwap(hh, bidSwap(hh, undefined, 'A'));
+  const b = await takenSwap(hh, bidSwap(hh, undefined, 'B'));
+  return { a, b };
+}
+
+describe('C2: fees follow the live base fee, and a transfer that is never mined never holds the lane', () => {
+  it('withdraw-params sizes the transfer’s fee from the live base fee: 2 × base + tip, at least 10 gwei, at most the cap', async () => {
+    const { s, token } = await takenSwap(h);
+    const params = async () => get(h, `${SWAP_PATHS.withdrawParams(s.swapId)}?kind=swap`, token);
+    h.vault.evm.baseFee = 20n * GWEI;
+    expect(((await (await params()).json()) as { gas: { maxFeePerGas: string } }).gas.maxFeePerGas).toBe(
+      (41n * GWEI).toString(),
+    );
+    h.vault.evm.baseFee = 1n * GWEI;
+    expect(((await (await params()).json()) as { gas: { maxFeePerGas: string } }).gas.maxFeePerGas).toBe(
+      (10n * GWEI).toString(),
+    );
+    h.vault.evm.baseFee = 60n * GWEI; // 121 gwei > the 100 gwei cap
+    expect((await params()).status).toBe(503);
+  });
+
+  it('a withdrawal priced under the base fee at the head of the lane is not started: retry with a new fee', async () => {
+    const { s, token } = await takenSwap(h);
+    h.vault.evm.baseFee = 20n * GWEI;
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+    h.vault.evm.baseFee = 45n * GWEI; // 45 + 1 > 41: this transfer could not be mined now
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token)).status).toBe(202);
+    await h.swaps.idle();
+    const v = await view(h, s, token);
+    expect(v.withdrawal).toEqual({ attempts: 1, last: 'start-failed', retry: true });
+    expect(v.withdraw!.error!.code).toBe('stale-gas');
+    expect(h.vault.submitted).toHaveLength(0);
+    const w2 = await paramsAndBuild(h, s, token, 'swap', 'repriced');
+    expect(w2.calls).not.toEqual(w.calls);
+    expect((await proveWithdraw(h, s, token, w2)).status).toBe(200);
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w2.tx) }, token)).status).toBe(202);
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!.state).toBe('done');
+  });
+
+  it('the lane is released once the start is on chain: a transfer not yet mined does not hold the next withdrawal (probe P2)', async () => {
+    const hold = gate();
+    const { a, b } = await twoTaken(h);
+    h.vault.defaultRelay = { beforeBroadcast: hold.promise };
+    const wa = await paramsAndBuild(h, a.s, a.token, 'swap', 'a');
+    expect(wa.evmNonce).toBe(9n);
+    expect((await proveWithdraw(h, a.s, a.token, wa)).status).toBe(200);
+    expect((await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token)).status).toBe(202);
+    await tick();
+    const wb = await paramsAndBuild(h, b.s, b.token, 'swap', 'b');
+    expect(wb.evmNonce).toBe(10n);
+    expect((await proveWithdraw(h, b.s, b.token, wb)).status).toBe(200);
+    expect((await post(h, SWAP_PATHS.withdraw(b.s.swapId), { tx: txHex(wb.tx) }, b.token)).status).toBe(202);
+    await tick();
+    expect(h.swaps.lanes().withdrawal).toEqual({ running: 0, waiting: 0 });
+    expect(h.vault.startNonces.filter((x) => x.kind === 'withdraw').map((x) => x.nonce)).toEqual([9n, 10n]);
+    hold.open();
+    await h.swaps.idle();
+    expect(h.store.get(a.s.swapId)!.state).toBe('done');
+    expect(h.store.get(b.s.swapId)!.state).toBe('done');
+  });
+
+  it('a transfer signed but unmined for 30 min with the base fee above its cap is replaced by the next withdrawal (same nonce); the stuck one is refunded and retried', async () => {
+    const hold = gate();
+    const { a, b } = await twoTaken(h);
+    const stuckPlan: { beforeBroadcast: Promise<void>; kind?: 'never-executed' } = { beforeBroadcast: hold.promise };
+    h.vault.defaultRelay = stuckPlan;
+    const wa = await paramsAndBuild(h, a.s, a.token, 'swap', 'a'); // 10 gwei at base 0.952
+    await proveWithdraw(h, a.s, a.token, wa);
+    await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token);
+    await tick(); // A's start landed and the MPC signed nonce 9; it is not mined
+    h.now.ms += 31 * 60_000;
+    h.vault.evm.baseFee = 12n * GWEI; // 12 + 1 > 10: A cannot be mined now
+    h.vault.defaultRelay = {};
+    const wb = await paramsAndBuild(h, b.s, b.token, 'swap', 'b');
+    expect(wb.evmNonce).toBe(9n); // the replacement
+    expect((await proveWithdraw(h, b.s, b.token, wb)).status).toBe(200);
+    expect((await post(h, SWAP_PATHS.withdraw(b.s.swapId), { tx: txHex(wb.tx) }, b.token)).status).toBe(202);
+    await tick();
+    expect(h.store.get(b.s.swapId)!.state).toBe('done'); // B mined at nonce 9 ...
+    stuckPlan.kind = 'never-executed'; // ... so the MPC attests A never executed
+    hold.open();
+    await h.swaps.idle();
+    const va = await view(h, a.s, a.token);
+    expect(va.state).toBe('minted');
+    expect(va.withdrawal).toEqual({ attempts: 1, last: 'refunded', retry: true });
+  });
+
+  it('a start the MPC has not signed for 2 h is replaced too', async () => {
+    const { a, b } = await twoTaken(h);
+    h.vault.defaultRelay = { fail: "timed out after 1200 s waiting for the MPC's signature on x (expected signer y)" };
+    const wa = await paramsAndBuild(h, a.s, a.token, 'swap', 'a');
+    await proveWithdraw(h, a.s, a.token, wa);
+    await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token);
+    await h.swaps.idle();
+    h.vault.defaultRelay = {};
+    h.now.ms += 30 * 60_000;
+    expect((await paramsAndBuild(h, b.s, b.token, 'swap', 'b1')).evmNonce).toBe(10n); // A still holds 9
+    h.now.ms += 2 * 3_600_000;
+    expect((await paramsAndBuild(h, b.s, b.token, 'swap', 'b2')).evmNonce).toBe(9n); // A is stale: replaced
+  });
+
+  it('the sweep signs the largest fee the ETH at the deposit address covers, and waits for more ETH when the base fee outgrew it', async () => {
+    const s = bidSwap(h);
+    const o = await openSwap(h, s); // sized at base 0.952 gwei: 2.5 gwei, 65,000 gas
+    fund(h, o);
+    h.vault.evm.baseFee = 3n * GWEI; // 1.25 × 3 + 0.5 = 4.25 gwei > the 2.5 gwei the ETH covers
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    const rec = h.store.get(s.swapId)!;
+    expect(rec.state).toBe('awaiting_funds');
+    expect(h.vault.log.filter((l) => l.startsWith('startDeposit'))).toHaveLength(0);
+    expect(rec.sweepGas).toMatchObject({
+      maxFeePerGas: (65n * GWEI) / 10n + '',
+      ethWei: (65_000n * 65n * GWEI) / 10n + '',
+    });
+    expect((await view(h, s, o.swapToken)).sweepGas.ethWei).toBe(rec.sweepGas.ethWei);
+    h.vault.evm.setEth(o.depositAddress, 65_000n * 7n * GWEI); // the page topped up (a little more)
+    await h.swaps.pollDeposits();
+    await h.swaps.idle();
+    expect(h.store.get(s.swapId)!.state).toBe('minted');
+    expect(h.vault.log.find((l) => l.startsWith('startDeposit'))).toMatch(/gas=65000x7000000000$/);
+  });
+});
+
+describe('C3: a withdrawal whose start landed keeps its EVM nonce until it settles', () => {
+  it('after a signature timeout the next withdrawal takes the next nonce, also after a restart', async () => {
+    const { a, b } = await twoTaken(h);
+    h.vault.defaultRelay = { fail: "timed out after 1200 s waiting for the MPC's signature on x (expected signer y)" };
+    const wa = await paramsAndBuild(h, a.s, a.token, 'swap', 'a');
+    expect(wa.evmNonce).toBe(9n);
+    await proveWithdraw(h, a.s, a.token, wa);
+    await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token);
+    await h.swaps.idle();
+    expect(h.store.get(a.s.swapId)!.withdrawals.at(-1)!.stage).toBe('relay-stalled');
+    h.vault.defaultRelay = {};
+    expect((await paramsAndBuild(h, b.s, b.token, 'swap', 'b')).evmNonce).toBe(10n);
+    // a restart: a new service over the same store and chain
+    const h2 = harness({ store: h.store, vault: h.vault, offers: h.offers });
+    expect((await paramsAndBuild(h2, b.s, b.token, 'swap', 'b2')).evmNonce).toBe(10n);
   });
 });
