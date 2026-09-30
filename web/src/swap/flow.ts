@@ -167,6 +167,14 @@ export function afterMint(record: SwapRecord, balances: Readonly<Record<string, 
   return 'wait-coin';
 }
 
+/** When the bridge-in began, for the page's "so far": the first sponsor stage once the funds are
+ *  there. The real sponsor's list starts with `waiting-for-funds` when the swap OPENS, which can be
+ *  long before the user sends the funds (plan P3: a swap funded 20 minutes after it opened showed
+ *  "19 min 52 s so far" 30 seconds into its bridge-in). */
+export function bridgeInStartedAt(record: SwapRecord): number | undefined {
+  return record.bridgeIn.stages?.find((s) => s.stage !== 'waiting-for-funds')?.at;
+}
+
 export const STAGE_KEYS = ['start', 'fund', 'bridge-in', 'take', 'bridge-out', 'done'] as const;
 export type StageKey = (typeof STAGE_KEYS)[number];
 export type StageState = 'done' | 'current' | 'pending' | 'failed';

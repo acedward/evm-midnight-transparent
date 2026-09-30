@@ -20,7 +20,7 @@ import {
   type TrackerStage,
 } from '../../design/index.js';
 import { amountText, clockText, elapsedText, ethText, legText } from '../../swap/display.js';
-import { type StageKey, stageStates, stageTitle } from '../../swap/flow.js';
+import { type StageKey, bridgeInStartedAt, stageStates, stageTitle } from '../../swap/flow.js';
 import { bridgeRequestUrl, midnightTxUrl, sepoliaAddressUrl, sepoliaTxUrl } from '../../swap/links.js';
 import { BRIDGE_IN_ESTIMATE_MIN } from '../../swap/offers.js';
 import { type SwapRecord, isFinished } from '../../swap/record-shape.js';
@@ -340,7 +340,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
     </>
   );
 
-  const inStart = record?.bridgeIn.stages?.[0]?.at;
+  const inStart = record ? bridgeInStartedAt(record) : undefined;
   const bridgeInDetail = record && (
     <>
       <p className="small">
