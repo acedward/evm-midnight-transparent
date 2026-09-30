@@ -13,6 +13,7 @@ import {
   stageStates,
   stageTitle,
   withdrawalStatus,
+  revivalNote,
 } from '../src/swap/flow.js';
 import {
   MIN_TIME_TO_EXPIRY_MS,
@@ -411,5 +412,21 @@ describe('the six stages', () => {
     expect(stageTitle('withdraw', 'settled')).toBe('Withdrawal closed on Midnight');
     expect(stageTitle('withdraw', 'evm-broadcast')).toBe('Tokens sent to you on Sepolia');
     expect(stageTitle('deposit', 'something-new')).toBe('something-new');
+    // FS2's new stage ids (P4.2-fix2 R4, R5, R6).
+    expect(stageTitle('deposit', 'budget-wait')).toMatch(/daily budget/);
+    expect(stageTitle('deposit', 'completed-foreign')).toMatch(/Another request/);
+    expect(stageTitle('withdraw', 'submission-uncertain')).toMatch(/Checking whether/);
+    expect(stageTitle('withdraw', 'adopted')).toBe('Withdrawal found on Midnight');
+  });
+
+  it("says from when a Resume revives a recoverable failure in its cooldown (FS2's retryAt, P4.2-fix2 R3)", () => {
+    const at = Date.UTC(2026, 8, 30, 14, 6, 9);
+    const failed = view('failed', { recoverable: true, retryAt: at / 1000 });
+    expect(revivalNote(failed, at - 60_000)).toBe(
+      'The sponsor can revive this swap from 14:06:09 UTC: resume it then.',
+    );
+    expect(revivalNote(failed, at + 1)).toBeNull();
+    expect(revivalNote(view('failed', { recoverable: false, retryAt: at / 1000 }), 0)).toBeNull();
+    expect(revivalNote(view('failed', { recoverable: true }), 0)).toBeNull();
   });
 });

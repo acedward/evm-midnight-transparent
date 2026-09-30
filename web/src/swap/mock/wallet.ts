@@ -160,6 +160,8 @@ export function mockWalletModule(
       const want = offer.wants[0]!;
       const d = draftFor(wallet, { colour: want.token, amount: want.amount });
       const give = offer.gives[0]!;
+      // The received coin (mock coins are exact: no change), disclosed to `/prove` (P4.2-fix2 R1).
+      const received = { nonce: randomHex(), colour: give.token, value: give.amount };
       // Like the real module: the id and the terms of the offer AS SERVED (P4.2-fix C10).
       return Object.assign(d, {
         offerId,
@@ -167,7 +169,14 @@ export function mockWalletModule(
           give: [{ colour: want.token, amount: want.amount }],
           receive: [{ colour: give.token, amount: give.amount }],
         },
-        tx: encodeMockTx({ kind: 'take', coinPk: wallet.coinPk, offerId, draft: d.id }),
+        walletOutputs: [received],
+        tx: encodeMockTx({
+          kind: 'take',
+          coinPk: wallet.coinPk,
+          offerId,
+          draft: d.id,
+          outputs: [{ ...received, value: received.value.toString() }],
+        }),
       });
     },
 
@@ -215,6 +224,8 @@ export function mockWalletModule(
       return Object.assign(d, {
         coinNonce,
         evmNonce: p.evmNonce,
+        // A mock coin is exact: no change comes back (P4.2-fix2 R1).
+        walletOutputs: [],
         tx: encodeMockTx({
           kind: 'withdraw',
           coinPk: wallet.coinPk,
@@ -224,6 +235,7 @@ export function mockWalletModule(
           coinNonce,
           evmNonce: p.evmNonce.toString(),
           draft: d.id,
+          outputs: [],
         }),
       });
     },

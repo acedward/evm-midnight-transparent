@@ -45,7 +45,7 @@ import { getAddress } from 'ethers';
 
 import { ethText } from './display.js';
 import { EvmError, type EvmPort, transferData } from './evm.js';
-import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, withdrawalStatus } from './flow.js';
+import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, revivalNote, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
 import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner, WithdrawDraft } from './ports.js';
 import {
@@ -806,7 +806,10 @@ export class SwapSession {
               ? { kind: 'done' }
               : {
                   kind: 'error',
-                  message: record.error ?? 'The swap failed.',
+                  // FS2 R3: a recoverable failure still in its cooldown says from when Resume revives it.
+                  message: [record.error ?? 'The swap failed.', revivalNote(view, this.deps.now())]
+                    .filter(Boolean)
+                    .join(' '),
                   canRetry: false,
                   // C5: the sponsor can revive it: Resume (one signature and a re-open).
                   ...(isRecoverable(record) ? { canResume: true } : {}),
@@ -910,7 +913,12 @@ export class SwapSession {
     let submitted = false;
     try {
       this.status({ kind: 'working', what: 'Proving the take' });
-      const proven = await backends.sponsor!.prove(this.snap.swapId, this.token!, { purpose: 'take', tx: draft.tx });
+      // P4.2-fix2 R1: the coins the take pays back to the wallet are disclosed with it.
+      const proven = await backends.sponsor!.prove(this.snap.swapId, this.token!, {
+        purpose: 'take',
+        tx: draft.tx,
+        walletOutputs: draft.walletOutputs,
+      });
       if ((await backends.kernel.offerStatus(offerId)) !== 'live') return this.markUnavailable();
       const settlement = backends.wallet.finalizeTake(draft, proven.tx);
       this.status({ kind: 'working', what: 'Submitting the take to the exchange' });
@@ -966,11 +974,17 @@ export class SwapSession {
         kind: 'working',
         what: which === 'receive' ? 'Building the withdrawal' : 'Building the bridge back',
       });
-      const params = await sponsor.withdrawParams(
-        this.snap.swapId,
-        this.token!,
-        which === 'receive' ? 'swap' : 'bridge-back',
-      );
+      let params: Awaited<ReturnType<typeof sponsor.withdrawParams>>;
+      try {
+        params = await sponsor.withdrawParams(
+          this.snap.swapId,
+          this.token!,
+          which === 'receive' ? 'swap' : 'bridge-back',
+        );
+      } catch (e) {
+        if (this.inProgress(e)) return false;
+        throw e;
+      }
       // Never build a withdrawal of anything but this swap's own leg, to anyone but its owner.
       if (
         params.colour !== l.colour ||
@@ -988,6 +1002,7 @@ export class SwapSession {
           tx: draft.tx,
           coinNonce: draft.coinNonce,
           evmNonce: draft.evmNonce.toString(),
+          walletOutputs: draft.walletOutputs,
         });
         const bound = backends.wallet.finalizeWithdraw(draft, proven.tx);
         this.status({ kind: 'working', what: 'Submitting the withdrawal to the sponsor' });
@@ -997,6 +1012,7 @@ export class SwapSession {
         this.submitted = draft;
       } catch (e) {
         await draft.release();
+        if (this.inProgress(e)) return false;
         if (e instanceof SponsorError && e.rebuild && attempt < 3) {
           this.set({ notice: 'The vault moved on while the withdrawal was being proven; building it again.' });
           continue;
@@ -1020,6 +1036,15 @@ export class SwapSession {
       this.set({ view });
       return false;
     }
+  }
+
+  /** The sponsor still settles an earlier withdrawal of this swap (409 `withdrawal-in-progress`,
+   *  FS2 R5: an uncertain submission, or an older attempt found live): not an error, the page waits
+   *  for its view to say what happened. */
+  private inProgress(e: unknown): boolean {
+    if (!(e instanceof SponsorError) || e.code !== 'withdrawal-in-progress') return false;
+    this.status({ kind: 'working', what: 'Waiting for the sponsor to settle an earlier withdrawal' });
+    return true;
   }
 
   // ── user actions ────────────────────────────────────────────────────────

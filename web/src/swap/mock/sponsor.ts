@@ -100,7 +100,8 @@ export interface MockSponsorDump {
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-const fail = (status: number, code: string, message: string) => json({ error: { code, message } }, status);
+const fail = (status: number, code: string, message: string, detail?: string) =>
+  json({ error: { code, message, ...(detail ? { detail } : {}) } }, status);
 
 const randomHex = (bytes: number) =>
   Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -390,12 +391,31 @@ export class MockSponsor {
   }
 
   private prove(s: MockSwap, body: unknown): Response {
-    const b = body as { purpose?: string; tx?: string; coinNonce?: string; evmNonce?: string };
+    const b = body as {
+      purpose?: string;
+      tx?: string;
+      coinNonce?: string;
+      evmNonce?: string;
+      walletOutputs?: Array<{ nonce?: string; colour?: string; value?: string }>;
+    };
     if (!b || (b.purpose !== 'take' && b.purpose !== 'withdraw') || typeof b.tx !== 'string')
       return fail(400, 'bad-request', 'expected {purpose, tx}');
     const tx = decodeMockTx(b.tx);
     const why = this.refusal(s, tx, b.purpose);
     if (why) return fail(422, 'refused', why);
+    // P4.2-fix2 R1, in miniature: every coin the transaction pays to the wallet must be disclosed
+    // (the real sponsor recomputes each commitment); a take always pays one, so it must disclose.
+    const disclosed = new Set((b.walletOutputs ?? []).map((o) => `${o.nonce}:${o.colour}:${o.value}`));
+    if (
+      (b.purpose === 'take' && b.walletOutputs === undefined) ||
+      (tx!.outputs ?? []).some((o) => !disclosed.has(`${o.nonce}:${o.colour}:${o.value}`))
+    )
+      return fail(
+        422,
+        'invalid-tx',
+        'an output is neither the vault coin nor a disclosed wallet coin',
+        'undisclosed-output',
+      );
     if (b.purpose === 'withdraw') {
       if (b.coinNonce !== tx!.coinNonce || b.evmNonce !== tx!.evmNonce)
         return fail(422, 'refused', "the hints are not the transaction's");

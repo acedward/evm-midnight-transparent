@@ -1,3 +1,4 @@
+import * as ledgerV9 from '@midnightntwrk/ledger-v9';
 import { firstValueFrom } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -15,6 +16,7 @@ import {
   txToHex,
   unprovenFromHex,
 } from '../src/index.js';
+import { walletOutputsOf } from '../src/outputs.js';
 import { internalsOf, type TempWallet } from '../src/temp-wallet.js';
 
 import { TEST_SEED_A, TEST_SEED_B, WSTKA, WUSDC, fixture, walletWithCoins } from './helpers.js';
@@ -64,6 +66,39 @@ describe('buildTake: the unproven, shielded-balanced complement of an offer', ()
     const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: 200_000_000n }]);
     const draft = await buildTake(wallet, OFFER.offerBech32);
     expect(shieldedImbalances(unprovenFromHex(draft.tx))).toEqual({ [WSTKA]: WANTED, [WUSDC]: -1_000_000n });
+    await draft.release();
+    await wallet.close();
+  });
+
+  // P4.2-fix2 R1: `/prove` discloses every coin the take pays to the wallet; the sponsor recomputes
+  // each commitment with the temporary coin public key and refuses any output it cannot account for.
+  it('discloses the received coin and the change: their commitments are exactly the outputs (P4.2-fix2 R1)', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: 200_000_000n }]);
+    const draft = await buildTake(wallet, OFFER.offerBech32);
+    const byColour = Object.fromEntries(draft.walletOutputs.map((o) => [o.colour, o.value]));
+    expect(byColour).toEqual({ [WUSDC]: 1_000_000n, [WSTKA]: 200_000_000n - WANTED });
+    const tx = unprovenFromHex(draft.tx);
+    const outputs = new Set(tx.guaranteedOffer!.outputs.map((o) => String(o.commitment)));
+    expect(outputs.size).toBe(2);
+    for (const o of draft.walletOutputs)
+      expect(
+        outputs.has(String(ledgerV9.coinCommitment({ type: o.colour, nonce: o.nonce, value: o.value }, wallet.coinPk))),
+      ).toBe(true);
+    // The same from the hex, as a caller holding only the draft's transaction would compute it.
+    expect(walletOutputsOf(wallet, draft.tx)).toEqual(draft.walletOutputs);
+    // Another wallet's keys see none of them.
+    const other = await walletWithCoins(TEST_SEED_B, []);
+    expect(walletOutputsOf(other, draft.tx)).toEqual([]);
+    await other.close();
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('an exact coin: only the received coin is disclosed (P4.2-fix2 R1)', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: WANTED }]);
+    const draft = await buildTake(wallet, OFFER.offerBech32);
+    expect(draft.walletOutputs.map((o) => [o.colour, o.value])).toEqual([[WUSDC, 1_000_000n]]);
+    expect(draft.walletOutputs[0]!.nonce).toMatch(/^[0-9a-f]{64}$/);
     await draft.release();
     await wallet.close();
   });

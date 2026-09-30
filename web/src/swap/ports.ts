@@ -61,6 +61,13 @@ export interface WithdrawParams {
   evmNonce: bigint;
 }
 
+/** A coin a transaction pays back to the temporary wallet, disclosed to `/prove` (P4.2-fix2 R1). */
+export interface WalletOutput {
+  readonly nonce: string;
+  readonly colour: string;
+  readonly value: bigint;
+}
+
 /** A take, built and unproven: `tx` goes to `/prove`; `release()` gives the booked coin back. */
 export interface TakeDraft {
   readonly tx: TxHex;
@@ -71,6 +78,8 @@ export interface TakeDraft {
     readonly give: ReadonlyArray<{ colour: string; amount: bigint }>;
     readonly receive: ReadonlyArray<{ colour: string; amount: bigint }>;
   };
+  /** The received coin and the change: `/prove` discloses them (P4.2-fix2 R1). */
+  readonly walletOutputs: readonly WalletOutput[];
   release(): Promise<void>;
 }
 
@@ -79,6 +88,8 @@ export interface WithdrawDraft {
   readonly tx: TxHex;
   readonly coinNonce: string;
   readonly evmNonce: bigint;
+  /** The change paid back to the wallet (none for an exact coin): `/prove` discloses it (P4.2-fix2 R1). */
+  readonly walletOutputs: readonly WalletOutput[];
   release(): Promise<void>;
 }
 

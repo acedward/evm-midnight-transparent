@@ -1005,3 +1005,65 @@ describe('P4.2-fix2 R7 (F-B23): the sweep ETH top-up survives a resume', () => {
     expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([first, 'token', first]);
   });
 });
+
+describe('P4.2-fix2 R1 (FS2 item 1): /prove discloses the coins paid back to the temporary wallet', () => {
+  it('the take discloses its received coin, the withdrawal its change (none for an exact coin)', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env); // pay 1.04 USDC, receive 100 stkA
+    const signer = testSigner();
+    const d = deps(signer, new FakeSepolia(signer.address));
+    const proves: Array<Record<string, unknown>> = [];
+    const real = env.sponsorFetch;
+    const watching = async (url: string, init: RequestInit = {}) => {
+      if (url.endsWith('/prove')) proves.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return real(url, init);
+    };
+    const { HttpSponsorApi } = await import('../src/swap/sponsor-client.js');
+    d.backends = { ...d.backends, sponsor: new HttpSponsorApi('https://sponsor.mock.invalid', { fetch: watching }) };
+    const s = track(SwapSession.begin(offer, d));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap');
+    expect(proves.map((p) => p.purpose)).toEqual(['take', 'withdraw']);
+    expect(proves[0]!.walletOutputs).toEqual([
+      {
+        nonce: expect.stringMatching(/^[0-9a-f]{64}$/),
+        colour: offer.receive.token.midnightColour,
+        value: '100000000',
+      },
+    ]);
+    expect(proves[1]!.walletOutputs).toEqual([]);
+  });
+});
+
+describe('P4.2-fix2 (FS2 item 6): 409 withdrawal-in-progress', () => {
+  it('is not an error: the page waits, then builds the withdrawal once the sponsor lets it', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const d = deps(signer, new FakeSepolia(signer.address));
+    let busy = 2;
+    const real = env.sponsorFetch;
+    const settling = async (url: string, init: RequestInit = {}) => {
+      if (url.includes('/withdraw-params') && busy-- > 0)
+        return new Response(
+          JSON.stringify({ error: { code: 'withdrawal-in-progress', message: 'an earlier withdrawal is unresolved' } }),
+          { status: 409 },
+        );
+      return real(url, init);
+    };
+    const { HttpSponsorApi } = await import('../src/swap/sponsor-client.js');
+    d.backends = { ...d.backends, sponsor: new HttpSponsorApi('https://sponsor.mock.invalid', { fetch: settling }) };
+    const s = track(SwapSession.begin(offer, d));
+    const errors: string[] = [];
+    s.subscribe(() => {
+      const st = statusOf(s);
+      if (st.kind === 'error') errors.push(st.message);
+    });
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap after the wait');
+    expect(errors).toEqual([]);
+    expect(busy).toBeLessThan(0);
+  });
+});

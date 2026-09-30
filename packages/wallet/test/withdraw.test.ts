@@ -1,3 +1,4 @@
+import * as ledgerV9 from '@midnightntwrk/ledger-v9';
 import { firstValueFrom } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -137,6 +138,30 @@ describe('buildWithdraw: the temporary wallet builds startWithdraw on the vault 
     );
     expect(draft.requestId).not.toBe(B31.requestId); // another nonce: another request
     expect(draft.requestNonce).toBe(B31.requestNonce);
+    // P4.2-fix2 R1: the change is the one output paid to the wallet, disclosed to `/prove`; its
+    // commitment (recomputed with the temporary coin key, as the sponsor does) is in the transaction.
+    expect(draft.walletOutputs.map((o) => [o.colour, o.value])).toEqual([[WSTKA, 5_000_000n - B31.amount]]);
+    const outputs = new Set(unprovenFromHex(draft.tx).guaranteedOffer!.outputs.map((o) => String(o.commitment)));
+    const [change] = draft.walletOutputs;
+    expect(
+      outputs.has(
+        String(
+          ledgerV9.coinCommitment({ type: change!.colour, nonce: change!.nonce, value: change!.value }, wallet.coinPk),
+        ),
+      ),
+    ).toBe(true);
+    await draft.release();
+    await wallet.close();
+  });
+
+  it('an exact coin: no output is paid to the wallet, nothing to disclose (P4.2-fix2 R1)', async () => {
+    const wallet = await walletWithCoins(TEST_SEED_A, [{ colour: WSTKA, value: B31.amount }]);
+    const draft = await buildWithdraw(
+      wallet,
+      { colour: WSTKA, amount: B31.amount, dest: B31.dest, evmNonce: B31.evmNonce },
+      { reader: fixtureReader(VAULT_AT_679357) },
+    );
+    expect(draft.walletOutputs).toEqual([]);
     await draft.release();
     await wallet.close();
   });
