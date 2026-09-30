@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { SWAP_PATHS, SwapViewSchema, type SwapView } from '@evm-midnight-transparent/core';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { afterMint, withdrawalStatus as pageWithdrawalStatus } from '../../web/src/swap/flow.js';
+import { SwapViewSchema as WebSwapViewSchema } from '../../web/src/swap/sponsor-client.js';
 import { loadConfig } from '../src/config.js';
 import { StaleCloser } from '../src/swaps/stale.js';
 import { VAULT_EVM, gate, summaryWith } from './fakes.js';
@@ -927,5 +929,64 @@ describe('C16 F-A16: the key directory’s compiled JavaScript is pinned before 
       expect((globalThis as { __emtTamperedModuleRan?: boolean }).__emtTamperedModuleRan).toBeUndefined();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── C1 across the lanes: the real sponsor's views through the page's own decision ───────────
+
+describe('C1 across the lanes: the page decides from the real sponsor’s views (the audit’s probe P1)', () => {
+  /** The page's record of a swap whose take landed and whose first withdrawal was submitted. */
+  const pageRecord = (s: SwapInput) =>
+    ({
+      offer: {
+        offerId: BID.offerId,
+        pay: { colour: BID.pay.token.midnightColour, amount: BID.pay.amount.toString() },
+        receive: { colour: BID.receive.token.midnightColour, amount: BID.receive.amount.toString() },
+      },
+      temp: { coinPk: s.payload.tempCoinPk },
+      take: { landed: true },
+      choice: 'swap',
+      phase: 'bridging-out',
+      bridgeIn: {},
+      bridgeOut: { attempts: 1, colour: BID.receive.token.midnightColour },
+    }) as unknown as Parameters<typeof afterMint>[0];
+  const holding = { [BID.receive.token.midnightColour]: BID.receive.amount };
+  const pageView = async (s: SwapInput, token: string) =>
+    WebSwapViewSchema.parse(
+      ((await (await get(h, SWAP_PATHS.swap(s.swapId), token)).json()) as { swap: unknown }).swap,
+    );
+
+  it('after a refund, and after a start refused at the head of the lane, the page rebuilds the withdrawal', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+    h.vault.defaultRelay = { kind: 'never-executed' };
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token)).status).toBe(202);
+    await h.swaps.idle();
+    const refunded = await pageView(s, token);
+    expect(afterMint(pageRecord(s), holding, pageWithdrawalStatus(refunded))).toBe('withdraw-receive');
+
+    h.vault.defaultRelay = {};
+    const w2 = await paramsAndBuild(h, s, token, 'swap', 'second');
+    expect((await proveWithdraw(h, s, token, w2)).status).toBe(200);
+    h.vault.version++; // the vault moves before the head of the lane
+    expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w2.tx) }, token)).status).toBe(202);
+    await h.swaps.idle();
+    const stale = await pageView(s, token);
+    expect(afterMint(pageRecord(s), holding, pageWithdrawalStatus(stale))).toBe('withdraw-receive');
+  });
+
+  it('while a withdrawal runs, the page waits (it never builds a second one)', async () => {
+    const hold = gate();
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    await proveWithdraw(h, s, token, w);
+    h.vault.defaultRelay = { beforeBroadcast: hold.promise };
+    await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token);
+    await tick();
+    const running = await pageView(s, token);
+    expect(afterMint(pageRecord(s), holding, pageWithdrawalStatus(running))).toBe('wait-withdrawal');
+    hold.open();
+    await h.swaps.idle();
   });
 });
