@@ -196,15 +196,18 @@ LOG_LEVEL=info
 - The secrets come only from the `*_FILE` settings: on stagenet the sponsor refuses a plain
   `SPONSOR_SEED` or `SEPOLIA_RPC_URL` (visible in `systemctl show` and the process table).
 - The spending controls keep their defaults unless you set them (`sponsor/README.md`): a daily DUST
-  budget (`SPONSOR_DAILY_DUST_BUDGET`, 500 DUST; set it to what the sponsor's NIGHT generates in a
-  day), 10 new swaps per EVM address a day, 100 swaps waiting for funds (RUNBOOK section 10).
+  budget (`SPONSOR_DAILY_DUST_BUDGET`, 500 DUST, committed when a swap's funds arrive; set it to what
+  the sponsor's NIGHT generates in a day), 10 new swaps per EVM address a day, 100 swaps waiting for
+  funds (10 per client: an IPv4 address or an IPv6 /64), and an open needs the user's address to hold
+  the pay amount and the sweep's ETH on Sepolia (RUNBOOK sections 4.4 and 10).
 - `SPONSOR_DEDICATED_WALLET=true` says the seed is this sponsor's alone. Only set it when it is: on
   stagenet the sponsor refuses to open a wallet without it (or a lock file).
 - `SPONSOR_TOOL_HEALTH_URL` matters. The wallet tool (step 7) looks for the sponsor at
   `http://sponsor:8080/health` by default (the Compose name). Natively that name does not resolve,
   and its guard ("never open the wallet while the sponsor has it") would be silently skipped.
-- `SPONSOR_TRUST_PROXY=true`: the sponsor rate-limits by the one `X-Forwarded-For` entry nginx sets
-  (step 6). It listens on 127.0.0.1 only, so nothing else can set that header.
+- `SPONSOR_TRUST_PROXY=true`: the sponsor rate-limits, and caps swaps waiting for funds per client,
+  by the one `X-Forwarded-For` entry nginx sets (step 6; an IPv6 client counts by its /64). It listens
+  on 127.0.0.1 only, so nothing else can set that header.
 - No `SPONSOR_CORS_ORIGINS`: the page reaches the sponsor on its own origin, through nginx.
 
 ## 4. The vault key directory
@@ -389,7 +392,7 @@ server {
 
 - **If a load balancer or CDN sits in front of this nginx**, add `set_real_ip_from <its CIDRs>;
   real_ip_header X-Forwarded-For; real_ip_recursive on;` to the 443 server. Without it, every user
-  shares one rate-limit bucket at the sponsor.
+  shares one rate-limit bucket at the sponsor, and one per-client cap of 10 swaps waiting for funds.
 - **https, not http.** The page carries the swap's bearer token and its users sign with their
   wallets; serve it only over TLS. The port-80 block only redirects.
 - **The Content-Security-Policy** is the Compose bundle's default (audit C15): regenerate the line with
