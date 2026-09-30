@@ -298,6 +298,9 @@ export class FakeVault implements SwapBackend {
     this.requests.delete(i.requestId);
     return this.facts('abandonDeposit');
   }
+  async vaultStateMark(): Promise<string> {
+    return `v${this.version}`;
+  }
   async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
     const calls = fakeWithdrawCalls(a, this.version);
     const callsDigest = callsDigestOf(calls);

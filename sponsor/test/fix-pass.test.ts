@@ -265,3 +265,133 @@ describe('C13: a "taken" report never blocks Bridge back (the coins decide)', ()
     expect(h.store.get(s.swapId)!).toMatchObject({ state: 'done', outcome: 'bridged-back' });
   });
 });
+
+// ── C11 ────────────────────────────────────────────────────────────────────────
+
+describe('C11: proof budgets reset on progress, admission is atomic, a moved vault answers 409', () => {
+  it('twelve stale-vault rounds no longer exhaust the withdraw proofs: each failed start gives the next attempt a fresh budget', async () => {
+    const { s, token } = await takenSwap(h);
+    for (let i = 0; i < 12; i++) {
+      const w = await paramsAndBuild(h, s, token, 'swap', `round${i}`);
+      expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+      h.vault.version++; // someone else's deposit or withdrawal landed in between
+      expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token)).status).toBe(202);
+      await h.swaps.idle();
+    }
+    const w = await paramsAndBuild(h, s, token, 'swap', 'last');
+    expect((await proveWithdraw(h, s, token, w)).status).toBe(200);
+  });
+
+  it('a lifetime cap still bounds the proofs of one swap', async () => {
+    const hh = harness({
+      config: testConfig({
+        RATE_LIMIT_PROVES_PER_SWAP_PER_MIN: '1000',
+        RATE_LIMIT_PROVES_PER_MIN: '1000',
+        SWAP_PROOFS_TOTAL_PER_SWAP: '4',
+      }),
+    });
+    hh.vault.evm.nonces.set(VAULT_EVM.toLowerCase(), { latest: 9n, pending: 9n });
+    hh.vault.evm.setEth(VAULT_EVM, 10n ** 17n);
+    hh.vault.evm.setErc20(tok('USDC').sepoliaAddress, VAULT_EVM, 10n ** 12n);
+    const { s, token } = await takenSwap(hh); // one take proof
+    for (let i = 0; i < 3; i++) {
+      const w = await paramsAndBuild(hh, s, token, 'swap', `r${i}`);
+      expect((await proveWithdraw(hh, s, token, w)).status).toBe(200);
+      hh.vault.version++;
+      await post(hh, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token);
+      await hh.swaps.idle();
+    }
+    const w = await paramsAndBuild(hh, s, token, 'swap', 'over');
+    const res = await proveWithdraw(hh, s, token, w);
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('proof-budget');
+  });
+
+  it('/prove on a vault that moved after withdraw-params answers 409 stale-vault-state (rebuild); a wrong call on an unmoved vault stays 422', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = await paramsAndBuild(h, s, token, 'swap');
+    h.vault.version++; // a vault request landed after the browser built on its block
+    const moved = await proveWithdraw(h, s, token, w);
+    expect(moved.status).toBe(409);
+    expect(((await moved.json()) as { error: { code: string } }).error.code).toBe('stale-vault-state');
+    const w2 = await paramsAndBuild(h, s, token, 'swap', 'second');
+    const wrong = withdrawFor(h, s, 'swap', {
+      evmNonce: w2.evmNonce,
+      coinNonce: w2.coinNonce,
+      dest: '0x000000000000000000000000000000000000dEaD',
+    });
+    const res = await proveWithdraw(h, s, token, wrong);
+    expect(res.status).toBe(422);
+    expect(h.store.get(s.swapId)!.proofs.withdraw).toBe(0);
+  });
+
+  it('concurrent opens with one temporary coin key admit exactly one swap', async () => {
+    const slow = h.offers.offer.bind(h.offers);
+    h.offers.offer = async (id: string) => {
+      await new Promise((r) => setTimeout(r, 15));
+      return slow(id);
+    };
+    const base = bidSwap(h);
+    const bodies = await Promise.all([0, 1, 2, 3, 4].map((i) => openBody(h, { ...base, swapId: hex32(`race-${i}`) })));
+    const res = await Promise.all(bodies.map((b) => post(h, SWAP_PATHS.swaps, b)));
+    expect(res.map((r) => r.status).sort()).toEqual([201, 409, 409, 409, 409]);
+    expect(h.store.all()).toHaveLength(1);
+  });
+
+  it('concurrent opens by one owner cannot pass the per-owner cap', async () => {
+    const slow = h.offers.offer.bind(h.offers);
+    h.offers.offer = async (id: string) => {
+      await new Promise((r) => setTimeout(r, 15));
+      return slow(id);
+    };
+    const base = bidSwap(h);
+    const bodies = await Promise.all(
+      [0, 1, 2, 3, 4].map((i) =>
+        openBody(h, {
+          ...base,
+          swapId: hex32(`own-${i}`),
+          payload: { ...base.payload, tempCoinPk: hex32(`coin-own-${i}`), tempEncPk: hex32(`enc-own-${i}`) },
+        }),
+      ),
+    );
+    const res = await Promise.all(bodies.map((b) => post(h, SWAP_PATHS.swaps, b)));
+    expect(res.filter((r) => r.status === 201)).toHaveLength(h.config.swaps.maxActivePerOwner);
+    expect(h.store.all()).toHaveLength(h.config.swaps.maxActivePerOwner);
+  });
+
+  it('concurrent proofs at the budget boundary never pass the budget', async () => {
+    const hh = harness({
+      config: testConfig({
+        RATE_LIMIT_PROVES_PER_SWAP_PER_MIN: '1000',
+        RATE_LIMIT_PROVES_PER_MIN: '1000',
+        SWAP_PROOFS_PER_SWAP: '2',
+      }),
+    });
+    const m = await mintedSwap(hh);
+    const slow = hh.offers.status.bind(hh.offers);
+    hh.offers.status = async (id: string) => {
+      await new Promise((r) => setTimeout(r, 15));
+      return slow(id);
+    };
+    const res = await Promise.all(
+      [0, 1, 2, 3, 4].map(() =>
+        post(hh, SWAP_PATHS.prove(m.s.swapId), { purpose: 'take', tx: txHex(bidTake()) }, m.token),
+      ),
+    );
+    expect(res.filter((r) => r.status === 200)).toHaveLength(2);
+    expect(hh.prover.proved).toHaveLength(2);
+  });
+});
+
+// ── C16: F-A15 ────────────────────────────────────────────────────────────────
+
+describe('C16 F-A15: /prove withdraw refuses an EVM nonce the lane can never reach', () => {
+  it('a nonce far above the next one is refused (409 stale-evm-nonce) and costs no proof', async () => {
+    const { s, token } = await takenSwap(h);
+    const w = withdrawFor(h, s, 'swap', { evmNonce: 1_000_000n });
+    const res = await proveWithdraw(h, s, token, w);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('stale-evm-nonce');
+    expect(h.store.get(s.swapId)!.proofs.withdraw).toBe(0);
+  });
+});

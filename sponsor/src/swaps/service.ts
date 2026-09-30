@@ -81,6 +81,8 @@ import { sizeSweepGas } from './sweep-gas.js';
 
 /** The MPC signature budget, counted from the start (upstream `POLL_TIMEOUT_MS`). */
 export const MPC_SIGNATURE_BUDGET_MS = 20 * 60_000;
+/** How far past the lane's next nonce a `/prove withdraw` may name (audit F-A15). */
+export const MAX_EVM_NONCE_AHEAD = 2n;
 const DAY_MS = 86_400_000;
 
 export interface SwapServiceConfig {
@@ -93,8 +95,10 @@ export interface SwapServiceConfig {
   maxSweepWei: bigint;
   minOfferTtlSeconds: number;
   maxActiveSwapsPerOwner: number;
-  /** Proofs per swap and purpose. */
+  /** Proofs per swap and purpose (the withdraw budget renews for each new attempt). */
   proofsPerSwap: number;
+  /** Every proof of one swap together, over its whole life. */
+  proofsTotalPerSwap: number;
   depositPollMs: number;
   /** An `awaiting_funds` swap fails after this long without its funds. */
   fundsWaitSeconds: number;
@@ -116,6 +120,7 @@ export function swapServiceConfig(c: SponsorConfig): SwapServiceConfig {
     minOfferTtlSeconds: c.swaps.minOfferTtlSeconds,
     maxActiveSwapsPerOwner: c.swaps.maxActivePerOwner,
     proofsPerSwap: c.swaps.proofsPerSwap,
+    proofsTotalPerSwap: c.swaps.proofsTotalPerSwap,
     depositPollMs: c.swaps.depositPollSeconds * 1000,
     fundsWaitSeconds: c.swaps.fundsWaitSeconds,
     maxDepositAttempts: c.swaps.maxDepositAttempts,
@@ -169,6 +174,13 @@ export class SwapService {
   private readonly mpc = { lastSignatureAfterMs: null as number | null, timeouts: [] as number[] };
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling: Promise<void> | null = null;
+  /** Opens between their checks and their record, so concurrent opens cannot pass the uniqueness
+   *  and per-owner checks together (audit C11, F-B10). */
+  private readonly admitting = {
+    swaps: new Set<string>(),
+    coins: new Set<string>(),
+    owners: new Map<string, number>(),
+  };
   private seq = 0;
 
   constructor(private readonly deps: SwapServiceDeps) {
@@ -293,16 +305,21 @@ export class SwapService {
     }
     const existing = this.deps.store.get(swapId);
     if (existing) return this.reopen(existing, payload, owner);
+    if (this.admitting.swaps.has(swapId)) {
+      throw new SwapError(409, SWAP_ERRORS.conflict, 'this swap is being opened right now', 'in-progress');
+    }
 
     const pay = this.token(payload.pay.colour);
     const receive = this.token(payload.receive.colour);
     if (pay.midnightColour === receive.midnightColour) {
       throw new SwapError(422, SWAP_ERRORS.offerMismatch, 'a swap needs two different tokens', 'same-token');
     }
-    if (this.deps.store.byCoinPk(payload.tempCoinPk)) {
+    if (this.deps.store.byCoinPk(payload.tempCoinPk) || this.admitting.coins.has(payload.tempCoinPk)) {
       throw new SwapError(409, SWAP_ERRORS.conflict, 'this temporary wallet already has a swap', 'coin-key-in-use');
     }
-    const active = this.deps.store.all().filter((r) => r.evmAddress === owner && !isTerminal(r.state)).length;
+    const active =
+      this.deps.store.all().filter((r) => r.evmAddress === owner && !isTerminal(r.state)).length +
+      (this.admitting.owners.get(owner) ?? 0);
     if (active >= this.cfg.maxActiveSwapsPerOwner) {
       throw new SwapError(
         429,
@@ -313,6 +330,30 @@ export class SwapService {
     const be = this.deps.backend();
     if (!be) throw new SwapError(503, SWAP_ERRORS.bridgeUnavailable, 'the sponsor cannot bridge right now');
 
+    // Reserve the swap id, the coin key and an owner slot before the first await (atomic admission).
+    this.admitting.swaps.add(swapId);
+    this.admitting.coins.add(payload.tempCoinPk);
+    this.admitting.owners.set(owner, (this.admitting.owners.get(owner) ?? 0) + 1);
+    try {
+      return await this.admit(swapId, payload, owner, pay, receive, be);
+    } finally {
+      this.admitting.swaps.delete(swapId);
+      this.admitting.coins.delete(payload.tempCoinPk);
+      const n = (this.admitting.owners.get(owner) ?? 1) - 1;
+      if (n > 0) this.admitting.owners.set(owner, n);
+      else this.admitting.owners.delete(owner);
+    }
+  }
+
+  /** The awaited part of a new open, under the admission reservation. */
+  private async admit(
+    swapId: string,
+    payload: OpenSwapPayload,
+    owner: string,
+    pay: TokenEntry,
+    receive: TokenEntry,
+    be: SwapBackend,
+  ): Promise<{ token: string; rec: SwapRecord; resumed: boolean }> {
     await this.checkOffer(payload);
 
     let baseFee: bigint;
@@ -483,6 +524,10 @@ export class SwapService {
     } catch {
       throw new SwapError(503, SWAP_ERRORS.bridgeUnavailable, 'Sepolia cannot be read right now; try again shortly');
     }
+    // Remember what was handed out: /prove tells a vault that moved since (409) from a wrong call.
+    const vaultMark = await be.vaultStateMark().catch(() => undefined);
+    rec.withdrawOffer = { kind, evmNonce: evmNonce.toString(), ...(vaultMark ? { vaultMark } : {}), at: this.nowS() };
+    this.persist(rec);
     const g = this.cfg.bridgeGas;
     return {
       kind,
@@ -553,19 +598,48 @@ export class SwapService {
 
   /** Validate and prove; returns the proven (pre-binding) transaction's bytes. */
   async prove(rec: SwapRecord, req: ProveRequest & { kind?: WithdrawKind }): Promise<Uint8Array> {
-    if (rec.proofs[req.purpose] >= this.cfg.proofsPerSwap) {
+    // The budget slot is taken before the first await and given back if nothing is proven, so
+    // concurrent requests cannot pass the budget together (audit C11, F-B10).
+    this.reserveProof(rec, req.purpose);
+    let proven = false;
+    try {
+      if (!this.deps.prover())
+        throw new SwapError(503, SWAP_ERRORS.proverUnavailable, 'the proof server is not available');
+      const bytes = hexBytes(req.tx);
+      const summary = this.inspect(bytes, 'unproven');
+      const out =
+        req.purpose === 'take'
+          ? await this.proveTake(rec, bytes, summary)
+          : await this.proveWithdraw(rec, bytes, summary, req);
+      proven = true;
+      return out;
+    } finally {
+      if (!proven) this.refundProof(rec, req.purpose);
+    }
+  }
+
+  private reserveProof(rec: SwapRecord, purpose: 'take' | 'withdraw'): void {
+    const total = rec.proofs.total ?? rec.proofs.take + rec.proofs.withdraw;
+    if (rec.proofs[purpose] >= this.cfg.proofsPerSwap) {
       throw new SwapError(
         429,
         SWAP_ERRORS.proofBudget,
-        `this swap has used its ${this.cfg.proofsPerSwap} ${req.purpose} proofs`,
+        purpose === 'withdraw'
+          ? `this withdrawal attempt has used its ${this.cfg.proofsPerSwap} proofs`
+          : `this swap has used its ${this.cfg.proofsPerSwap} take proofs`,
       );
     }
-    if (!this.deps.prover())
-      throw new SwapError(503, SWAP_ERRORS.proverUnavailable, 'the proof server is not available');
-    const bytes = hexBytes(req.tx);
-    const summary = this.inspect(bytes, 'unproven');
-    if (req.purpose === 'take') return this.proveTake(rec, bytes, summary);
-    return this.proveWithdraw(rec, bytes, summary, req);
+    if (total >= this.cfg.proofsTotalPerSwap) {
+      throw new SwapError(429, SWAP_ERRORS.proofBudget, `this swap has used its ${this.cfg.proofsTotalPerSwap} proofs`);
+    }
+    rec.proofs[purpose]++;
+    rec.proofs.total = total + 1;
+  }
+
+  private refundProof(rec: SwapRecord, purpose: 'take' | 'withdraw'): void {
+    rec.proofs[purpose] = Math.max(0, rec.proofs[purpose] - 1);
+    rec.proofs.total = Math.max(0, (rec.proofs.total ?? 1) - 1);
+    this.persist(rec);
   }
 
   private async proveTake(rec: SwapRecord, bytes: Uint8Array, summary: TxSummary): Promise<Uint8Array> {
@@ -582,7 +656,6 @@ export class SwapService {
     if (['consumed', 'expired', 'cancelled', 'not_found'].includes(status)) {
       throw new SwapError(409, SWAP_ERRORS.offerNotAvailable, `the offer is ${status}: Swap is not available`, status);
     }
-    rec.proofs.take++;
     if (rec.state === 'minted') transition(rec, 'taking', this.nowS());
     rec.updatedAt = this.nowS();
     this.deps.store.put(rec);
@@ -606,6 +679,20 @@ export class SwapService {
     }
     if (evmNonce < confirmed) {
       throw new SwapError(409, SWAP_ERRORS.staleEvmNonce, 'this EVM nonce is already used: rebuild the withdrawal');
+    }
+    // Nor one the lane can never reach: it would only cost a proof (audit F-A15).
+    let next: bigint;
+    try {
+      next = await this.nextWithdrawNonce(be);
+    } catch {
+      throw new SwapError(503, SWAP_ERRORS.bridgeUnavailable, 'Sepolia cannot be read right now; try again shortly');
+    }
+    if (evmNonce > next + MAX_EVM_NONCE_AHEAD) {
+      throw new SwapError(
+        409,
+        SWAP_ERRORS.staleEvmNonce,
+        'this EVM nonce is ahead of the lane: rebuild the withdrawal',
+      );
     }
     // The kind the page named, or both in the likelier order (the swap's own token after a take).
     const kinds: WithdrawKind[] = req.kind
@@ -633,7 +720,6 @@ export class SwapService {
         firstError ??= e;
         continue;
       }
-      rec.proofs.withdraw++;
       rec.provenWithdraw = {
         kind,
         callsDigest: summary.callsDigest,
@@ -645,6 +731,19 @@ export class SwapService {
       rec.updatedAt = this.nowS();
       this.deps.store.put(rec);
       return this.proveOnServer(bytes);
+    }
+    // A transcript mismatch on a vault that moved since this swap's withdraw-params is a stale build,
+    // not a wrong call: 409 with the rebuild hint (audit C11). Nothing is proven either way.
+    if (firstError instanceof SwapError && firstError.detail === 'wrong-call' && rec.withdrawOffer?.vaultMark) {
+      const mark = await be.vaultStateMark().catch(() => null);
+      if (mark !== null && mark !== rec.withdrawOffer.vaultMark) {
+        throw new SwapError(
+          409,
+          SWAP_ERRORS.staleVaultState,
+          'the vault moved since this withdrawal was built: rebuild it and prove again',
+          'vault-moved',
+        );
+      }
     }
     throw firstError ?? new SwapError(409, SWAP_ERRORS.wrongState, 'nothing can be withdrawn in this state');
   }
@@ -835,6 +934,7 @@ export class SwapService {
     w.error = { code, message };
     pushStage(w, 'failed', this.nowS(), { code });
     if (rec.state === 'withdrawing' || rec.state === 'bridging_back') transition(rec, 'minted', this.nowS());
+    rec.proofs.withdraw = 0; // the next attempt gets a fresh budget (audit C11)
     this.persist(rec);
   }
 
@@ -976,6 +1076,7 @@ export class SwapService {
       // The transfer did not happen: the coin is back in the temporary wallet (plan Q9 A).
       pushStage(w, 'refunded', now, { circuit, ...(settled.txHash ? { tx: settled.txHash } : {}) });
       transition(rec, 'minted', now);
+      rec.proofs.withdraw = 0; // the retry gets a fresh budget (audit C11)
       this.deps.log.info('withdrawal refunded', { swapId, requestId, attested: relay.kind });
     } else {
       pushStage(w, 'completed', now, { circuit, ...(settled.txHash ? { tx: settled.txHash } : {}) });

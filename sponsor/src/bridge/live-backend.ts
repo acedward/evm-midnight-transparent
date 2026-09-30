@@ -12,6 +12,8 @@
 //   - the relayer options of test/gates/bridge/gate.ts `runRelay` (request paths [0] and [2], the
 //     vault's response key and schema, the MPC output cache).
 
+import { createHash } from 'node:crypto';
+
 import {
   depositAddressFor,
   depositPathOf,
@@ -259,6 +261,14 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         ]);
         return facts(out.txId, out.status, out.txHash);
       }),
+
+    async vaultStateMark(): Promise<string> {
+      const state: Any = await pdp.queryContractState(vault);
+      if (!state) throw new Error('no contract state at the vault');
+      return createHash('sha256')
+        .update(Buffer.from(state.serialize() as Uint8Array))
+        .digest('hex');
+    },
 
     async rebuildWithdraw(a: WithdrawCallArgs): Promise<RebuiltWithdraw> {
       const r = await rebuildStartWithdraw({ compiledContract: rt.compiledContract, ledger: rt.ledger }, pdp, vault, a);

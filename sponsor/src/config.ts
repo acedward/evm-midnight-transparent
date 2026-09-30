@@ -78,8 +78,11 @@ export interface SponsorConfig {
     /** A new swap's offer must expire at least this far ahead. */
     minOfferTtlSeconds: number;
     maxActivePerOwner: number;
-    /** Proofs per swap and purpose (take, withdraw). */
+    /** Proofs per swap and purpose (take, withdraw); the withdraw budget is renewed for each new
+     *  attempt after a refund or a failed start (audit C11). */
     proofsPerSwap: number;
+    /** Every proof of one swap together, over its whole life. */
+    proofsTotalPerSwap: number;
     depositPollSeconds: number;
     /** An awaiting_funds swap fails after this long without its funds (re-opening resumes it). */
     fundsWaitSeconds: number;
@@ -302,6 +305,7 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       minOfferTtlSeconds: int(env.SWAP_MIN_OFFER_TTL_SECONDS, 1800, 'SWAP_MIN_OFFER_TTL_SECONDS', 0, 86_400),
       maxActivePerOwner: int(env.SWAP_MAX_ACTIVE_PER_OWNER, 3, 'SWAP_MAX_ACTIVE_PER_OWNER', 1, 100),
       proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
+      proofsTotalPerSwap: int(env.SWAP_PROOFS_TOTAL_PER_SWAP, 48, 'SWAP_PROOFS_TOTAL_PER_SWAP', 1, 10_000),
       depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
       fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_SECONDS', 60),
       maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),

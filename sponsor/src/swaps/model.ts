@@ -77,6 +77,16 @@ export interface WithdrawRecord {
   error?: { code: string; message: string };
 }
 
+/** What the latest `withdraw-params` handed out: `/prove withdraw` rebuilds with its gas, and tells a
+ *  vault that moved since (409, rebuild) from a wrong call (422) by its state mark (audit C11). */
+export interface WithdrawOffer {
+  kind: WithdrawKind;
+  evmNonce: string;
+  /** A digest of the vault's contract state when the parameters were handed out. */
+  vaultMark?: string;
+  at: number;
+}
+
 /** What the latest `/prove withdraw` validated: `/withdraw` must carry the same calls. */
 export interface ProvenWithdraw {
   kind: WithdrawKind;
@@ -103,7 +113,9 @@ export interface SwapRecord {
   state: SwapState;
   deposit: DepositRecord | null;
   takeTx: string | null;
-  proofs: { take: number; withdraw: number };
+  /** Proofs used: take and withdraw (the withdraw budget renews per attempt) and all of them. */
+  proofs: { take: number; withdraw: number; total?: number };
+  withdrawOffer?: WithdrawOffer;
   provenWithdraw: ProvenWithdraw | null;
   withdrawals: WithdrawRecord[];
   outcome?: 'swapped' | 'bridged-back';

@@ -132,6 +132,9 @@ export interface SwapBackend {
   }): Promise<MidnightTxFacts & { minted: boolean }>;
   /** The vault's permissionless `abandonDeposit`, for a sweep attested never-executed. */
   abandonDeposit(input: { requestId: string; attestation: Attestation }): Promise<MidnightTxFacts>;
+  /** A digest of the vault's current contract state: it changes whenever the vault's state does
+   *  (a request started or settled), so `/prove` can tell a moved vault from a wrong call. */
+  vaultStateMark(): Promise<string>;
   /** The sponsor's own build of `startWithdraw(args)` on the vault's CURRENT state (not proven, not
    *  sent): the calls' public transcripts, and the request it would create. */
   rebuildWithdraw(args: WithdrawCallArgs): Promise<RebuiltWithdraw>;
