@@ -39,6 +39,7 @@ import {
 
 import type { NonceStore } from './auth/nonces.js';
 import { bearerOf } from './auth/swap-token.js';
+import { clientKeyOf } from './client-key.js';
 import { verifySponsorActionRequest } from './auth/verifiers.js';
 import type { SponsorConfig } from './config.js';
 import type { Logger } from './log.js';
@@ -89,7 +90,9 @@ function defaultClientAddress(trustProxy: boolean): (c: Context) => string {
 
 export function createApp(deps: AppDeps): Hono {
   const { config, log, swaps } = deps;
-  const clientAddress = deps.clientAddress ?? defaultClientAddress(config.trustProxy);
+  const address = deps.clientAddress ?? defaultClientAddress(config.trustProxy);
+  // Every per-client limit counts an IPv6 client by its /64 (audit R4, F-A21).
+  const clientAddress = (c: Context) => clientKeyOf(address(c));
   const limits = config.limits;
   const readLimiter = new RateLimiter(limits.readsPerMinute);
   const healthLimiter = new RateLimiter(limits.healthPerMinute);
@@ -245,7 +248,12 @@ export function createApp(deps: AppDeps): Hono {
     }
     const ownerRefused = limited(ownerLimiter, outcome.signer.toLowerCase(), c);
     if (ownerRefused) return ownerRefused;
-    const { token, rec, resumed } = await swaps.open({ swapId, payload, signer: outcome.signer });
+    const { token, rec, resumed } = await swaps.open({
+      swapId,
+      payload,
+      signer: outcome.signer,
+      client: clientAddress(c),
+    });
     const body: OpenSwapResponse = {
       swapToken: token,
       depositAddress: rec.depositAddress,
@@ -317,6 +325,7 @@ export function createApp(deps: AppDeps): Hono {
   app.onError((err, c) => {
     if (err instanceof SwapError) {
       if (err.status >= 500) log.warn('swap route refused', { path: c.req.path, code: err.code });
+      if (err.retryAfterSeconds !== undefined) c.header('Retry-After', String(Math.max(1, err.retryAfterSeconds)));
       return apiError(c, err.status, err.code, err.message, err.detail);
     }
     log.error('unhandled error', { path: c.req.path, error: err });

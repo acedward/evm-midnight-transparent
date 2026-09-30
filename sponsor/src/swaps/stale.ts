@@ -10,8 +10,9 @@
 // Every `intervalMs` the closer looks for swaps in `depositing`, `withdrawing` or `bridging_back`
 // that nothing drives and that have not moved for `staleAfterMs`, and drives each again: the
 // relayer loop is resumable, and the settle it ends with is permissionless (its mint, a refund, goes
-// to the temporary wallet the vault's request names). It also adopts a withdrawal whose start was
-// reported failed but landed after all (its predicted request is open in the vault).
+// to the temporary wallet the vault's request names). It also settles every withdrawal attempt whose
+// outcome is unknown by its request id, superseded ones included (audit R5): one that landed after
+// all is adopted and driven, one that provably did not land is closed.
 //
 // It never touches a request that is not one of this sponsor's swaps. Its spending is capped: at
 // most `maxPerDay` re-drives in any rolling 24 hours, and none while the sponsor's DUST is under

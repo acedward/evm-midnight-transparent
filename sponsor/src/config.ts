@@ -82,11 +82,12 @@ export interface SponsorConfig {
     maxPerOwnerPerDay: number;
     /** Swaps waiting for funds that have received nothing, all addresses together (audit C6). */
     maxUnfunded: number;
-    /** Proofs per swap and purpose (take, withdraw); the withdraw budget is renewed for each new
-     *  attempt after a refund or a failed start (audit C11). */
+    /** Proofs per swap and purpose (take, withdraw) in any 24 hours; the withdraw budget is also
+     *  renewed for each new attempt after a refund or a failed start (audit C11, R3). */
     proofsPerSwap: number;
-    /** Every proof of one swap together, over its whole life. */
-    proofsTotalPerSwap: number;
+    /** Every proof of one swap together in any 24 hours, failed prover work included (audit R3: a
+     *  budget that comes back, never a lifetime cap). */
+    proofsPerSwapPerDay: number;
     depositPollSeconds: number;
     /** An awaiting_funds swap that received NOTHING fails after this long (re-opening resumes it). */
     fundsWaitSeconds: number;
@@ -101,8 +102,19 @@ export interface SponsorConfig {
     dustPerStartSpecks: bigint;
     dustPerSettleSpecks: bigint;
     maxDepositAttempts: number;
-    /** How often a re-open may re-arm a deposit that failed with its funds at the address (audit C5). */
-    maxDepositRearms: number;
+    /** How often a re-open may re-arm a deposit that failed with its funds at the address, in any
+     *  24 hours (audit C5, R3: paced, never a lifetime cap), and the pause between two re-arms. */
+    depositRearmsPerDay: number;
+    depositRearmCooldownSeconds: number;
+    /** Swaps waiting for funds that have received nothing, per client (IPv4 address or IPv6 /64). */
+    maxUnfundedPerClient: number;
+    /** How long an open reuses its read of the owner's Sepolia balances (audit R4). */
+    ownerBalanceCacheSeconds: number;
+    /** Deposit-address reads per poll pass, all swaps together (audit R4). */
+    pollMaxReadsPerPass: number;
+    /** A page looking at a swap brings its next deposit-address read forward, never closer than this
+     *  to the last one (audit R4: page reads cannot reset the backoff). */
+    pollNudgeMinSeconds: number;
     /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
     sweepGasLimits: Record<string, bigint>;
     /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
@@ -133,6 +145,12 @@ export interface SponsorConfig {
   withdrawStuckAfterSeconds: number;
   /** A started withdrawal the MPC has not signed after this long is stale the same way. */
   withdrawUnsignedStaleSeconds: number;
+  /** A withdrawal whose submission's outcome is unknown, whose request is neither in the vault nor
+   *  attested this long after it was sent, did not land (audit R5). */
+  withdrawUncertainSeconds: number;
+  /** A replacement of a stuck transfer outbids every transfer holding its nonce by at least this
+   *  percent on BOTH fee fields (the pools' replacement increment; audit R2). */
+  bridgeReplacementBumpPercent: number;
   healthCacheSeconds: number;
   logLevel: LogLevel;
 }
@@ -336,7 +354,14 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       maxPerOwnerPerDay: int(env.SWAP_MAX_PER_OWNER_PER_DAY, 10, 'SWAP_MAX_PER_OWNER_PER_DAY', 1, 10_000),
       maxUnfunded: int(env.SWAP_MAX_UNFUNDED, 100, 'SWAP_MAX_UNFUNDED', 1, 100_000),
       proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
-      proofsTotalPerSwap: int(env.SWAP_PROOFS_TOTAL_PER_SWAP, 48, 'SWAP_PROOFS_TOTAL_PER_SWAP', 1, 10_000),
+      // SWAP_PROOFS_TOTAL_PER_SWAP (the lifetime cap before P4.2-fix2) is read as the daily budget.
+      proofsPerSwapPerDay: int(
+        env.SWAP_PROOFS_PER_SWAP_PER_DAY ?? env.SWAP_PROOFS_TOTAL_PER_SWAP,
+        48,
+        'SWAP_PROOFS_PER_SWAP_PER_DAY',
+        1,
+        10_000,
+      ),
       depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
       fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 10_800, 'SWAP_FUNDS_WAIT_SECONDS', 60),
       fundsWaitPartialSeconds: int(env.SWAP_FUNDS_WAIT_PARTIAL_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_PARTIAL_SECONDS', 60),
@@ -345,7 +370,31 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       dustPerStartSpecks: big(env.SWAP_DUST_PER_START_SPECKS, 2_200_000_000_000_000n, 'SWAP_DUST_PER_START_SPECKS'),
       dustPerSettleSpecks: big(env.SWAP_DUST_PER_SETTLE_SPECKS, 400_000_000_000_000n, 'SWAP_DUST_PER_SETTLE_SPECKS'),
       maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),
-      maxDepositRearms: int(env.DEPOSIT_MAX_REARMS, 3, 'DEPOSIT_MAX_REARMS', 0, 10),
+      // DEPOSIT_MAX_REARMS (the lifetime cap before P4.2-fix2) is read as the per-day count.
+      depositRearmsPerDay: int(
+        env.DEPOSIT_REARMS_PER_DAY ?? env.DEPOSIT_MAX_REARMS,
+        3,
+        'DEPOSIT_REARMS_PER_DAY',
+        1,
+        100,
+      ),
+      depositRearmCooldownSeconds: int(
+        env.DEPOSIT_REARM_COOLDOWN_SECONDS,
+        1_800,
+        'DEPOSIT_REARM_COOLDOWN_SECONDS',
+        0,
+        86_400,
+      ),
+      maxUnfundedPerClient: int(env.SWAP_MAX_UNFUNDED_PER_CLIENT, 10, 'SWAP_MAX_UNFUNDED_PER_CLIENT', 1, 100_000),
+      ownerBalanceCacheSeconds: int(
+        env.SWAP_OWNER_BALANCE_CACHE_SECONDS,
+        30,
+        'SWAP_OWNER_BALANCE_CACHE_SECONDS',
+        0,
+        3_600,
+      ),
+      pollMaxReadsPerPass: int(env.DEPOSIT_POLL_MAX_READS, 120, 'DEPOSIT_POLL_MAX_READS', 2, 100_000),
+      pollNudgeMinSeconds: int(env.DEPOSIT_POLL_NUDGE_MIN_SECONDS, 60, 'DEPOSIT_POLL_NUDGE_MIN_SECONDS', 0, 3_600),
       sweepGasLimits: (() => {
         try {
           return parseSweepGasLimits(str(env.SWEEP_GAS_LIMITS));
@@ -383,6 +432,14 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       7_200,
       'WITHDRAW_UNSIGNED_STALE_SECONDS',
       1_200,
+    ),
+    withdrawUncertainSeconds: int(env.WITHDRAW_UNCERTAIN_SECONDS, 900, 'WITHDRAW_UNCERTAIN_SECONDS', 300, 86_400),
+    bridgeReplacementBumpPercent: int(
+      env.BRIDGE_EVM_REPLACEMENT_BUMP_PERCENT,
+      10,
+      'BRIDGE_EVM_REPLACEMENT_BUMP_PERCENT',
+      10,
+      100,
     ),
     healthCacheSeconds: int(env.HEALTH_CACHE_SECONDS, 15, 'HEALTH_CACHE_SECONDS', 0, 600),
     logLevel,

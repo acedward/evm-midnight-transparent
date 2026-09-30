@@ -24,7 +24,15 @@ export type BridgeKind = 'deposit' | 'withdraw';
 
 /** One stage of the relayer loop (../bridge/relay-loop.ts). */
 export type RelayProgress =
-  | { stage: 'signed'; signedTxHash: string; from: string; nonce: number; afterMs: number; maxFeePerGas?: bigint }
+  | {
+      stage: 'signed';
+      signedTxHash: string;
+      from: string;
+      nonce: number;
+      afterMs: number;
+      maxFeePerGas?: bigint;
+      maxPriorityFeePerGas?: bigint;
+    }
   /** The signed transfer was broadcast and is not mined yet (reported once; it is broadcast again
    *  until it is mined or its nonce is consumed). */
   | { stage: 'pending'; signedTxHash: string; nonce: number; afterMs: number }
@@ -53,6 +61,13 @@ export interface RelayOutcome extends Attestation {
   signedTxHash: string;
   signatureAfterMs: number;
   attestationAfterMs: number;
+}
+
+/** A submission that failed BEFORE the transaction reached the node (the DUST balancing or the
+ *  proofs): conclusive, nothing can land (audit R5). Any other submission error leaves the outcome
+ *  uncertain until the request id settles it. */
+export class NotSubmittedError extends Error {
+  override name = 'NotSubmittedError';
 }
 
 /** A Midnight transaction the sponsor submitted and saw finalized. */
@@ -160,7 +175,7 @@ export interface SwapBackend {
    *  sent): the calls' public transcripts, and the request it would create. */
   rebuildWithdraw(args: WithdrawCallArgs): Promise<RebuiltWithdraw>;
   /** Add DUST to the browser's bound `startWithdraw` (DUST-only balancing, then merge), submit it and
-   *  wait until it is final. */
+   *  wait until it is final. Throws NotSubmittedError when it failed before reaching the node. */
   submitWithdraw(finalTx: Uint8Array): Promise<MidnightTxFacts>;
 }
 

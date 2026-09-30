@@ -20,7 +20,8 @@ import {
   BID,
   LOCAL_TOKENS,
   bidSwap,
-  bidTake,
+  bidTakeFor,
+  coinOutput,
   fund,
   get,
   harness,
@@ -30,12 +31,14 @@ import {
   openSwap,
   post,
   testConfig,
+  takeBody,
   tok,
   txHex,
   withdrawFor,
   type Harness,
   type SwapInput,
 } from './harness.js';
+import type { TxSummary } from '../src/validate/summary.js';
 
 const view = async (h: Harness, s: SwapInput, token: string): Promise<SwapView> => {
   const body = (await (await get(h, SWAP_PATHS.swap(s.swapId), token)).json()) as { swap: unknown };
@@ -64,9 +67,7 @@ const proveWithdraw = (
 
 async function takenSwap(h: Harness, s: SwapInput = bidSwap(h)) {
   const m = await mintedSwap(h, s);
-  expect((await post(h, SWAP_PATHS.prove(s.swapId), { purpose: 'take', tx: txHex(bidTake()) }, m.token)).status).toBe(
-    200,
-  );
+  expect((await post(h, SWAP_PATHS.prove(s.swapId), takeBody(s), m.token)).status).toBe(200);
   expect((await post(h, SWAP_PATHS.take(s.swapId), { outcome: 'taken', takeTx: hex32('take') }, m.token)).status).toBe(
     200,
   );
@@ -77,11 +78,12 @@ async function takenSwap(h: Harness, s: SwapInput = bidSwap(h)) {
 async function paramsAndBuild(h: Harness, s: SwapInput, token: string, kind: 'swap' | 'bridge-back', tag = 'c') {
   const res = await get(h, `${SWAP_PATHS.withdrawParams(s.swapId)}?kind=${kind}`, token);
   expect(res.status).toBe(200);
-  const p = (await res.json()) as { evmNonce: string; gas: { maxFeePerGas: string } };
+  const p = (await res.json()) as { evmNonce: string; gas: { maxFeePerGas: string; maxPriorityFeePerGas: string } };
   return withdrawFor(h, s, kind, {
     evmNonce: BigInt(p.evmNonce),
     coinNonce: hex32(`${tag}-${p.evmNonce}`),
     maxFeePerGas: BigInt(p.gas.maxFeePerGas),
+    maxPriorityFeePerGas: BigInt(p.gas.maxPriorityFeePerGas),
   });
 }
 
@@ -227,24 +229,8 @@ describe('C5 (sponsor side): a funded deposit never fails by age, and failed dep
     expect((await view(h, s, token)).state).toBe('minted');
   });
 
-  it('re-arming is capped: after the last re-arm the failure is no longer recoverable', async () => {
-    const hh = harness({ config: testConfig({ DEPOSIT_MAX_ATTEMPTS: '1', DEPOSIT_MAX_REARMS: '1' }) });
-    const s = bidSwap(hh);
-    const o = await openSwap(hh, s);
-    fund(hh, o);
-    hh.vault.defaultRelay = { kind: 'returned-false' };
-    await hh.swaps.pollDeposits();
-    await hh.swaps.idle();
-    expect(hh.store.get(s.swapId)!).toMatchObject({ state: 'failed', reason: 'deposit-returned-false' });
-    const r1 = await post(hh, SWAP_PATHS.swaps, await openBody(hh, s));
-    const t1 = ((await r1.json()) as { swapToken: string }).swapToken;
-    await hh.swaps.pollDeposits();
-    await hh.swaps.idle();
-    const v = await view(hh, s, t1);
-    expect(v).toMatchObject({ state: 'failed', reason: 'deposit-returned-false', recoverable: false });
-    await post(hh, SWAP_PATHS.swaps, await openBody(hh, s));
-    expect(hh.store.get(s.swapId)!.state).toBe('failed');
-  });
+  // P4.2-fix2 (audit R3): re-arming is paced by a cooldown and a per-day count, never capped for
+  // good; the test that asserted the lifetime cap is replaced by sponsor/test/fix2-pass.test.ts "R3".
 });
 
 // ── C13 ────────────────────────────────────────────────────────────────────────
@@ -384,9 +370,7 @@ describe('C11: proof budgets reset on progress, admission is atomic, a moved vau
       return slow(id);
     };
     const res = await Promise.all(
-      [0, 1, 2, 3, 4].map(() =>
-        post(hh, SWAP_PATHS.prove(m.s.swapId), { purpose: 'take', tx: txHex(bidTake()) }, m.token),
-      ),
+      [0, 1, 2, 3, 4].map(() => post(hh, SWAP_PATHS.prove(m.s.swapId), takeBody(m.s), m.token)),
     );
     expect(res.filter((r) => r.status === 200)).toHaveLength(2);
     expect(hh.prover.proved).toHaveLength(2);
@@ -409,7 +393,12 @@ describe('C16 F-A15: /prove withdraw refuses an EVM nonce the lane can never rea
 // ── C6 ─────────────────────────────────────────────────────────────────────────
 
 /** The per-IP limits out of the way: these tests open many swaps from one client address. */
-const OPEN_LIMITS = { RATE_LIMIT_OPENS_PER_MIN: '1000', RATE_LIMIT_NONCES_PER_MIN: '1000' };
+const OPEN_LIMITS = {
+  RATE_LIMIT_OPENS_PER_MIN: '1000',
+  RATE_LIMIT_NONCES_PER_MIN: '1000',
+  // One client address in the harness: the per-client cap (P4.2-fix2, R4) is tested on its own.
+  SWAP_MAX_UNFUNDED_PER_CLIENT: '1000',
+};
 
 /** Open `n` unfunded swaps of the bid, each by a fresh EVM key (any key is free). */
 async function openMany(hh: Harness, n: number, tag: string) {
@@ -514,11 +503,23 @@ describe('C7: a sponsorship budget', () => {
     expect((await post(hh, SWAP_PATHS.swaps, await openBody(hh, s4))).status).toBe(201);
   });
 
-  it('a daily DUST budget: new swaps are refused (503 sponsor-budget) once spent + committed legs would pass it', async () => {
-    // 2.2 DUST per start and 0.4 per settle: a swap commits 5.2 DUST; a 12-DUST budget admits two.
+  it('a daily DUST budget: funded swaps wait (budget-wait) and new swaps are refused (503 sponsor-budget) once spent + committed legs would pass it', async () => {
+    // 2.2 DUST per start and 0.4 per settle: a swap commits 5.2 DUST once its funds are there
+    // (P4.2-fix2, R4: an unfunded open commits nothing); a 12-DUST budget admits two.
     const hh = harness({ config: testConfig({ ...OPEN_LIMITS, SPONSOR_DAILY_DUST_BUDGET: '12' }) });
     const opened = await openMany(hh, 3, 'budget');
-    expect(opened.map((o) => o.status)).toEqual([201, 201, 503]);
+    expect(opened.map((o) => o.status)).toEqual([201, 201, 201]);
+    const hold = gate();
+    hh.vault.defaultRelay = { beforeBroadcast: hold.promise };
+    for (const o of opened) {
+      const r = hh.store.get(o.s.swapId)!;
+      hh.vault.evm.setErc20(r.pay.erc20Address, r.depositAddress, BigInt(r.pay.amount));
+      hh.vault.evm.setEth(r.depositAddress, BigInt(r.sweepGas.ethWei));
+    }
+    await hh.swaps.pollDeposits();
+    await tick();
+    expect(opened.map((o) => hh.store.get(o.s.swapId)!.state)).toEqual(['depositing', 'depositing', 'awaiting_funds']);
+    expect(hh.store.get(opened[2]!.s.swapId)!.deposit!.stage).toBe('budget-wait');
     const body = (await (
       await post(hh, SWAP_PATHS.swaps, await openBody(hh, bidSwap(hh, undefined, 'budget-x')))
     ).json()) as {
@@ -529,8 +530,10 @@ describe('C7: a sponsorship budget', () => {
     expect(st).toMatchObject({
       dustBudgetSpecks24h: (12n * 10n ** 15n).toString(),
       exhausted: true,
-      swapsOpened24h: 2,
+      swapsOpened24h: 3,
     });
+    hold.open();
+    await hh.swaps.idle();
   });
 
   it('a deposit → Bridge back loop spends from the same budget: legs executed count for 24 h', async () => {
@@ -546,7 +549,22 @@ describe('C7: a sponsorship budget', () => {
     expect(hh.store.get(m.s.swapId)!.state).toBe('done');
     const st = hh.swaps.budgetStatus();
     expect(st.dustSpentSpecks24h).toBe((52n * 10n ** 14n).toString()); // 2 starts + 2 settles
-    expect((await openMany(hh, 2, 'after-loop')).map((o) => o.status)).toEqual([201, 503]);
+    // Unfunded opens commit nothing (P4.2-fix2, R4); once funded, the first fits (5.2 + 5.2 ≤ 12)
+    // and the second waits for the budget.
+    const after = await openMany(hh, 2, 'after-loop');
+    expect(after.map((o) => o.status)).toEqual([201, 201]);
+    const hold = gate();
+    hh.vault.defaultRelay = { beforeBroadcast: hold.promise };
+    for (const o of after) {
+      const r = hh.store.get(o.s.swapId)!;
+      hh.vault.evm.setErc20(r.pay.erc20Address, r.depositAddress, BigInt(r.pay.amount));
+      hh.vault.evm.setEth(r.depositAddress, BigInt(r.sweepGas.ethWei));
+    }
+    await hh.swaps.pollDeposits();
+    await tick();
+    expect(after.map((o) => hh.store.get(o.s.swapId)!.state)).toEqual(['depositing', 'awaiting_funds']);
+    hold.open();
+    await hh.swaps.idle();
     hh.now.ms += 86_400_000 + 1_000;
     expect(hh.swaps.budgetStatus().dustSpentSpecks24h).toBe('0');
   });
@@ -601,8 +619,10 @@ describe('C12: the sponsor adopts only requests that are this swap’s, and adop
     };
     expect((await post(h, SWAP_PATHS.withdraw(s.swapId), { tx: txHex(w.tx) }, token)).status).toBe(202);
     await h.swaps.idle();
+    // P4.2-fix2 (audit R5): the outcome is unknown, so the attempt keeps its nonce and the swap waits.
     const failed = h.store.get(s.swapId)!;
-    expect(failed.state).toBe('minted');
+    expect(failed.state).toBe('withdrawing');
+    expect(failed.withdrawals.at(-1)!.stage).toBe('submission-uncertain');
     const requestId = failed.withdrawals.at(-1)!.requestId!;
     // ... but the start landed after all
     h.vault.submitWithdraw = submit;
@@ -628,12 +648,12 @@ describe('C12: the sponsor adopts only requests that are this swap’s, and adop
     const capped = closerWith(0, 10n ** 20n);
     await capped.scan();
     await h.swaps.idle();
-    expect(h.store.get(s.swapId)!.state).toBe('minted');
+    expect(h.store.get(s.swapId)!.withdrawals.at(-1)!.stage).toBe('submission-uncertain');
     expect(capped.status().paused).toMatch(/cap/);
     const poor = closerWith(5, 10n ** 15n);
     await poor.scan();
     await h.swaps.idle();
-    expect(h.store.get(s.swapId)!.state).toBe('minted');
+    expect(h.store.get(s.swapId)!.withdrawals.at(-1)!.stage).toBe('submission-uncertain');
     const ok = closerWith(5, 10n ** 20n);
     await ok.scan();
     await h.swaps.idle();
@@ -796,7 +816,7 @@ describe('C3: a withdrawal whose start landed keeps its EVM nonce until it settl
 // ── C4 ─────────────────────────────────────────────────────────────────────────
 
 /** A separately balanced transfer someone appends: one more coin in, one more coin out. */
-const withExtraTransfer = (s: ReturnType<typeof bidTake>) => {
+const withExtraTransfer = (s: TxSummary) => {
   const shielded = {
     inputs: [...s.shielded.inputs, { nullifier: 'ee'.repeat(32), contract: null }],
     outputs: [...s.shielded.outputs, { commitment: 'ff'.repeat(32), contract: null }],
@@ -838,24 +858,31 @@ describe('C4: the sponsor binds every shielded coin, not only the calls and the 
 
   it('/prove take refuses a take with an extra balanced transfer; one change coin is fine', async () => {
     const m = await mintedSwap(h);
+    const t = bidTakeFor(m.s);
     const extra = await post(
       h,
       SWAP_PATHS.prove(m.s.swapId),
-      { purpose: 'take', tx: txHex(withExtraTransfer(bidTake())) },
+      { purpose: 'take', tx: txHex(withExtraTransfer(t.tx)), walletOutputs: t.walletOutputs },
       m.token,
     );
     expect(extra.status).toBe(422);
     expect(((await extra.json()) as { error: { detail: string } }).error.detail).toBe('extra-coins');
-    const change = summaryWith(bidTake(), {
-      inputs: [{ nullifier: '01'.repeat(32), contract: null }],
-      outputs: [
-        { commitment: '02'.repeat(32), contract: null },
-        { commitment: '03'.repeat(32), contract: null },
-      ],
+    // One change coin, disclosed as the temporary wallet's (audit R1).
+    const changeCoin = { nonce: hex32('change'), colour: BID.pay.token.midnightColour, value: '5' };
+    const change = summaryWith(t.tx, {
+      inputs: t.tx.shielded.inputs,
+      outputs: [...t.tx.shielded.outputs, coinOutput(changeCoin, m.s.payload.tempCoinPk)],
     });
-    expect((await post(h, SWAP_PATHS.prove(m.s.swapId), { purpose: 'take', tx: txHex(change) }, m.token)).status).toBe(
-      200,
-    );
+    expect(
+      (
+        await post(
+          h,
+          SWAP_PATHS.prove(m.s.swapId),
+          { purpose: 'take', tx: txHex(change), walletOutputs: [...t.walletOutputs, changeCoin] },
+          m.token,
+        )
+      ).status,
+    ).toBe(200);
   });
 
   it('open refuses an offer whose maker transaction is not the one its id names (offerId = sha256 of its bytes)', async () => {

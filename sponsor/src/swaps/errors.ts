@@ -11,6 +11,8 @@ export class SwapError extends Error {
     readonly code: string,
     message: string,
     readonly detail?: string,
+    /** Seconds the caller should wait before trying again (the Retry-After header). */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }

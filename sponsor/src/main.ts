@@ -23,7 +23,7 @@ import { DisabledSponsorSession, type SponsorSession } from './sponsor/session.j
 import { SwapService, swapServiceConfig } from './swaps/service.js';
 import { StaleCloser } from './swaps/stale.js';
 import { JsonFileSwapStore, MemorySwapStore, type SwapStore } from './swaps/store.js';
-import { inspectTransaction, makerImbalances } from './validate/inspect.js';
+import { inspectTransaction, makerImbalances, walletCoinCommitment } from './validate/inspect.js';
 import { SPONSOR_VERSION } from './version.js';
 
 async function main(): Promise<void> {
@@ -134,6 +134,7 @@ async function main(): Promise<void> {
     inspect: (bytes, stage) => inspectTransaction(bytes, stage).summary,
     makerImbalances: (offer) => makerImbalances(decodeOffer(offer)),
     makerTxId: (offer) => createHash('sha256').update(decodeOffer(offer)).digest('hex'),
+    coinCommitment: walletCoinCommitment,
     sponsor: () => sponsor.status(),
     log: log.child({ component: 'swaps' }),
   });

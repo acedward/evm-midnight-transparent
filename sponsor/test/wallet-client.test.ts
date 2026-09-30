@@ -7,7 +7,7 @@ import { SponsorApiError, sponsorClient } from '@evm-midnight-transparent/wallet
 import { describe, expect, it } from 'vitest';
 
 import { VAULT_EVM } from './fakes.js';
-import { BID, bidTake, harness, mintedSwap, testConfig, tok, txHex, withdrawFor } from './harness.js';
+import { BID, bidTakeFor, harness, mintedSwap, testConfig, tok, txHex, withdrawFor } from './harness.js';
 
 describe('the wallet’s sponsor client against the sponsor', () => {
   it('drives a whole take and withdrawal', async () => {
@@ -16,15 +16,25 @@ describe('the wallet’s sponsor client against the sponsor', () => {
     h.vault.evm.setEth(VAULT_EVM, 10n ** 17n);
     h.vault.evm.setErc20(tok('USDC').sepoliaAddress, VAULT_EVM, 10n ** 12n);
     const { s, token } = await mintedSwap(h);
+    const take = bidTakeFor(s);
+    // Plan 00048 Lane contracts, "P4.2-fix2, lane FS2" item 1: the wallet's client sends the take's
+    // `walletOutputs` from its hints. Until FW2's client does, this shim adds them to a take's body
+    // when they are absent (a no-op once the client sends them).
+    const shim = (init: RequestInit): RequestInit => {
+      if (typeof init.body !== 'string') return init;
+      const body = JSON.parse(init.body) as Record<string, unknown>;
+      if (body.purpose !== 'take' || body.walletOutputs !== undefined) return init;
+      return { ...init, body: JSON.stringify({ ...body, walletOutputs: take.walletOutputs }) };
+    };
     const client = sponsorClient({
       baseUrl: 'http://sponsor.test',
       swapId: `0x${s.swapId}`,
       swapToken: token,
-      fetchImpl: ((url: string, init: RequestInit) => h.app.request(url, init)) as typeof fetch,
+      fetchImpl: ((url: string, init: RequestInit) => h.app.request(url, shim(init))) as typeof fetch,
     });
 
-    // take
-    const proven = await client.prove('take', txHex(bidTake()));
+    // take (the coin it pays to the temporary wallet disclosed: audit R1)
+    const proven = await client.prove('take', txHex(take.tx), { walletOutputs: take.walletOutputs } as never);
     expect(Buffer.from(proven, 'hex').toString('utf8')).toMatch(/^PROVEN:/);
     await client.reportTake({ outcome: 'taken', takeTx: `0x${'ab'.repeat(32)}` });
     expect(h.store.get(s.swapId)!).toMatchObject({ state: 'taken', takeTx: 'ab'.repeat(32) });

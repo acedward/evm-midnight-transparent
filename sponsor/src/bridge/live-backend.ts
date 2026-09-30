@@ -272,6 +272,7 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
                 from: String(tx.from),
                 nonce: Number(tx.nonce),
                 maxFeePerGas: BigInt(tx.maxFeePerGas ?? 0),
+                maxPriorityFeePerGas: BigInt(tx.maxPriorityFeePerGas ?? 0),
                 serialized: String(tx.serialized),
               };
             },
