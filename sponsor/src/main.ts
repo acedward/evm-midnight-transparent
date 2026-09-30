@@ -164,6 +164,7 @@ async function main(): Promise<void> {
         keysVerified,
         swaps: swaps.countsByState(),
         mpc: swaps.mpcStatus(),
+        budget: swaps.budgetStatus(),
         staleCloser: {
           enabled: cs.enabled,
           lastScanAt: cs.lastScanAt,
@@ -188,9 +189,14 @@ async function main(): Promise<void> {
 
   swaps.start();
   closer.start();
+  let sweeps = 0;
   const sweeper = setInterval(() => {
     nonces.sweep();
     store.prune(Math.floor(Date.now() / 1000));
+    // Never-funded failed swaps: one read each before they are dropped (audit C6), every 10 minutes.
+    if (++sweeps % 10 === 0) {
+      void swaps.pruneUnfunded().catch((e: unknown) => log.warn('unfunded prune failed', { error: e }));
+    }
   }, 60_000);
 
   const server = Bun.serve({ hostname: config.host, port: config.port, fetch: app.fetch });

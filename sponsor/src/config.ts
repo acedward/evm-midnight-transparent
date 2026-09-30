@@ -78,14 +78,28 @@ export interface SponsorConfig {
     /** A new swap's offer must expire at least this far ahead. */
     minOfferTtlSeconds: number;
     maxActivePerOwner: number;
+    /** New swaps per EVM address in any 24 hours, whatever became of them (audit C7). */
+    maxPerOwnerPerDay: number;
+    /** Swaps waiting for funds that have received nothing, all addresses together (audit C6). */
+    maxUnfunded: number;
     /** Proofs per swap and purpose (take, withdraw); the withdraw budget is renewed for each new
      *  attempt after a refund or a failed start (audit C11). */
     proofsPerSwap: number;
     /** Every proof of one swap together, over its whole life. */
     proofsTotalPerSwap: number;
     depositPollSeconds: number;
-    /** An awaiting_funds swap fails after this long without its funds (re-opening resumes it). */
+    /** An awaiting_funds swap that received NOTHING fails after this long (re-opening resumes it). */
     fundsWaitSeconds: number;
+    /** ... and one that received part of the token, after this long (audit C6). */
+    fundsWaitPartialSeconds: number;
+    /** Failed swaps that never received anything are dropped after this many days, once their
+     *  deposit address is read empty (audit C6). */
+    retainUnfundedDays: number;
+    /** The sponsorship budget (audit C7): DUST (specks) the sponsor may pay in any 24 hours, 0 for
+     *  none, and the estimate of one paid start and one paid settle. */
+    dailyDustBudgetSpecks: bigint;
+    dustPerStartSpecks: bigint;
+    dustPerSettleSpecks: bigint;
     maxDepositAttempts: number;
     /** How often a re-open may re-arm a deposit that failed with its funds at the address (audit C5). */
     maxDepositRearms: number;
@@ -304,10 +318,17 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
       retainDays: int(env.SWAP_RETAIN_DAYS, 30, 'SWAP_RETAIN_DAYS', 1, 3650),
       minOfferTtlSeconds: int(env.SWAP_MIN_OFFER_TTL_SECONDS, 1800, 'SWAP_MIN_OFFER_TTL_SECONDS', 0, 86_400),
       maxActivePerOwner: int(env.SWAP_MAX_ACTIVE_PER_OWNER, 3, 'SWAP_MAX_ACTIVE_PER_OWNER', 1, 100),
+      maxPerOwnerPerDay: int(env.SWAP_MAX_PER_OWNER_PER_DAY, 10, 'SWAP_MAX_PER_OWNER_PER_DAY', 1, 10_000),
+      maxUnfunded: int(env.SWAP_MAX_UNFUNDED, 100, 'SWAP_MAX_UNFUNDED', 1, 100_000),
       proofsPerSwap: int(env.SWAP_PROOFS_PER_SWAP, 12, 'SWAP_PROOFS_PER_SWAP', 1, 1000),
       proofsTotalPerSwap: int(env.SWAP_PROOFS_TOTAL_PER_SWAP, 48, 'SWAP_PROOFS_TOTAL_PER_SWAP', 1, 10_000),
       depositPollSeconds: int(env.DEPOSIT_POLL_SECONDS, 15, 'DEPOSIT_POLL_SECONDS', 2, 3600),
-      fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_SECONDS', 60),
+      fundsWaitSeconds: int(env.SWAP_FUNDS_WAIT_SECONDS, 10_800, 'SWAP_FUNDS_WAIT_SECONDS', 60),
+      fundsWaitPartialSeconds: int(env.SWAP_FUNDS_WAIT_PARTIAL_SECONDS, 86_400, 'SWAP_FUNDS_WAIT_PARTIAL_SECONDS', 60),
+      retainUnfundedDays: int(env.SWAP_RETAIN_UNFUNDED_DAYS, 2, 'SWAP_RETAIN_UNFUNDED_DAYS', 1, 3650),
+      dailyDustBudgetSpecks: big(env.SPONSOR_DAILY_DUST_BUDGET, 500n, 'SPONSOR_DAILY_DUST_BUDGET') * 10n ** 15n,
+      dustPerStartSpecks: big(env.SWAP_DUST_PER_START_SPECKS, 2_200_000_000_000_000n, 'SWAP_DUST_PER_START_SPECKS'),
+      dustPerSettleSpecks: big(env.SWAP_DUST_PER_SETTLE_SPECKS, 400_000_000_000_000n, 'SWAP_DUST_PER_SETTLE_SPECKS'),
       maxDepositAttempts: int(env.DEPOSIT_MAX_ATTEMPTS, 3, 'DEPOSIT_MAX_ATTEMPTS', 1, 10),
       maxDepositRearms: int(env.DEPOSIT_MAX_REARMS, 3, 'DEPOSIT_MAX_REARMS', 0, 10),
       sweepGasLimits: (() => {

@@ -52,6 +52,8 @@ export interface DepositRecord {
   startedAtMs?: number;
   /** How many times a re-open re-armed this deposit after a recoverable failure (audit C5). */
   rearms?: number;
+  /** Unix seconds: when the deposit address was first seen holding any of the token (audit C6). */
+  seenAt?: number;
 }
 
 export interface WithdrawRecord {

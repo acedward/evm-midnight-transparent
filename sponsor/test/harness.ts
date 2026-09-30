@@ -109,7 +109,13 @@ export function harness(
   const sponsor = new FakeSponsor();
   const now = { ms: Date.now() };
   const swaps = new SwapService({
-    config: { ...swapServiceConfig(config), depositPollMs: 1_000_000, ...opts.service },
+    config: {
+      ...swapServiceConfig(config),
+      depositPollMs: 1_000_000,
+      // Every pass reads a fresh swap's address (tests call pollDeposits by hand).
+      pollBackoffMs: { fast: 0, medium: 60_000, slow: 300_000 },
+      ...opts.service,
+    },
     store,
     backend: () => (opts.bridge === false ? null : vault),
     prover: () => (opts.bridge === false ? null : prover),

@@ -265,7 +265,9 @@ export function createApp(deps: AppDeps): Hono {
     const refused = limited(readLimiter, clientAddress(c), c);
     if (refused) return refused;
     c.header('Cache-Control', 'no-store');
-    return c.json({ swap: swapView(authorised(c)) });
+    const rec = authorised(c);
+    swaps.nudge(rec); // a page watching a swap that waits for funds: read its address on the next pass
+    return c.json({ swap: swapView(rec) });
   });
 
   app.get('/v1/swaps/:id/withdraw-params', async (c) => {

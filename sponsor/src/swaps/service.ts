@@ -95,13 +95,28 @@ export interface SwapServiceConfig {
   maxSweepWei: bigint;
   minOfferTtlSeconds: number;
   maxActiveSwapsPerOwner: number;
+  /** New swaps per EVM address in any 24 hours (audit C7). */
+  maxSwapsPerOwnerPerDay: number;
+  /** Swaps waiting for funds that have received nothing, all addresses together (audit C6). */
+  maxUnfundedSwaps: number;
   /** Proofs per swap and purpose (the withdraw budget renews for each new attempt). */
   proofsPerSwap: number;
   /** Every proof of one swap together, over its whole life. */
   proofsTotalPerSwap: number;
   depositPollMs: number;
-  /** An `awaiting_funds` swap fails after this long without its funds. */
+  /** How often one unfunded deposit address is read: every pass for the first 10 minutes (and once
+   *  any of the token arrived), then every `medium`, and after an hour every `slow` (audit C6). */
+  pollBackoffMs: { fast: number; medium: number; slow: number };
+  /** An `awaiting_funds` swap that received nothing fails after this long. */
   fundsWaitSeconds: number;
+  /** ... one that received part of the token, after this long. */
+  fundsWaitPartialSeconds: number;
+  /** Never-funded failed swaps are dropped after this many days (their address read empty). */
+  retainUnfundedDays: number;
+  /** The sponsorship budget (audit C7): DUST per 24 h (0: none), per paid start, per paid settle. */
+  dailyDustBudgetSpecks: bigint;
+  dustPerStartSpecks: bigint;
+  dustPerSettleSpecks: bigint;
   maxDepositAttempts: number;
   /** How often a re-open may re-arm a deposit that failed with its funds still at the address. */
   maxDepositRearms: number;
@@ -119,10 +134,18 @@ export function swapServiceConfig(c: SponsorConfig): SwapServiceConfig {
     maxSweepWei: c.swaps.maxSweepWei,
     minOfferTtlSeconds: c.swaps.minOfferTtlSeconds,
     maxActiveSwapsPerOwner: c.swaps.maxActivePerOwner,
+    maxSwapsPerOwnerPerDay: c.swaps.maxPerOwnerPerDay,
+    maxUnfundedSwaps: c.swaps.maxUnfunded,
     proofsPerSwap: c.swaps.proofsPerSwap,
     proofsTotalPerSwap: c.swaps.proofsTotalPerSwap,
     depositPollMs: c.swaps.depositPollSeconds * 1000,
+    pollBackoffMs: { fast: c.swaps.depositPollSeconds * 1000, medium: 60_000, slow: 300_000 },
     fundsWaitSeconds: c.swaps.fundsWaitSeconds,
+    fundsWaitPartialSeconds: c.swaps.fundsWaitPartialSeconds,
+    retainUnfundedDays: c.swaps.retainUnfundedDays,
+    dailyDustBudgetSpecks: c.swaps.dailyDustBudgetSpecks,
+    dustPerStartSpecks: c.swaps.dustPerStartSpecks,
+    dustPerSettleSpecks: c.swaps.dustPerSettleSpecks,
     maxDepositAttempts: c.swaps.maxDepositAttempts,
     maxDepositRearms: c.swaps.maxDepositRearms,
     dustLowSpecks: c.sponsor.dustLowSpecks,
@@ -145,6 +168,15 @@ export interface SwapServiceDeps {
   /** ms. */
   now?: () => number;
   random?: (n: number) => Uint8Array;
+}
+
+export interface BudgetStatus {
+  dustSpentSpecks24h: string;
+  dustBudgetSpecks24h: string;
+  swapsOpened24h: number;
+  unfundedOpen: number;
+  unfundedMax: number;
+  exhausted: boolean;
 }
 
 export interface MpcStatus {
@@ -181,6 +213,8 @@ export class SwapService {
     coins: new Set<string>(),
     owners: new Map<string, number>(),
   };
+  /** When each awaiting deposit address is read next (ms; in memory: a restart reads them all once). */
+  private readonly nextPoll = new Map<string, number>();
   private seq = 0;
 
   constructor(private readonly deps: SwapServiceDeps) {
@@ -317,15 +351,37 @@ export class SwapService {
     if (this.deps.store.byCoinPk(payload.tempCoinPk) || this.admitting.coins.has(payload.tempCoinPk)) {
       throw new SwapError(409, SWAP_ERRORS.conflict, 'this temporary wallet already has a swap', 'coin-key-in-use');
     }
+    const pendingOwner = this.admitting.owners.get(owner) ?? 0;
     const active =
-      this.deps.store.all().filter((r) => r.evmAddress === owner && !isTerminal(r.state)).length +
-      (this.admitting.owners.get(owner) ?? 0);
+      this.deps.store.all().filter((r) => r.evmAddress === owner && !isTerminal(r.state)).length + pendingOwner;
     if (active >= this.cfg.maxActiveSwapsPerOwner) {
       throw new SwapError(
         429,
         SWAP_ERRORS.tooManySwaps,
         `this address already has ${active} swaps in progress; finish one first`,
       );
+    }
+    // Spending controls for a NEW swap (re-opens are exempt): swaps per address per day, swaps
+    // waiting for funds overall, and the daily DUST budget (audit C6, C7).
+    const dayAgo = this.nowS() - 86_400;
+    const today =
+      this.deps.store.all().filter((r) => r.evmAddress === owner && r.createdAt > dayAgo).length + pendingOwner;
+    if (today >= this.cfg.maxSwapsPerOwnerPerDay) {
+      throw new SwapError(
+        429,
+        SWAP_ERRORS.tooManySwaps,
+        `this address has started ${today} swaps in the last 24 hours; try again later`,
+      );
+    }
+    if (this.unfundedCount() + this.admitting.swaps.size >= this.cfg.maxUnfundedSwaps) {
+      throw new SwapError(
+        503,
+        SWAP_ERRORS.sponsorBusy,
+        'too many swaps are waiting for funds right now; try again later',
+      );
+    }
+    if (this.overBudget(this.admitting.swaps.size + 1)) {
+      throw new SwapError(503, SWAP_ERRORS.sponsorBudget, 'the sponsor’s daily budget is spent; try again tomorrow');
     }
     const be = this.deps.backend();
     if (!be) throw new SwapError(503, SWAP_ERRORS.bridgeUnavailable, 'the sponsor cannot bridge right now');
@@ -421,6 +477,12 @@ export class SwapService {
       // deposit, re-arm it: a NEW startDeposit to the same recipient moves them (audit C5).
       const d = rec.deposit;
       const rearm = rec.reason !== 'funds-not-received';
+      // A re-armed deposit pays a new start and settle: it waits for the budget like a new swap.
+      if (rearm && this.overBudget(1)) {
+        this.deps.store.put(rec);
+        this.deps.log.info('swap re-opened; re-arm deferred by the daily budget', { swapId: rec.swapId });
+        return { token, rec, resumed: true };
+      }
       if (rearm) {
         d.rearms = (d.rearms ?? 0) + 1;
         d.attempts = 0;
@@ -431,6 +493,7 @@ export class SwapService {
       pushStage(d, 'waiting-for-funds', now, { reopened: 'true', ...(rearm ? { rearm: String(d.rearms) } : {}) });
     }
     rec.updatedAt = now;
+    this.nextPoll.delete(rec.swapId);
     this.deps.store.put(rec);
     this.deps.log.info('swap re-opened', { swapId: rec.swapId, state: rec.state });
     return { token, rec, resumed: true };
@@ -486,6 +549,132 @@ export class SwapService {
     if (keys.length !== 2 || keys.some((k) => maker[k] !== expected[k])) {
       throw mismatch('maker-tx', 'the offer’s transaction is not the offer the book lists');
     }
+  }
+
+  // ── Spending controls (audit C6, C7) ──────────────────────────────────────
+
+  /** A swap waiting for funds whose address has shown none of the token yet. */
+  private static unfunded(r: SwapRecord): boolean {
+    return r.state === 'awaiting_funds' && r.deposit?.seenAt === undefined;
+  }
+
+  private unfundedCount(): number {
+    return this.deps.store.all().filter(SwapService.unfunded).length;
+  }
+
+  /** DUST (estimated per paid leg) the sponsor paid in the last 24 hours, from the recorded stages. */
+  private spent24h(): bigint {
+    const since = this.nowS() - 86_400;
+    const { dustPerStartSpecks: start, dustPerSettleSpecks: settle } = this.cfg;
+    let total = 0n;
+    const add = (stages: readonly { stage: string; at: number }[], settles: readonly string[]) => {
+      for (const st of stages) {
+        if (st.at <= since) continue;
+        if (st.stage === 'started') total += start;
+        else if (settles.includes(st.stage)) total += settle;
+      }
+    };
+    for (const r of this.deps.store.all()) {
+      if (r.deposit) add(r.deposit.stages, ['completed', 'closed', 'abandoned']);
+      for (const w of r.withdrawals) add(w.stages, ['completed', 'refunded']);
+    }
+    return total;
+  }
+
+  /** DUST the swaps in flight will still cost (their remaining starts and settles). */
+  private committed(): bigint {
+    const { dustPerStartSpecks: start, dustPerSettleSpecks: settle } = this.cfg;
+    let total = 0n;
+    for (const r of this.deps.store.all()) {
+      const w = currentWithdrawal(r);
+      switch (r.state) {
+        case 'awaiting_funds':
+          total += 2n * (start + settle);
+          break;
+        case 'depositing':
+          total += (r.deposit?.requestId ? settle : start + settle) + start + settle;
+          break;
+        case 'minted':
+        case 'taking':
+        case 'taken':
+          total += start + settle;
+          break;
+        case 'withdrawing':
+        case 'bridging_back':
+          total += w?.startTx || w?.startTxId || w?.startedAtMs ? settle : start + settle;
+          break;
+        default:
+          break;
+      }
+    }
+    return total;
+  }
+
+  /** Whether `newSwaps` more swaps would pass the daily DUST budget. */
+  private overBudget(newSwaps: number): boolean {
+    const budget = this.cfg.dailyDustBudgetSpecks;
+    if (budget === 0n) return false;
+    const perSwap = 2n * (this.cfg.dustPerStartSpecks + this.cfg.dustPerSettleSpecks);
+    return this.spent24h() + this.committed() + BigInt(newSwaps) * perSwap > budget;
+  }
+
+  /** The budget as /health reports it. */
+  budgetStatus(): BudgetStatus {
+    const since = this.nowS() - 86_400;
+    return {
+      dustSpentSpecks24h: this.spent24h().toString(),
+      dustBudgetSpecks24h: this.cfg.dailyDustBudgetSpecks.toString(),
+      swapsOpened24h: this.deps.store.all().filter((r) => r.createdAt > since).length,
+      unfundedOpen: this.unfundedCount(),
+      unfundedMax: this.cfg.maxUnfundedSwaps,
+      exhausted: this.overBudget(1),
+    };
+  }
+
+  /** The page is looking at this swap: read its deposit address on the next pass. */
+  nudge(rec: SwapRecord): void {
+    if (rec.state === 'awaiting_funds') this.nextPoll.delete(rec.swapId);
+  }
+
+  /**
+   * Drop failed swaps that never received anything once they are `retainUnfundedDays` old, after
+   * one more read shows their deposit address empty (a late payment keeps the swap). At most
+   * `limit` per call (the sweeper calls it every few minutes).
+   */
+  async pruneUnfunded(limit = 20): Promise<number> {
+    const be = this.deps.backend();
+    if (!be) return 0;
+    const cutoff = this.nowS() - this.cfg.retainUnfundedDays * 86_400;
+    const candidates = this.deps.store
+      .all()
+      .filter(
+        (r) =>
+          r.state === 'failed' &&
+          r.reason === 'funds-not-received' &&
+          r.deposit?.seenAt === undefined &&
+          r.updatedAt <= cutoff,
+      )
+      .slice(0, limit);
+    let dropped = 0;
+    for (const r of candidates) {
+      try {
+        const [erc20, eth] = await Promise.all([
+          be.evm.erc20Balance(r.pay.erc20Address, r.depositAddress),
+          be.evm.ethBalance(r.depositAddress),
+        ]);
+        if (erc20 > 0n || eth > 0n) {
+          r.deposit!.seenAt = this.nowS();
+          this.persist(r);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      this.deps.store.delete(r.swapId);
+      dropped++;
+    }
+    if (dropped > 0) this.deps.log.info('pruned never-funded swaps', { dropped });
+    return dropped;
   }
 
   // ── Withdraw params ───────────────────────────────────────────────────────
@@ -1102,34 +1291,53 @@ export class SwapService {
   private async pollOnce(): Promise<void> {
     const be = this.deps.backend();
     const now = this.nowS();
+    const nowMs = this.now();
+    const b = this.cfg.pollBackoffMs;
     for (const rec of this.deps.store.all()) {
-      if (rec.state !== 'awaiting_funds' || this.driving.has(rec.swapId)) continue;
+      if (rec.state !== 'awaiting_funds' || this.driving.has(rec.swapId)) {
+        this.nextPoll.delete(rec.swapId);
+        continue;
+      }
       // Without a bridge the address cannot be read: never fail a swap on its age unread.
       if (!be) continue;
+      if ((this.nextPoll.get(rec.swapId) ?? 0) > nowMs) continue;
+      const d = rec.deposit!;
+      const amount = BigInt(rec.pay.amount);
+      // The token first; the sweep ETH only once the token is there (one read per pass, audit C6).
       let erc20: bigint;
-      let eth: bigint;
+      let eth = 0n;
       try {
-        [erc20, eth] = await Promise.all([
-          be.evm.erc20Balance(rec.pay.erc20Address, rec.depositAddress),
-          be.evm.ethBalance(rec.depositAddress),
-        ]);
+        erc20 = await be.evm.erc20Balance(rec.pay.erc20Address, rec.depositAddress);
+        if (erc20 >= amount) eth = await be.evm.ethBalance(rec.depositAddress);
       } catch (e) {
         this.deps.log.warn('deposit address read failed', { swapId: rec.swapId, error: e });
         continue;
       }
-      const tokenThere = erc20 >= BigInt(rec.pay.amount);
+      if (erc20 > 0n && d.seenAt === undefined) {
+        d.seenAt = now;
+        this.persist(rec);
+      }
+      const tokenThere = erc20 >= amount;
       // The balance first, the age second: a swap whose token reached the address is never failed for
-      // its age, whatever kept the sponsor from starting it (audit C5).
+      // its age, whatever kept the sponsor from starting it (audit C5). A swap that received nothing
+      // gets the short window, one with part of the token the long one (audit C6).
       const since = [...rec.history].reverse().find((h) => h.state === 'awaiting_funds')?.at ?? rec.createdAt;
-      if (!tokenThere && now - since > this.cfg.fundsWaitSeconds) {
+      const window = d.seenAt === undefined ? this.cfg.fundsWaitSeconds : this.cfg.fundsWaitPartialSeconds;
+      if (!tokenThere && now - since > window) {
         transition(rec, 'failed', now, {
           reason: 'funds-not-received',
           message: 'the deposit address did not receive the funds in time; re-open the swap to keep waiting',
           recoverable: true,
         });
+        this.nextPoll.delete(rec.swapId);
         this.persist(rec);
         continue;
       }
+      const age = now - since;
+      this.nextPoll.set(
+        rec.swapId,
+        nowMs + (d.seenAt !== undefined || age < 600 ? b.fast : age < 3_600 ? b.medium : b.slow),
+      );
       if (!tokenThere || eth < BigInt(rec.sweepGas.ethWei)) continue;
       const s = this.deps.sponsor();
       if (!s.synced || (s.dustSpecks !== null && s.dustSpecks < this.cfg.dustLowSpecks)) continue;
