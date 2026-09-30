@@ -399,7 +399,8 @@ export class SwapService {
    * Records written before P4.2-fix2 (audit R3, R5): a failure that can be revived is marked
    * recoverable (the lifetime re-arm cap is gone; a failure without the field is read by its
    * reason), and a failed withdrawal attempt that named a request id without a known resolution
-   * keeps its nonce until it is reconciled by that id.
+   * keeps its nonce until it is reconciled by that id. Before P4.2-fix3 (audit S1): an attempt judged
+   * not included gets its day of re-checks.
    */
   private migrate(): void {
     for (const r of this.deps.store.all()) {
@@ -414,6 +415,12 @@ export class SwapService {
       for (const w of r.withdrawals) {
         if (w.stage === 'failed' && w.requestId && w.resolution === undefined && w.unresolved === undefined) {
           w.unresolved = true;
+          dirty = true;
+        }
+        // Judged not included before P4.2-fix3, possibly from a stale read (audit S1): re-checked for
+        // a day from now like a new judgment.
+        if (w.resolution === 'not-included' && w.recheckUntilMs === undefined && w.requestId) {
+          w.recheckUntilMs = this.now() + this.cfg.recheckMs;
           dirty = true;
         }
       }

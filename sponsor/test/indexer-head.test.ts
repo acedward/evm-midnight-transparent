@@ -23,6 +23,11 @@ describe('S1: the indexer head', () => {
     expect(JSON.parse(seen[0]!.body).query).toContain('block { height timestamp }');
   });
 
+  it('reads a timestamp given in seconds as seconds', async () => {
+    const head = await indexerHead('u', reply({ data: { block: { height: 7, timestamp: 1_790_544_294 } } }));
+    expect(head.timeMs).toBe(1_790_544_294_000);
+  });
+
   it('refuses anything that is not a block', async () => {
     await expect(indexerHead('u', reply({ data: { block: null } }))).rejects.toThrow(/block/);
     await expect(indexerHead('u', reply({ errors: [{ message: 'x' }] }))).rejects.toThrow(/block/);

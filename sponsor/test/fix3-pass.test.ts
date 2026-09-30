@@ -267,6 +267,27 @@ describe('S1: "not included" needs a vault read that covers the submission’s e
     await h.swaps.idle();
   });
 
+  it('an attempt judged not included by an older sponsor gets its day of re-checks at start-up', async () => {
+    const a = await takenSwap(h, bidSwap(h, Wallet.createRandom(), 'old'));
+    const replica = hideWithdrawRequests(h, 0);
+    const wa = withdrawFor(h, a.s, 'swap', { coinNonce: hex32('old') });
+    expect((await proveWithdraw(h, a.s, a.token, wa)).status).toBe(200);
+    h.vault.submitFailure = 'lost-landed';
+    await post(h, SWAP_PATHS.withdraw(a.s.swapId), { tx: txHex(wa.tx) }, a.token);
+    await h.swaps.idle();
+    h.now.ms += 16 * MIN;
+    await h.swaps.adoptLateStarts();
+    // As the a26438d sponsor left it: judged not included, no re-check.
+    const rec = h.store.get(a.s.swapId)!;
+    delete rec.withdrawals.at(-1)!.recheckUntilMs;
+    h.store.put(rec);
+    replica.off();
+    const h2 = harness({ config: testConfig(LIMITS), store: h.store, vault: h.vault, offers: h.offers });
+    h2.now.ms = h.now.ms;
+    expect(await h2.swaps.adoptLateStarts()).toEqual([a.s.swapId]);
+    await h2.swaps.idle();
+  });
+
   it('the re-check ends after a day', async () => {
     const a = await takenSwap(h, bidSwap(h, Wallet.createRandom(), 'end'));
     const replica = hideWithdrawRequests(h, 0);

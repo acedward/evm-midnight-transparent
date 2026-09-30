@@ -123,11 +123,12 @@ export async function indexerHead(
   const body = (await res.json()) as { data?: { block?: { height?: unknown; timestamp?: unknown } | null } };
   const b = body.data?.block;
   const height = Number(b?.height);
-  const timeMs = Number(b?.timestamp);
-  if (!Number.isSafeInteger(height) || height < 0 || !Number.isSafeInteger(timeMs) || timeMs <= 0) {
+  const t = Number(b?.timestamp);
+  if (!Number.isSafeInteger(height) || height < 0 || !Number.isSafeInteger(t) || t <= 0) {
     throw new Error('the indexer did not answer with a block');
   }
-  return { height, timeMs };
+  // The indexer reports milliseconds; a value in seconds is read as such (both are unambiguous).
+  return { height, timeMs: t < 1e12 ? t * 1000 : t };
 }
 
 /** Load the vault and its keys, verify them against the chain, and compose the backend. Throws a
