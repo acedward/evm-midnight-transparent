@@ -64,6 +64,13 @@ export interface WithdrawParams {
 /** A take, built and unproven: `tx` goes to `/prove`; `release()` gives the booked coin back. */
 export interface TakeDraft {
   readonly tx: TxHex;
+  /** The kernel's offer id of the SERVED offer: sha256 of its maker transaction's bytes (P4.2-fix C10). */
+  readonly offerId: string;
+  /** What the taker gives and receives, read from the served offer's own transaction. */
+  readonly terms: {
+    readonly give: ReadonlyArray<{ colour: string; amount: bigint }>;
+    readonly receive: ReadonlyArray<{ colour: string; amount: bigint }>;
+  };
   release(): Promise<void>;
 }
 
@@ -91,22 +98,25 @@ export interface SubmitTakeResult extends BatcherResult {
 export interface WalletModule {
   /** Where this module runs against: shown in the page's mock banner. */
   readonly kind: 'mock' | 'live' | 'unavailable';
-  /** Ask for the "start swap" signature TWICE; the seed is the first signature's keccak256 and
-   *  `deterministic` says whether both were equal (Q4). SECRET seed: memory only. */
+  /** Ask for the "start swap" signature TWICE (derivation 2, the warning prompt: P4.2-fix C14); the
+   *  seed is the first signature's keccak256 and `deterministic` says whether both were equal (Q4).
+   *  SECRET seed: memory only, straight into `createTempWallet`. The salt is local only. */
   deriveSwapSeed(signer: TypedDataSigner, salt: string): Promise<{ seed: string; deterministic: boolean }>;
   createTempWallet(seed: string): Promise<TempWallet>;
   /** The swap's Sepolia deposit address for the temporary wallet's coin key (core). */
   depositAddressFor(coinPk: string): string;
   /** Balance the offer's shielded side: unproven. */
   buildTake(wallet: TempWallet, offerBech32: string): Promise<TakeDraft>;
-  /** The proven balancing (from `/prove`) merged into the maker's transaction: the settlement. */
+  /** The proven balancing (from `/prove`) merged into the maker's transaction: the settlement. It
+   *  refuses an answer that is not exactly the draft once proofs are erased (P4.2-fix C10). */
   finalizeTake(draft: TakeDraft, provenHex: TxHex): { tx: TxHex };
   /** Submit the settlement to the exchange's batcher, which pays its fee. */
   submitTake(wallet: TempWallet, settlement: { tx: TxHex }): Promise<SubmitTakeResult>;
   /** The vault's `startWithdraw` on its live state, shielded side balanced: unproven. Build it right
    *  before `/prove` (G-BRIDGE flag). */
   buildWithdraw(wallet: TempWallet, params: WithdrawParams): Promise<WithdrawDraft>;
-  /** The proven `startWithdraw` (from `/prove`), bound and checked: what `/withdraw` takes. */
+  /** The proven `startWithdraw` (from `/prove`), bound and checked (exactly the draft once proofs are
+   *  erased: every call argument and recipient; P4.2-fix C10): what `/withdraw` takes. */
   finalizeWithdraw(draft: WithdrawDraft, provenHex: TxHex): { tx: TxHex };
 }
 

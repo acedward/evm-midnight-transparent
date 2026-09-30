@@ -3,10 +3,13 @@
 // after the tab closed, and the page's refusals (a deposit address it did not compute, an offer that
 // is gone, not enough funds). The records it writes hold no secret and survive Export/Import.
 
+import { KernelClient, START_SWAP_PURPOSE_V2, swapSeedFromSignature } from '@evm-midnight-transparent/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { transferData } from '../src/swap/evm.js';
+import { MockChain } from '../src/swap/mock/chain.js';
 import type { MockEnvironment } from '../src/swap/mock/index.js';
+import { swapIdOf } from '../src/swap/record-shape.js';
 import { readSwapRecords, saveSwapRecord } from '../src/swap/records.js';
 import { type SessionDeps, SwapSession } from '../src/swap/session.js';
 import { LocalStore } from '../src/store/store.js';
@@ -433,5 +436,386 @@ describe('what the page refuses', () => {
     expect(s.getSnapshot().notice).toMatch(/declined/);
     await s.sendFunds();
     expect(evm.sent).toHaveLength(2);
+  });
+});
+
+// ── P4.2-fix (the security audit's Consolidation rows C1, C5, C8, C9, C10, C14, and F-A14) ──────────
+
+describe('P4.2-fix C1: a withdrawal that ended without a transfer, against the real sponsor wire', () => {
+  it('a start that failed after /withdraw accepted it (back to minted, stage failed) is rebuilt and resubmitted', async () => {
+    env = mockEnv({ scenario: { failFirstStart: true } });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const s = track(SwapSession.begin(offer, deps(signer, new FakeSepolia(signer.address))));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 15_000, 'the swap after a failed start');
+    const r = s.getSnapshot().record!;
+    expect(r.outcome).toBe('swapped');
+    expect(r.bridgeOut.attempts).toBe(2);
+    expect(r.bridgeOut.refunds).toBe(1); // one attempt ended without a transfer
+    expect(env.sponsor.requests.filter((q) => q.path.endsWith('/withdraw')).length).toBe(2);
+  });
+
+  it('a refund: the page retries from the sponsor signal, whatever `refunds` counts', async () => {
+    env = mockEnv({ scenario: { refundFirstWithdrawal: true } });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const s = track(SwapSession.begin(offer, deps(signer, new FakeSepolia(signer.address))));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(
+      () => (env.sponsor.views()[0]?.withdraw?.stage === 'refunded' ? true : statusOf(s).kind === 'done'),
+      15_000,
+      'the refund',
+    );
+    await waitFor(() => statusOf(s).kind === 'done', 15_000, 'the swap after a refund');
+    expect(s.getSnapshot().record!.bridgeOut).toMatchObject({ attempts: 2, refunds: 1 });
+  });
+});
+
+describe('P4.2-fix C5: a failure the sponsor can revive', () => {
+  it('funds-not-received, recoverable: Resume re-opens it and the swap goes on to the end', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    env.controls.failAwaitingFunds(true);
+    await waitFor(() => statusOf(s).kind === 'error', 5_000, 'the failure');
+    expect(statusOf(s)).toMatchObject({ kind: 'error', canRetry: false, canResume: true });
+    expect(s.getSnapshot().record).toMatchObject({ phase: 'failed', recoverable: true });
+    await s.close();
+
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    const r = track(SwapSession.resume(record!, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'fund', 5_000, 'the funding step again');
+    expect(r.getSnapshot().record).toMatchObject({ phase: 'funding' });
+    expect(r.getSnapshot().record!.recoverable).toBeUndefined();
+    await r.sendFunds();
+    await waitFor(() => statusOf(r).kind === 'done', 10_000, 'the revived swap');
+    expect(r.getSnapshot().record!.outcome).toBe('swapped');
+  });
+
+  it('a failure that is not recoverable stays final: no signature, no re-open', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    env.controls.failAwaitingFunds(false);
+    await waitFor(() => statusOf(s).kind === 'error', 5_000, 'the failure');
+    expect(statusOf(s)).not.toMatchObject({ canResume: true });
+    await s.close();
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    const before = signer.prompts.length;
+    const opens = env.sponsor.requests.filter((q) => q.method === 'POST' && q.path === '/v1/swaps').length;
+    const r = track(SwapSession.resume(record!, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'error', 5_000);
+    expect(signer.prompts.length).toBe(before);
+    expect(env.sponsor.requests.filter((q) => q.method === 'POST' && q.path === '/v1/swaps').length).toBe(opens);
+  });
+});
+
+describe('P4.2-fix C8: Send funds uses only the sponsor answer, checked, never the record', () => {
+  it('an edited (imported) record cannot change the token, the amount or the sweep ETH that is sent', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env); // pay 1.04 USDC
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const honest = s.getSnapshot().record!.deposit;
+    await s.close();
+
+    // The same swap (same id, keys and deposit address), its funding block edited, e.g. by a
+    // "support" contact, and imported back.
+    const [record] = readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address });
+    const edited = {
+      ...record!,
+      deposit: {
+        ...record!.deposit,
+        erc20Address: registry.bySymbol('stkA')!.sepoliaAddress,
+        amount: '999000000',
+        sweepGas: { gasLimit: '1000000', maxFeePerGas: '3000000000', ethWei: '3000000000000000' },
+      },
+    };
+    saveSwapRecord(store, edited);
+    const r = track(SwapSession.resume(edited, deps(signer, evm)));
+    await waitFor(() => statusOf(r).kind === 'fund', 5_000);
+    // The record is back to the verified values.
+    expect(r.getSnapshot().record!.deposit).toEqual(honest);
+    await r.sendFunds();
+    expect(evm.sent.map((t) => ({ to: t.to, value: t.value ?? 0n, data: t.data ?? '' }))).toEqual([
+      { to: honest.address, value: BigInt(honest.sweepGas.ethWei), data: '' },
+      { to: honest.erc20Address, value: 0n, data: transferData(honest.address, 1_040_000n) },
+    ]);
+    expect(honest.erc20Address).toBe(registry.bySymbol('USDC')!.sepoliaAddress);
+  });
+
+  it('the offer is no longer live when the funds would go: nothing is sent', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    env.chain.consume(offer.offerId);
+    await s.sendFunds();
+    expect(evm.sent).toEqual([]);
+    expect(s.getSnapshot().notice).toMatch(/no longer live/);
+    expect(statusOf(s)).toEqual({ kind: 'fund', sending: null });
+  });
+});
+
+describe('P4.2-fix C8 with FS C2: a sweep gas the sponsor raises while it waits for the funds', () => {
+  it('is adopted (checked, never lowered) and Send funds tops the ETH up: no token twice', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address, { tokens: { USDC: 1_040_000n } });
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    env.controls.raiseSweepGas(); // before the page funds: it sends the raised amount at once
+    await waitFor(() => BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei) === first * 2n, 5_000, 'the raise');
+    await s.sendFunds();
+    expect(evm.sent.map((t) => t.value ?? 0n)).toEqual([first * 2n, 0n]);
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap');
+  });
+
+  it('after the funds went: the fund step comes back and only the missing ETH is sent', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    // The sponsor has not seen the funds yet: hold its watch by hiding the deposit address's ETH.
+    env.setEvmReader({ ethBalance: async () => 0n, erc20Balance: async () => 0n });
+    const first = BigInt(s.getSnapshot().record!.deposit.sweepGas.ethWei);
+    await s.sendFunds();
+    expect(evm.sent).toHaveLength(2);
+    env.controls.raiseSweepGas();
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000, 'the fund step again');
+    expect(s.getSnapshot().notice).toMatch(/gas price rose/);
+    env.setEvmReader(evm);
+    await s.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : (t.value ?? 0n)))).toEqual([first, 'token', first]);
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap');
+  });
+
+  it('a sweep gas above what the page sends, or not gasLimit x maxFeePerGas, is refused', async () => {
+    env = mockEnv({ stepMs: 25 });
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const before = s.getSnapshot().record!.deposit.sweepGas;
+    for (let i = 0; i < 7; i++) env.controls.raiseSweepGas(); // 2^7 × 0.0001625 ETH > the page's 0.003 cap
+    await waitFor(() => /will not send/.test(s.getSnapshot().notice ?? ''), 5_000, 'the refusal');
+    expect(s.getSnapshot().record!.deposit.sweepGas).toEqual(before);
+  });
+});
+
+describe('P4.2-fix C9: funding is bound to Sepolia and the swap account', () => {
+  it('the wallet leaves Sepolia while the sweep is confirming: the token transfer is not sent', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new DelegatedSepolia(signer.address);
+    evm.pollsToMine = 2;
+    const receipt = evm.receipt.bind(evm);
+    evm.receipt = async (hash?: string) => {
+      evm.chainId = '0x1'; // the user switched networks during the wait
+      return receipt(hash);
+    };
+    const quick = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 5)));
+    const s = track(SwapSession.begin(offer, { ...deps(signer, evm), sleep: quick }));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : 'eth'))).toEqual(['eth']);
+    expect(s.getSnapshot().notice).toMatch(/not on Sepolia/);
+    // Back on Sepolia: only the token goes, the sweep is never sent twice.
+    evm.chainId = '0xaa36a7';
+    evm.receipt = receipt;
+    await s.sendFunds();
+    expect(evm.sent.map((t) => (t.data ? 'token' : 'eth'))).toEqual(['eth', 'token']);
+  });
+
+  it('checks the wallet before any send, and refuses another account', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    evm.account = `0x${'12'.repeat(20)}`;
+    await s.sendFunds();
+    expect(evm.sent).toEqual([]);
+    expect(s.getSnapshot().notice).toMatch(/another account/);
+    evm.account = evm.address;
+    evm.chainId = '0x1';
+    await s.sendFunds();
+    expect(evm.sent).toEqual([]);
+    evm.chainId = '0xaa36a7';
+    await s.sendFunds();
+    expect(evm.sent).toHaveLength(2);
+    expect(evm.readyCalls).toBeGreaterThanOrEqual(3);
+  });
+
+  it('a network change pauses funding (chainChanged) until the wallet is back', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new FakeSepolia(signer.address);
+    const s = track(SwapSession.begin(offer, deps(signer, evm)));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    s.setFundingBlocked('Your wallet switched away from Sepolia: funding is paused.');
+    expect(s.getSnapshot().fundingBlocked).toMatch(/paused/);
+    await s.sendFunds();
+    expect(evm.sent).toEqual([]);
+    s.setFundingBlocked(null);
+    await s.sendFunds();
+    expect(evm.sent).toHaveLength(2);
+  });
+});
+
+describe('P4.2-fix C10: the take is built only from this swap own offer', () => {
+  it('the exchange serves another maker transaction for this offer id: refused before /prove, the coin released', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env); // pay 1.04 USDC, receive 100 stkA
+    // An offer wanting the same 1.04 USDC for 1 base unit of stkA, served under the real offer id.
+    const colour = (n: string) => registry.byMidnightName(n)!.midnightColour;
+    const evil = env.chain.addOffer(
+      'evil',
+      [{ token: colour('wStkA'), amount: 1n, type: 'SHIELDED' }],
+      [{ token: colour('wUSDC'), amount: 1_040_000n, type: 'SHIELDED' }],
+      86_400_000,
+    );
+    const lyingKernel = async (url: string, init?: RequestInit) => {
+      const res = await env.kernelFetch(url, init);
+      if (!new URL(url).pathname.endsWith(`/v1/offers/${offer.offerId}`)) return res;
+      const body = (await res.json()) as Record<string, unknown>;
+      return new Response(JSON.stringify({ ...body, offerBech32: MockChain.offerBech32(evil) }), { status: 200 });
+    };
+    const signer = testSigner();
+    const d = deps(signer, new FakeSepolia(signer.address));
+    d.backends = {
+      ...d.backends,
+      kernel: new KernelClient({ baseUrl: network.zswap.kernelUrl, fetch: lyingKernel, retries: 0 }),
+    };
+    const s = track(SwapSession.begin(offer, d));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'error', 10_000, 'the refusal');
+    expect(statusOf(s)).toMatchObject({
+      message: expect.stringMatching(/another offer than this swap/),
+      canRetry: true,
+    });
+    expect(env.sponsor.requests.some((q) => q.path.endsWith('/prove'))).toBe(false);
+    expect(env.controls.walletStats()).toEqual({ drafts: 1, released: 1 });
+    expect(env.chain.offer(evil)?.status).toBe('live');
+  });
+});
+
+describe('P4.2-fix C14 and F-A14: the salt stays in the page, the seed is not kept', () => {
+  it('the sponsor sees only the public id: no request carries the salt; the record keeps it locally', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const salt = `0x${'3c'.repeat(32)}`;
+    const d = deps(signer, new FakeSepolia(signer.address));
+    const seen: Array<{ method: string; url: string; headers: string; body: string }> = [];
+    const real = env.sponsorFetch;
+    const watching = async (url: string, init: RequestInit = {}) => {
+      seen.push({
+        method: (init.method ?? 'GET').toUpperCase(),
+        url,
+        headers: JSON.stringify([...new Headers(init.headers).entries()]),
+        body: typeof init.body === 'string' ? init.body : '',
+      });
+      return real(url, init);
+    };
+    const { HttpSponsorApi } = await import('../src/swap/sponsor-client.js');
+    d.backends = { ...d.backends, sponsor: new HttpSponsorApi('https://sponsor.mock.invalid', { fetch: watching }) };
+    const s = track(SwapSession.begin(offer, { ...d, newSalt: () => salt }));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 10_000);
+
+    const id = swapIdOf(salt);
+    expect(s.getSnapshot().swapId).toBe(id);
+    const r = s.getSnapshot().record!;
+    expect(r).toMatchObject({ v: 2, swapId: id, salt, derivation: 2 });
+    // The open-swap body names the public id, and its signature covers it.
+    const open = JSON.parse(seen.find((x) => x.method === 'POST' && x.url.endsWith('/v1/swaps'))!.body);
+    expect(open.swap).toBe(id);
+    expect(open.auth.message.swap).toBe(id);
+    // Not one request (URL, headers or body) carries the salt.
+    const hex = salt.slice(2);
+    expect(seen.length).toBeGreaterThan(5);
+    for (const x of seen) expect(JSON.stringify(x)).not.toContain(hex);
+    // The "start swap" prompts are derivation 2: the warning.
+    const starts = signer.prompts.filter((p) => p.primaryType === 'StartSwap');
+    expect(starts).toHaveLength(2);
+    for (const p of starts)
+      expect((p.message as { purpose: string; salt: string }).purpose).toBe(START_SWAP_PURPOSE_V2);
+    expect((starts[0]!.message as { salt: string }).salt).toBe(salt);
+  });
+
+  it('the session never keeps the seed (F-A14): only the wallet module holds the keys', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const s = track(SwapSession.begin(offer, deps(signer, new FakeSepolia(signer.address))));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    const seed = swapSeedFromSignature(signer.signatures[0]!);
+    const found: string[] = [];
+    const scan = (v: unknown, path: string, depth: number, seen: Set<unknown>) => {
+      if (typeof v === 'string') {
+        if (v.includes(seed)) found.push(path);
+        return;
+      }
+      if (!v || typeof v !== 'object' || depth > 4 || seen.has(v)) return;
+      seen.add(v);
+      for (const k of Object.getOwnPropertyNames(v)) {
+        if (k === 'deps') continue; // the ports, not the session's own state
+        scan((v as Record<string, unknown>)[k], `${path}.${k}`, depth + 1, seen);
+      }
+    };
+    scan(s, 'session', 0, new Set());
+    expect(found).toEqual([]);
+    expect(s.hasSecrets()).toBe(true); // the token, and the wallet (its keys inside the module)
+    await s.close();
+    expect(s.hasSecrets()).toBe(false);
+  });
+});
+
+describe('P4.2-fix change 4: /prove answers 409 stale-vault-state', () => {
+  it('the withdrawal draft is released, rebuilt and proven again', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const d = deps(signer, new FakeSepolia(signer.address));
+    let stale = 0;
+    const real = env.sponsorFetch;
+    const staleOnce = async (url: string, init: RequestInit = {}) => {
+      if (url.endsWith('/prove') && String(init.body).includes('"withdraw"') && stale++ === 0)
+        return new Response(JSON.stringify({ error: { code: 'stale-vault-state', message: 'the vault moved on' } }), {
+          status: 409,
+        });
+      return real(url, init);
+    };
+    const { HttpSponsorApi } = await import('../src/swap/sponsor-client.js');
+    d.backends = { ...d.backends, sponsor: new HttpSponsorApi('https://sponsor.mock.invalid', { fetch: staleOnce }) };
+    const s = track(SwapSession.begin(offer, d));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    await waitFor(() => statusOf(s).kind === 'done', 10_000, 'the swap after a stale proof');
+    expect(env.controls.walletStats()).toEqual({ drafts: 3, released: 1 });
   });
 });

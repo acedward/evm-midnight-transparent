@@ -1,6 +1,7 @@
+import { firstValueFrom } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { DEFAULT_EVM_GAS, STAGENET } from '@evm-midnight-transparent/core';
+import { DEFAULT_EVM_GAS, STAGENET, bytesToHex } from '@evm-midnight-transparent/core';
 
 import {
   WithdrawError,
@@ -8,6 +9,7 @@ import {
   buildWithdraw,
   contractCalls,
   dustSpendCount,
+  erasedHex,
   finalizeWithdraw,
   jsonRpcRequest,
   parseWithdrawParams,
@@ -16,7 +18,9 @@ import {
   shieldedImbalances,
   txToHex,
   unprovenFromHex,
+  type WithdrawDraft,
 } from '../src/index.js';
+import { internalsOf } from '../src/temp-wallet.js';
 
 import {
   TEST_SEED_A,
@@ -196,6 +200,47 @@ describe('finalizeWithdraw and the shape check', () => {
     await draft.release();
     expect(() => finalizeWithdraw(draft, LIVE)).toThrow(expect.objectContaining({ code: 'released' }));
     await wallet.close();
+  });
+
+  // A draft for the live transaction (its unproven form was not recorded): what `buildWithdraw` keeps
+  // for the finalizer, taken from the live transaction itself.
+  const liveDraft = (): WithdrawDraft => {
+    const { tx } = provenFromHex(LIVE);
+    return {
+      released: false,
+      vault: VAULT,
+      singleton: SINGLETON,
+      requestId: B31.requestId,
+      identifiers: tx.identifiers().map(String),
+      erased: bytesToHex(tx.eraseProofs().serialize()),
+    } as unknown as WithdrawDraft;
+  };
+
+  it('erases proofs and binding only: a draft and its proven form erase to the same bytes', () => {
+    const { tx } = provenFromHex(LIVE);
+    expect(erasedHex(tx)).toBe(liveDraft().erased);
+  });
+
+  it('accepts the proven transaction of its own draft (P4.2-fix C10)', () => {
+    expect(finalizeWithdraw(liveDraft(), LIVE).requestId).toBe(B31.requestId);
+  });
+
+  it('refuses a proven answer that adds a separately balanced transfer, though every identifier and colour check passes (P4.2-fix C10, F-B9)', async () => {
+    const other = await walletWithCoins(TEST_SEED_A, [{ colour: WUSDC, value: 5_000_000n }]);
+    const { opened, keys } = internalsOf(other);
+    const self = (await firstValueFrom(opened.wallet.state)).address;
+    const extra = await opened.wallet.transferTransaction(keys.shieldedSecretKeys, [
+      { type: WUSDC, receiverAddress: self, amount: 1_000_000n },
+    ]);
+    const tampered = provenFromHex(LIVE).tx.merge(extra.mockProve());
+    // The old checks all pass: the two calls, no DUST, balanced, and every identifier of the draft.
+    expect(() => assertWithdrawShape(tampered, VAULT, SINGLETON)).not.toThrow();
+    const ids = new Set(tampered.identifiers().map(String));
+    expect(liveDraft().identifiers.every((id) => ids.has(id))).toBe(true);
+    expect(() => finalizeWithdraw(liveDraft(), txToHex(tampered))).toThrow(
+      expect.objectContaining({ code: 'proof-mismatch' }),
+    );
+    await other.close();
   });
 
   it('refuses a take, or any other transaction, as a withdrawal', () => {

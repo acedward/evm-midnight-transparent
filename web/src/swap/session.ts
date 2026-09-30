@@ -5,21 +5,32 @@
 //           swap cannot be recovered once the tab closes) → the temporary wallet → the sponsor's
 //           open-swap SponsorAction (a third signature) → checks on the answer → the swap record;
 //   fund    the two Sepolia transactions from the connected wallet: the sized sweep ETH, then the
-//           exact ERC20 amount, both to the deposit address (never more than is missing there);
+//           exact ERC20 amount, both to the deposit address (never more than is missing there). What
+//           is sent comes ONLY from the sponsor's open-swap answer, checked against this page's own
+//           derivation and the registry, and the offer is checked live first; never from the stored
+//           (or imported) record (P4.2-fix C8). Every send first checks the wallet is still on
+//           Sepolia with the swap's account, and funding stops while it is not (C9);
 //   loop    the sponsor's state, every `pollMs`: bridge-in progress; once minted, the take (offer
 //           still live → build → prove at the sponsor → still live → batcher) or "Swap is not
 //           available"; then the withdrawal of the received token (or, after Bridge back, of the
-//           paid one) → prove → the sponsor's withdrawal lane; a refund rebuilds it (Q9 A);
+//           paid one) → prove → the sponsor's withdrawal lane; a refund or a failed start rebuilds it
+//           when the sponsor's view says `withdrawal.retry` (Q9 A; P4.2-fix C1);
 //   resume  "start swap" signed ONCE: the re-derived coin key must equal the record's; then the swap
-//           is re-opened with the sponsor for a new token, and the loop continues from its state.
+//           is re-opened with the sponsor for a new token, and the loop continues from its state. A
+//           failed swap the sponsor marked `recoverable` is resumed the same way (P4.2-fix C5).
 //
-// Secrets stay in this object only: the seed (the temporary wallet's key) and the sponsor's swap
-// token. Neither is put in the snapshot, the record, a log or an error message.
+// The swap's PUBLIC id is keccak256(tag ‖ salt) (P4.2-fix C14): the sponsor, URLs and the snapshot
+// see it; the salt stays in this tab and the local record. Secrets stay in memory only: the sponsor's
+// swap token here, and the temporary wallet's keys inside the wallet module (the seed is handed to
+// `createTempWallet` and never kept: F-A14). Neither is put in the snapshot, the record, a log or an
+// error message.
 
 import {
   type NetworkProfile,
   type SwapOffer,
   type TokenRegistry,
+  SWAP_KEY_DERIVATION_LATEST,
+  classifyOffer,
   newSwapSalt,
   recoverStartSwapSigner,
   startSwapTypedData,
@@ -28,14 +39,15 @@ import {
 import { getAddress } from 'ethers';
 
 import { EvmError, type EvmPort, transferData } from './evm.js';
-import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction } from './flow.js';
+import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
-import type { SwapBackends, TempWallet, TypedDataSigner } from './ports.js';
-import { SWAP_RECORD_VERSION, type SwapRecord, isFinished } from './record-shape.js';
+import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner } from './ports.js';
+import { SWAP_RECORD_VERSION, type SwapRecord, isFinished, isRecoverable, swapIdOf } from './record-shape.js';
 import {
   type OpenSwapPayload,
   type OpenSwapResponse,
   SponsorError,
+  type SweepGas,
   type SwapView,
   openSwapMessage,
   signOpenSwap,
@@ -61,10 +73,12 @@ export type SessionStatus =
   /** The offer was gone at take time: waiting for Bridge back. */
   | { kind: 'unavailable' }
   | { kind: 'done' }
-  | { kind: 'error'; message: string; canRetry: boolean }
+  /** `canResume`: a failed swap the sponsor marked recoverable (P4.2-fix C5): Resume revives it. */
+  | { kind: 'error'; message: string; canRetry: boolean; canResume?: boolean }
   | { kind: 'stopped'; message: string };
 
 export interface SessionSnapshot {
+  /** The swap's PUBLIC id (keccak256(tag ‖ salt)), never the salt. */
   swapId: string;
   offer: SwapOffer | null;
   record: SwapRecord | null;
@@ -76,6 +90,8 @@ export interface SessionSnapshot {
   view: SwapView | null;
   /** A passing message: a refund being retried, a failed transfer. */
   notice: string | null;
+  /** Why "Send funds" is paused (the wallet left Sepolia or the swap's account; P4.2-fix C9), or null. */
+  fundingBlocked: string | null;
 }
 
 export interface SessionDeps {
@@ -94,6 +110,27 @@ export interface SessionDeps {
 
 export class SessionError extends Error {
   override name = 'SessionError';
+}
+
+/** What "Send funds" sends, from the sponsor's open-swap answer checked against this page's own
+ *  derivation and the registry (P4.2-fix C8): session memory only, never read back from a record. */
+interface VerifiedFunding {
+  address: string;
+  erc20Address: string;
+  amount: bigint;
+  sweepGas: Pick<SweepGas, 'gasLimit' | 'maxFeePerGas' | 'ethWei'>;
+  ethWei: bigint;
+}
+
+const sameLeg = (a: { colour: string; amount: bigint }, b: { colour: string; amount: string }) =>
+  a.colour === b.colour && a.amount === BigInt(b.amount);
+
+/** The draft's terms are the record's: the taker gives the pay leg, receives the receive leg. */
+function termsAreTheRecords(draft: TakeDraft, offer: SwapRecord['offer']): boolean {
+  const { give, receive } = draft.terms;
+  return (
+    give.length === 1 && receive.length === 1 && sameLeg(give[0]!, offer.pay) && sameLeg(receive[0]!, offer.receive)
+  );
 }
 
 const leg = (l: SwapOffer['pay']) => ({
@@ -115,10 +152,14 @@ export class SwapSession {
   private snap: SessionSnapshot;
   private readonly listeners = new Set<() => void>();
   private readonly deps: Required<Omit<SessionDeps, 'fundingRefusal'>> & Pick<SessionDeps, 'fundingRefusal'>;
-  /** SECRET: the temporary wallet's key. */
-  private seed: string | null = null;
+  /** LOCAL ONLY: the "start swap" salt (never sent, never in a URL or a log; P4.2-fix C14). */
+  private readonly salt: string;
   /** SECRET: the sponsor's bearer token for this swap. */
   private token: string | null = null;
+  /** What "Send funds" may send (P4.2-fix C8). */
+  private funding: VerifiedFunding | null = null;
+  /** The sponsor raised the sweep gas after the funds were sent: "Send funds" tops the ETH up. */
+  private topUp = false;
   private wallet: TempWallet | null = null;
   private looping = false;
   private closed = false;
@@ -126,7 +167,14 @@ export class SwapSession {
   /** One more automatic withdrawal after MAX_AUTO_RETRIES refunds, approved by the user. */
   private retryApproved = false;
 
-  private constructor(swapId: string, offer: SwapOffer | null, record: SwapRecord | null, deps: SessionDeps) {
+  private constructor(
+    salt: string,
+    swapId: string,
+    offer: SwapOffer | null,
+    record: SwapRecord | null,
+    deps: SessionDeps,
+  ) {
+    this.salt = salt;
     this.deps = {
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -142,20 +190,21 @@ export class SwapSession {
       temp: record?.temp ?? null,
       view: null,
       notice: null,
+      fundingBlocked: null,
     };
   }
 
   /** Start a new swap on `offer`. */
   static begin(offer: SwapOffer, deps: SessionDeps): SwapSession {
     const salt = (deps.newSalt ?? (() => newSwapSalt()))().toLowerCase();
-    const s = new SwapSession(salt, offer, null, deps);
+    const s = new SwapSession(salt, swapIdOf(salt), offer, null, deps);
     void s.start();
     return s;
   }
 
   /** Resume a swap from its record (sign the start message again). */
   static resume(record: SwapRecord, deps: SessionDeps): SwapSession {
-    const s = new SwapSession(record.swapId, null, record, deps);
+    const s = new SwapSession(record.salt, record.swapId, null, record, deps);
     void s.resumeFlow();
     return s;
   }
@@ -171,6 +220,18 @@ export class SwapSession {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  /** Stopped for good in this tab (an error that allows no retry): a Resume may replace it. */
+  get isStuck(): boolean {
+    const st = this.snap.status;
+    return st.kind === 'error' && !st.canRetry;
+  }
+
+  /** Pause "Send funds" (the wallet left Sepolia or the swap's account: P4.2-fix C9), or lift it. */
+  setFundingBlocked(reason: string | null): void {
+    if (this.snap.fundingBlocked === reason) return;
+    this.set({ fundingBlocked: reason, ...(reason ? { notice: reason } : {}) });
   }
 
   private set(patch: Partial<SessionSnapshot>): void {
@@ -220,9 +281,7 @@ export class SwapSession {
           return signer.signTypedData(td);
         },
       };
-      const { seed, deterministic } = await backends.wallet.deriveSwapSeed(counting, this.snap.swapId);
-      this.seed = seed;
-      const wallet = await backends.wallet.createTempWallet(seed);
+      const { wallet, deterministic } = await this.newTempWallet(counting);
       this.wallet = wallet;
       void wallet.sync().catch(() => undefined); // warm up while the user funds the swap
       this.set({
@@ -244,19 +303,15 @@ export class SwapSession {
       let record: SwapRecord = {
         v: SWAP_RECORD_VERSION,
         swapId: this.snap.swapId,
-        derivation: 1,
+        salt: this.salt,
+        derivation: SWAP_KEY_DERIVATION_LATEST,
         network: network.name,
         vault: network.bridge.vaultAddress,
         evmAddress: getAddress(signer.address),
         deterministic,
         offer: { offerId: offer.offerId, pay: leg(offer.pay), receive: leg(offer.receive), expiresAt: offer.expiresAt },
         temp: { coinPk: wallet.coinPk, encPk: wallet.encPk, shieldedAddress: wallet.shieldedAddress },
-        deposit: {
-          address: getAddress(opened.depositAddress),
-          erc20Address: getAddress(opened.erc20Address),
-          amount: opened.amount,
-          sweepGas: opened.sweepGas,
-        },
+        deposit: this.depositOf(),
         funding: {},
         bridgeIn: {},
         take: {},
@@ -272,6 +327,22 @@ export class SwapSession {
     } catch (e) {
       this.fail(e, false);
     }
+  }
+
+  /** The record's deposit block: the verified funding values (P4.2-fix C8). */
+  private depositOf(): SwapRecord['deposit'] {
+    const f = this.funding;
+    if (!f) throw new SessionError('the swap has not been opened with the sponsor');
+    return { address: f.address, erc20Address: f.erc20Address, amount: f.amount.toString(), sweepGas: f.sweepGas };
+  }
+
+  /** "Start swap" signed twice, and the temporary wallet made from the seed. The salt goes to the
+   *  user's own wallet (it is in the message) and nowhere else; the seed lives only in this frame, on
+   *  its way to the wallet module, which keeps the keys (F-A14). */
+  private async newTempWallet(signer: TypedDataSigner): Promise<{ wallet: TempWallet; deterministic: boolean }> {
+    const { backends } = this.deps;
+    const derived = await backends.wallet.deriveSwapSeed(signer, this.salt);
+    return { wallet: await backends.wallet.createTempWallet(derived.seed), deterministic: derived.deterministic };
   }
 
   /** The user's answer to "your wallet signs differently each time". */
@@ -316,13 +387,23 @@ export class SwapSession {
         "The sponsor's deposit address does not match the one this page computed. Nothing was sent.",
       );
     const token = registry.byColour(pay.colour);
-    if (!token || getAddress(res.erc20Address) !== getAddress(token.sepoliaAddress))
+    if (!token || !token.sepoliaAddress || getAddress(res.erc20Address) !== getAddress(token.sepoliaAddress))
       throw new SessionError('The sponsor named another token contract than the one this swap pays. Nothing was sent.');
     if (res.amount !== pay.amount)
       throw new SessionError('The sponsor asked for another amount than the offer wants. Nothing was sent.');
     const g = res.sweepGas;
-    if (BigInt(g.ethWei) !== BigInt(g.gasLimit) * BigInt(g.maxFeePerGas) || BigInt(g.ethWei) > MAX_SWEEP_WEI)
+    const ethWei = BigInt(g.ethWei);
+    if (ethWei <= 0n || ethWei !== BigInt(g.gasLimit) * BigInt(g.maxFeePerGas) || ethWei > MAX_SWEEP_WEI)
       throw new SessionError('The sweep gas the sponsor asks for is not one this page will send. Nothing was sent.');
+    // The only values "Send funds" will use (C8): this page's own address, the registry's token, the
+    // offer's amount, and the checked sweep gas. Never the record's.
+    this.funding = {
+      address: mine,
+      erc20Address: getAddress(token.sepoliaAddress),
+      amount: BigInt(pay.amount),
+      sweepGas: { gasLimit: g.gasLimit, maxFeePerGas: g.maxFeePerGas, ethWei: g.ethWei },
+      ethWei,
+    };
     this.token = res.swapToken;
     return res;
   }
@@ -335,11 +416,26 @@ export class SwapSession {
     try {
       if (getAddress(signer.address) !== getAddress(record.evmAddress))
         throw new SessionError('Connect the wallet that started this swap to resume it.');
-      const params = { network: record.network, vault: record.vault, salt: record.swapId };
+      if (isFinished(record) && !isRecoverable(record)) {
+        this.status(
+          record.phase === 'done'
+            ? { kind: 'done' }
+            : { kind: 'error', message: record.error ?? 'This swap failed.', canRetry: false },
+        );
+        return;
+      }
+      const params = {
+        network: record.network,
+        vault: record.vault,
+        salt: record.salt,
+        derivation: record.derivation,
+        chainId: this.deps.network.evm.chainId,
+      };
       this.status({ kind: 'signing', prompt: 'resume' });
       const signature = await signer.signTypedData(startSwapTypedData(params));
       if (recoverStartSwapSigner(params, signature) !== getAddress(record.evmAddress))
         throw new SessionError('The signature is not from the wallet that started this swap.');
+      // The seed goes straight to the wallet module; this object never keeps it (F-A14).
       const wallet = await backends.wallet.createTempWallet(swapSeedFromSignature(signature));
       if (wallet.coinPk !== record.temp.coinPk) {
         await wallet.close();
@@ -349,19 +445,15 @@ export class SwapSession {
           }`,
         );
       }
-      this.seed = swapSeedFromSignature(signature);
       this.wallet = wallet;
       void wallet.sync().catch(() => undefined);
-      if (isFinished(record)) {
-        this.status(
-          record.phase === 'done'
-            ? { kind: 'done' }
-            : { kind: 'error', message: record.error ?? 'This swap failed.', canRetry: false },
-        );
-        return;
-      }
+      // A re-open: the same terms and keys; a failed swap the sponsor marked recoverable revives.
       const opened = await this.open(record);
-      if (opened.swap) this.saveRecord(applyView(this.record, opened.swap, this.deps.now()));
+      // The record's funding block is replaced by the verified values (an imported record cannot
+      // steer "Send funds": C8).
+      let next: SwapRecord = { ...this.record, deposit: this.depositOf(), updatedAt: this.deps.now() };
+      if (opened.swap) next = applyView(next, opened.swap, this.deps.now());
+      this.saveRecord(next);
       void this.loop();
     } catch (e) {
       this.fail(e, false);
@@ -379,23 +471,33 @@ export class SwapSession {
     if (this.snap.status.kind !== 'fund' || this.snap.status.sending !== null) return;
     const { evm } = this.deps;
     try {
-      const refusal = this.deps.fundingRefusal?.();
+      const refusal = this.fundingRefusal();
       if (refusal) throw new SessionError(refusal);
+      // C8: only what the sponsor's answer said, as this page checked it; never the record's.
+      const f = this.funding;
+      if (!f) throw new SessionError('Resume the swap first: this tab has not opened it with the sponsor.');
       this.status({ kind: 'fund', sending: 'checking' });
+      await this.bound();
       const r = this.record;
-      const dep = r.deposit;
-      const amount = BigInt(dep.amount);
-      const ethWei = BigInt(dep.sweepGas.ethWei);
+      const amount = f.amount;
+      const ethWei = f.ethWei;
       const [ethThere, tokenThere, myEth, myToken] = await Promise.all([
-        evm.ethBalance(dep.address),
-        evm.erc20Balance(dep.erc20Address, dep.address),
+        evm.ethBalance(f.address),
+        evm.erc20Balance(f.erc20Address, f.address),
         evm.ethBalance(evm.address),
-        evm.erc20Balance(dep.erc20Address, evm.address),
+        evm.erc20Balance(f.erc20Address, evm.address),
       ]);
       const pendingEth = r.funding.eth?.status === 'sent';
       const pendingToken = r.funding.token?.status === 'sent';
+      if (this.topUp && pendingEth && ethThere < ethWei)
+        throw new SessionError(
+          'Your sweep gas transfer is still pending on Sepolia. Press Send funds again once it is confirmed to top it up.',
+        );
       const needEth = !pendingEth && ethThere < ethWei ? ethWei - ethThere : 0n;
       const needToken = !pendingToken && tokenThere < amount ? amount - tokenThere : 0n;
+      // C8: before any of the token goes, the offer must still be live with this swap's terms (once
+      // some of it is at the deposit address, the rest follows so the funds can bridge in and back).
+      if (needToken > 0n && tokenThere === 0n) await this.assertOfferStillOn(r);
       if (needToken > myToken)
         throw new SessionError(
           `Your wallet holds less ${r.offer.pay.symbol} on Sepolia than this swap pays. Nothing was sent.`,
@@ -404,8 +506,9 @@ export class SwapSession {
         throw new SessionError('Your wallet holds less Sepolia ETH than the sweep gas. Nothing was sent.');
       let sweepPending: string | null = pendingEth ? r.funding.eth!.hash : null;
       if (needEth > 0n) {
+        await this.bound();
         this.status({ kind: 'fund', sending: 'eth' });
-        const hash = await evm.sendTransaction({ to: dep.address, value: needEth }, 'the sweep gas transfer');
+        const hash = await evm.sendTransaction({ to: f.address, value: needEth }, 'the sweep gas transfer');
         this.saveRecord({
           ...this.record,
           funding: { ...this.record.funding, eth: { hash, status: 'sent' } },
@@ -432,9 +535,11 @@ export class SwapSession {
           throw new SessionError('Your sweep gas transfer failed on Sepolia. Send the funds again.');
       }
       if (needToken > 0n) {
+        // After the wait: the wallet may have changed networks or accounts meanwhile (C9).
+        await this.bound();
         this.status({ kind: 'fund', sending: 'token' });
         const hash = await evm.sendTransaction(
-          { to: dep.erc20Address, data: transferData(dep.address, needToken) },
+          { to: f.erc20Address, data: transferData(f.address, needToken) },
           `the ${r.offer.pay.symbol} transfer`,
         );
         this.saveRecord({
@@ -443,11 +548,74 @@ export class SwapSession {
           updatedAt: this.deps.now(),
         });
       }
+      this.topUp = false;
       this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
       void this.loop();
     } catch (e) {
       this.set({ status: { kind: 'fund', sending: null }, notice: describe(e) });
     }
+  }
+
+  /** The sponsor RAISED the sweep gas while the swap waits for its funds (the live base fee outgrew
+   *  it; never lowered): adopt it, checked as at open (C8), and have "Send funds" top the ETH up. */
+  private adoptRaisedSweep(g: SweepGas): void {
+    const f = this.funding;
+    if (!f) return;
+    const ethWei = BigInt(g.ethWei);
+    if (ethWei <= f.ethWei) return;
+    if (ethWei !== BigInt(g.gasLimit) * BigInt(g.maxFeePerGas) || ethWei > MAX_SWEEP_WEI) {
+      this.set({ notice: 'The sponsor asks for a sweep gas this page will not send. Nothing more was sent.' });
+      return;
+    }
+    this.funding = { ...f, sweepGas: { gasLimit: g.gasLimit, maxFeePerGas: g.maxFeePerGas, ethWei: g.ethWei }, ethWei };
+    this.topUp = true;
+    this.saveRecord({ ...this.record, deposit: this.depositOf(), updatedAt: this.deps.now() });
+    this.set({
+      notice:
+        'The Sepolia gas price rose, so the bridge needs more sweep gas at the deposit address. Press Send funds to top it up.',
+    });
+  }
+
+  /** Why funding cannot go on right now (mock mode with a real wallet, or the wallet left Sepolia or
+   *  the swap's account), or null. */
+  private fundingRefusal(): string | null {
+    return this.snap.fundingBlocked ?? this.deps.fundingRefusal?.() ?? null;
+  }
+
+  /** Before every send and after every wait (P4.2-fix C9): this tab still drives the swap, funding is
+   *  not paused, and the wallet itself says it is on Sepolia with the swap's account. */
+  private async bound(): Promise<void> {
+    if (this.closed) throw new SessionError('The swap stopped in this tab. Nothing more was sent.');
+    const refusal = this.fundingRefusal();
+    if (refusal) throw new SessionError(refusal);
+    await this.deps.evm.ready();
+    if (getAddress(this.deps.evm.address) !== getAddress(this.record.evmAddress))
+      throw new SessionError('Connect the wallet that started this swap. Nothing more was sent.');
+  }
+
+  /** The offer is still live on the exchange, with this swap's two legs, and lasts long enough for a
+   *  swap (P4.2-fix C8: funding is checked against the live offer, not the record alone). */
+  private async assertOfferStillOn(r: SwapRecord): Promise<void> {
+    const { kernel } = this.deps.backends;
+    const status = await kernel.offerStatus(r.offer.offerId).catch(() => null);
+    if (status === null)
+      throw new SessionError(
+        'The exchange did not answer, so this page cannot check the offer is still live. Nothing was sent; try again.',
+      );
+    if (status !== 'live')
+      throw new SessionError('This offer is no longer live, so the swap cannot happen. Nothing was sent.');
+    const detail = await kernel.offer(r.offer.offerId).catch(() => null);
+    const c = detail ? classifyOffer(detail, this.deps.registry) : null;
+    const legOf = (l: SwapOffer['pay']) => ({ colour: l.token.midnightColour, amount: l.amount });
+    if (
+      !c ||
+      c.kind !== 'swappable' ||
+      !sameLeg(legOf(c.offer.pay), r.offer.pay) ||
+      !sameLeg(legOf(c.offer.receive), r.offer.receive)
+    )
+      throw new SessionError("The exchange lists this offer with other terms than this swap's. Nothing was sent.");
+    if (!lastsLongEnough(c.offer, this.deps.now()))
+      throw new SessionError('This offer expires before a swap could finish. Nothing was sent.');
   }
 
   /** The receipt's outcome once the transaction is mined, or null after SWEEP_RECEIPT_WAIT_MS. */
@@ -517,15 +685,20 @@ export class SwapSession {
         }
         const before = this.record;
         const record = applyView(before, view, this.deps.now());
-        const refunds = record.bridgeOut.refunds ?? 0;
-        if (refunds > (before.bridgeOut.refunds ?? 0))
+        // A withdrawal ended without a transfer (C1: from the sponsor's signal, not the page's counters).
+        const ended = record.bridgeOut.refunds ?? 0;
+        if (ended > (before.bridgeOut.refunds ?? 0)) {
+          const attempt = ended < MAX_AUTO_RETRIES ? ` (attempt ${ended + 1})` : '';
           this.set({
-            notice: `The withdrawal was refunded to the temporary wallet (another withdrawal used the vault's Sepolia nonce). Retrying${
-              refunds < MAX_AUTO_RETRIES ? ` (attempt ${refunds + 1})` : ''
-            }.`,
+            notice:
+              withdrawalStatus(view).last === 'refunded'
+                ? `The withdrawal was refunded to the temporary wallet (another withdrawal used the vault's Sepolia nonce). Retrying${attempt}.`
+                : `The sponsor could not start the withdrawal (the vault moved on); your tokens are still in the temporary wallet. Retrying${attempt}.`,
           });
+        }
         this.saveRecord(record);
         this.set({ view });
+        if (view.state === 'awaiting_funds' && view.sweepGas) this.adoptRaisedSweep(view.sweepGas);
         // A funding transfer still pending: read its receipt, whatever the sponsor's state.
         if (record.funding.eth?.status === 'sent' || record.funding.token?.status === 'sent')
           await this.checkReceipts();
@@ -534,13 +707,19 @@ export class SwapSession {
           this.status(
             record.phase === 'done'
               ? { kind: 'done' }
-              : { kind: 'error', message: record.error ?? 'The swap failed.', canRetry: false },
+              : {
+                  kind: 'error',
+                  message: record.error ?? 'The swap failed.',
+                  canRetry: false,
+                  // C5: the sponsor can revive it: Resume (one signature and a re-open).
+                  ...(isRecoverable(record) ? { canResume: true } : {}),
+                },
           );
           await this.wallet?.close().catch(() => undefined);
           return;
         }
         if (act === 'fund') {
-          if (this.fundingSent(this.record))
+          if (this.fundingSent(this.record) && !this.topUp)
             this.status({ kind: 'working', what: 'Waiting for your funds to reach the deposit address' });
           else if (this.snap.status.kind !== 'fund') this.status({ kind: 'fund', sending: null });
         } else if (act === 'wait') {
@@ -556,7 +735,7 @@ export class SwapSession {
         } else if (act === 'unavailable') {
           this.status({ kind: 'unavailable' });
         } else {
-          const stop = await this.onMinted();
+          const stop = await this.onMinted(view);
           if (stop) return;
         }
         await this.deps.sleep(backends.pollMs);
@@ -567,12 +746,12 @@ export class SwapSession {
   }
 
   /** The coin is minted: take, bridge out, bridge back or wait. True when the loop must stop. */
-  private async onMinted(): Promise<boolean> {
+  private async onMinted(view: SwapView): Promise<boolean> {
     const wallet = this.wallet!;
     try {
       this.status({ kind: 'working', what: 'Syncing the temporary Midnight wallet' });
       await wallet.sync();
-      const act = afterMint(this.record, await wallet.balances());
+      const act = afterMint(this.record, await wallet.balances(), withdrawalStatus(view));
       switch (act) {
         case 'take':
           await this.take();
@@ -617,6 +796,12 @@ export class SwapSession {
     if (!detail) return this.markUnavailable();
     this.status({ kind: 'working', what: 'Building the take' });
     const draft = await backends.wallet.buildTake(this.wallet!, detail.offerBech32);
+    // C10: the offer the exchange served must be this swap's: its id is sha256 of the served bytes,
+    // and its terms are read from them. Nothing is proven or submitted otherwise.
+    if (draft.offerId !== offerId || !termsAreTheRecords(draft, this.record.offer)) {
+      await draft.release();
+      throw new SessionError("The exchange served another offer than this swap's. Nothing was taken or sent.");
+    }
     let submitted = false;
     try {
       this.status({ kind: 'working', what: 'Proving the take' });
@@ -664,7 +849,7 @@ export class SwapSession {
     if ((r.bridgeOut.refunds ?? 0) >= MAX_AUTO_RETRIES && !this.retryApproved) {
       this.status({
         kind: 'error',
-        message: `The withdrawal was refunded ${r.bridgeOut.refunds} times. Your tokens are safe in the temporary wallet; press Retry to try again.`,
+        message: `The withdrawal was refunded or could not start ${r.bridgeOut.refunds} times. Your tokens are safe in the temporary wallet; press Retry to try again.`,
         canRetry: true,
       });
       return true;
@@ -753,8 +938,8 @@ export class SwapSession {
     if (this.closed) return;
     this.decide?.(false);
     this.closed = true;
-    this.seed = null;
     this.token = null;
+    this.funding = null;
     const w = this.wallet;
     this.wallet = null;
     await w?.close().catch(() => undefined);
@@ -762,8 +947,9 @@ export class SwapSession {
     for (const l of [...this.listeners]) l();
   }
 
-  /** Whether a secret is held (for tests: it must never be on the snapshot or the record). */
+  /** Whether a secret is held: the swap token, or a temporary wallet (whose keys the wallet module
+   *  holds). For tests: neither is ever on the snapshot or the record. */
   hasSecrets(): boolean {
-    return this.seed !== null || this.token !== null;
+    return this.token !== null || this.wallet !== null;
   }
 }

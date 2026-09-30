@@ -18,7 +18,12 @@ export const STKA = '0x2Ab7BE0769e3BBD5c7d047B422CB383fCC06FB52';
 
 export interface MockSettings {
   stepMs?: number;
-  scenario?: { offerGoneAtTake?: boolean; refundFirstWithdrawal?: boolean; refuseOpen?: string };
+  scenario?: {
+    offerGoneAtTake?: boolean;
+    refundFirstWithdrawal?: boolean;
+    refuseOpen?: string;
+    failFirstStart?: boolean;
+  };
   book?: 'default' | 'empty';
   evmWallet?: boolean;
   persist?: boolean;

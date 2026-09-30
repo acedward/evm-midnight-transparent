@@ -15,9 +15,11 @@
 import {
   type NetworkProfile,
   STAGENET,
+  SWAP_KEY_DERIVATION_LATEST,
   deriveSwapSeed as deriveSwapSeedCore,
   swapDepositAddress,
   type StartSwapSigner,
+  type SwapKeyDerivation,
 } from '@evm-midnight-transparent/core';
 import * as Rx from 'rxjs';
 
@@ -72,20 +74,31 @@ export interface SwapSeed {
 
 /**
  * The swap's seed from the user's "start swap" signature, asked for TWICE (spec Q4; the derivation
- * spec v1 is core's swap-key.ts). The message binds the profile's Midnight network and vault and
- * this swap's `salt` (32 bytes of hex, public, kept in the swap record). Signatures from another
+ * spec is core's swap-key.ts). The message binds the profile's Midnight network and vault and this
+ * swap's `salt` (32 bytes of hex, kept in the browser's swap record only: the sponsor and URLs see
+ * `publicSwapId(salt)`). New swaps use derivation 2, whose prompt carries the warning (P4.2-fix
+ * C14); pass `derivation: 1` only to re-derive a swap started before it. Signatures from another
  * account than `signer.address` are refused. The seed of the FIRST signature is returned.
  */
 export async function deriveSwapSeed(
   signer: SwapSigner,
   salt: string,
-  options: { profile?: Pick<NetworkProfile, 'midnightNetworkId' | 'bridge' | 'evm'> } = {},
+  options: {
+    profile?: Pick<NetworkProfile, 'midnightNetworkId' | 'bridge' | 'evm'>;
+    derivation?: SwapKeyDerivation;
+  } = {},
 ): Promise<SwapSeed> {
   const profile = options.profile ?? STAGENET;
   if (profile.bridge.vaultAddress === '') throw new TempWalletError('the network profile names no vault');
   const out = await deriveSwapSeedCore(
     (td) => signer.signTypedData(td),
-    { network: profile.midnightNetworkId, vault: profile.bridge.vaultAddress, salt, chainId: profile.evm.chainId },
+    {
+      network: profile.midnightNetworkId,
+      vault: profile.bridge.vaultAddress,
+      salt,
+      chainId: profile.evm.chainId,
+      derivation: options.derivation ?? SWAP_KEY_DERIVATION_LATEST,
+    },
     signer.address,
   );
   return { seed: out.seedHex, deterministic: out.deterministic, signer: out.signer };

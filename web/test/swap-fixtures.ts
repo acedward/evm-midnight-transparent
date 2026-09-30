@@ -7,7 +7,7 @@ import { secp256k1 } from '@noble/curves/secp256k1';
 import { TypedDataEncoder, Wallet, getAddress, getBytes, hexlify } from 'ethers';
 
 import type { MockSettings } from '../src/config.js';
-import type { EvmPort } from '../src/swap/evm.js';
+import { EvmError, type EvmPort } from '../src/swap/evm.js';
 import { type MockEnvironment, createMockEnvironment } from '../src/swap/mock/index.js';
 import type { SwapBackends, TypedData, TypedDataSigner } from '../src/swap/ports.js';
 import { HttpSponsorApi } from '../src/swap/sponsor-client.js';
@@ -55,9 +55,13 @@ export class FakeSepolia implements EvmPort {
   readonly erc20 = new Map<string, bigint>();
   readonly sent: Array<{ to: string; data?: string; value?: bigint; hash: string }> = [];
   declineNext = false;
+  /** The wallet's current network and account, as the bound port reads them (P4.2-fix C9). */
+  chainId = '0xaa36a7';
+  account: string;
 
   constructor(address: string, holdings: { eth?: bigint; tokens?: Record<string, bigint> } = {}) {
     this.address = getAddress(address);
+    this.account = this.address;
     this.eth.set(this.address.toLowerCase(), holdings.eth ?? 10n ** 18n);
     for (const t of registry.tokens)
       if (t.sepoliaAddress)
@@ -65,6 +69,17 @@ export class FakeSepolia implements EvmPort {
           `${t.sepoliaAddress.toLowerCase()}:${this.address.toLowerCase()}`,
           holdings.tokens?.[t.symbol] ?? 1_000n * 10n ** 6n,
         );
+  }
+
+  /** How many times the session asked `ready()`. */
+  readyCalls = 0;
+
+  /** As the real port (web/src/swap/evm.ts): Sepolia and the bound account, or it refuses. Its
+   *  `sendTransaction` below does NOT call it, so the tests see the SESSION's own checks. */
+  async ready(): Promise<void> {
+    this.readyCalls++;
+    if (this.chainId !== '0xaa36a7') throw new EvmError('Your wallet is not on Sepolia. Nothing was sent.');
+    if (getAddress(this.account) !== this.address) throw new EvmError('Your wallet switched to another account.');
   }
 
   async sendTransaction(tx: { to: string; data?: string; value?: bigint }): Promise<string> {
