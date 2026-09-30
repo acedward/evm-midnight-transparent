@@ -197,16 +197,18 @@ LOG_LEVEL=info
   `SPONSOR_SEED` or `SEPOLIA_RPC_URL` (visible in `systemctl show` and the process table).
 - The spending controls keep their defaults unless you set them (`sponsor/README.md`): a daily DUST
   budget (`SPONSOR_DAILY_DUST_BUDGET`, 500 DUST, committed when a swap's funds arrive; set it to what
-  the sponsor's NIGHT generates in a day), 10 new swaps per EVM address a day, 100 swaps waiting for
-  funds (10 per client: an IPv4 address or an IPv6 /64), and an open needs the user's address to hold
-  the pay amount and the sweep's ETH on Sepolia (RUNBOOK sections 4.4 and 10).
+  the sponsor's NIGHT generates in a day), 10 new swaps per EVM address a day, 1,000 swaps waiting for
+  their whole amount (10 per client: an IPv4 address or an IPv6 /48), and an open needs the user's
+  address to hold the pay amount and the sweep's ETH on Sepolia (RUNBOOK sections 4.4 and 10). The
+  sponsor also reads the Midnight indexer's latest block (`block { height timestamp }`, the same
+  GraphQL endpoint) before it reads the vault's requests: the indexer URL must answer that query.
 - `SPONSOR_DEDICATED_WALLET=true` says the seed is this sponsor's alone. Only set it when it is: on
   stagenet the sponsor refuses to open a wallet without it (or a lock file).
 - `SPONSOR_TOOL_HEALTH_URL` matters. The wallet tool (step 7) looks for the sponsor at
   `http://sponsor:8080/health` by default (the Compose name). Natively that name does not resolve,
   and its guard ("never open the wallet while the sponsor has it") would be silently skipped.
 - `SPONSOR_TRUST_PROXY=true`: the sponsor rate-limits, and caps swaps waiting for funds per client,
-  by the one `X-Forwarded-For` entry nginx sets (step 6; an IPv6 client counts by its /64). It listens
+  by the one `X-Forwarded-For` entry nginx sets (step 6; an IPv6 client counts by its /48). It listens
   on 127.0.0.1 only, so nothing else can set that header.
 - No `SPONSOR_CORS_ORIGINS`: the page reaches the sponsor on its own origin, through nginx.
 

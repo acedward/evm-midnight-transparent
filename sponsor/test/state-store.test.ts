@@ -36,10 +36,17 @@ describe('the state machine', () => {
     expect(allowed.sort()).toEqual(
       [
         'awaiting_funds->depositing',
+        'awaiting_funds->partial',
+        'awaiting_funds->minted',
         'awaiting_funds->failed',
         'depositing->minted',
+        'depositing->partial',
         'depositing->awaiting_funds',
         'depositing->failed',
+        // A partial deposit (audit S2): the remainder, or a Bridge back of what arrived.
+        'partial->depositing',
+        'partial->minted',
+        'partial->bridging_back',
         'minted->taking',
         'minted->taken',
         'minted->withdrawing',
@@ -59,8 +66,10 @@ describe('the state machine', () => {
         'withdrawing->failed',
         'bridging_back->done',
         'bridging_back->minted',
+        'bridging_back->partial',
         'bridging_back->failed',
         'failed->awaiting_funds',
+        'failed->partial',
       ].sort(),
     );
   });

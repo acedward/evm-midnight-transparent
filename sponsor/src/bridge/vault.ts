@@ -23,7 +23,7 @@ import { pathToFileURL } from 'node:url';
 import { depositPathOf, hexToBytes, walletRecipient } from '@evm-midnight-transparent/core';
 
 import type { OpenedWallet } from '../sponsor/facade.js';
-import { NotSubmittedError } from '../swaps/backend.js';
+import { NotSubmittedError, WITHDRAW_TX_TTL_MS } from '../swaps/backend.js';
 
 // ── Types kept loose on purpose: the SDK's types are deep generics; the gate proves the shapes ──
 
@@ -395,21 +395,25 @@ export async function settle(
 export async function addDustAndSubmit(
   opened: OpenedWallet,
   tx: Any,
-  ttlMs = 60_000,
+  ttlMs = WITHDRAW_TX_TTL_MS,
+  onExpiry?: (expiresAtMs: number) => void,
 ): Promise<{ txId: string; merged: Any }> {
   const h = opened.handle as Any;
   let merged: Any;
+  const ttl = new Date(Date.now() + ttlMs);
   try {
     const recipe = await h.wallet.balanceFinalizedTransaction(
       tx,
       { shieldedSecretKeys: h.shieldedSecretKeys, dustSecretKey: h.dustSecretKey },
-      { ttl: new Date(Date.now() + ttlMs), tokenKindsToBalance: ['dust'] },
+      { ttl, tokenKindsToBalance: ['dust'] },
     );
     merged = await h.wallet.finalizeRecipe(recipe);
   } catch (e) {
     // Nothing reached the node: the start cannot land (audit R5).
     throw new NotSubmittedError(`the DUST balancing failed before submission: ${(e as Error)?.message ?? e}`);
   }
+  // The last moment the merged transaction can be included, recorded before the node sees it (audit S1).
+  onExpiry?.(ttl.getTime());
   const txId = String(await h.wallet.submitTransaction(merged));
   return { txId, merged };
 }

@@ -13,12 +13,18 @@
 //   funds wait at the deposit address and a new startDeposit to the same recipient moves them)
 //   taken ─► minted on a not-available report, and ─► bridging_back: a "taken" report never blocks
 //   Bridge back, because only the coin the temporary wallet really holds can be withdrawn (audit C13)
+//   awaiting_funds ─► partial: a completed deposit request minted LESS of the pay token than the swap
+//   pays (anyone may start one for this recipient; audit S2). partial ─► depositing (the remainder, once
+//   it is at the address) ─► minted; partial ─► bridging_back (what arrived goes back) ─► done, or back
+//   to partial while the address still holds some of the pay token.
 //
 // `minted` means "the temporary wallet holds the funds and the app acts next": after the deposit,
 // after a lost take race ("Swap is not available"), and after a refunded withdrawal.
 
 import {
   SWAP_ERRORS,
+  type PartialDeposit,
+  type PartialOption,
   type StageEntry,
   type SwapState,
   type SwapView,
@@ -78,6 +84,16 @@ export interface DepositRecord extends TransferProgress {
   /** Requests of another party that swept this recipient's deposit address with another token or
    *  amount, completed by the sponsor so the coin reaches the temporary wallet (audit R6). */
   foreign?: { requestId: string; erc20: string; amount: string; at: number; completeTx?: string }[];
+  /** Base units of the PAY token every completed deposit request of this recipient minted into the
+   *  temporary wallet (the sponsor's own and anyone else's; audit S2). Absent on records completed
+   *  before P4.2-fix3: their one own deposit minted the pay amount. */
+  mintedTotal?: string;
+  /** Base units of the pay token a Bridge back from `partial` returned (audit S2). */
+  returned?: string;
+  /** The amount of the request `requestId` moves (the remainder, in `partial`). */
+  requestAmount?: string;
+  /** The pay token the sponsor last read at the deposit address (base units). */
+  atAddress?: string;
 }
 
 export interface WithdrawRecord extends TransferProgress {
@@ -115,6 +131,13 @@ export interface WithdrawRecord extends TransferProgress {
   resolution?: 'not-submitted' | 'failed-on-chain' | 'not-included';
   /** The fee fields of the transfer the MPC actually signed (audit R2: replacements outbid both). */
   signedFees?: { maxFeePerGas: string; maxPriorityFeePerGas: string };
+  /** ms: the latest moment the submitted transaction could still be included (its DUST intent's time
+   *  to live, or an upper bound of it). "Not included" is concluded only from a vault read at an
+   *  indexer block past it plus a margin (audit S1). */
+  expiresAtMs?: number;
+  /** ms: an attempt judged `not-included` is re-checked by its request id until then, and adopted if
+   *  it landed after all (audit S1). */
+  recheckUntilMs?: number;
 }
 
 /** What the latest `withdraw-params` handed out: `/prove withdraw` rebuilds with its gas, and tells a
@@ -129,9 +152,17 @@ export interface WithdrawOffer {
   at: number;
 }
 
+/** The version of the approval `/prove withdraw` records. `/withdraw` accepts only this one: an
+ *  approval an older sponsor made was validated by older rules (audit S8), so it is proven again. */
+export const PROVEN_WITHDRAW_VERSION = 3;
+
 /** What the latest `/prove withdraw` validated: `/withdraw` must carry the same calls. */
 export interface ProvenWithdraw {
+  /** PROVEN_WITHDRAW_VERSION when it was approved (absent before P4.2-fix3). */
+  v?: number;
   kind: WithdrawKind;
+  /** The amount the approved withdrawal moves (a Bridge back from `partial` moves what arrived). */
+  amount?: string;
   callsDigest: string;
   /** The proven transaction's structure (calls, segments, every shielded coin): `/withdraw` must
    *  carry exactly this one, apart from proofs and binding (audit C4). */
@@ -194,17 +225,16 @@ export interface SwapRecord {
 
 /** Which state may follow which. Anything else is a bug (or a replayed request) and throws. */
 export const TRANSITIONS: Readonly<Record<SwapState, readonly SwapState[]>> = {
-  awaiting_funds: ['depositing', 'failed'],
-  depositing: ['minted', 'awaiting_funds', 'failed'],
-  // P4.2-fix3 S2: core's new state (FS3's wire). This sponsor never enters it; FS3 defines its moves.
-  partial: [],
+  awaiting_funds: ['depositing', 'partial', 'minted', 'failed'],
+  depositing: ['minted', 'partial', 'awaiting_funds', 'failed'],
+  partial: ['depositing', 'minted', 'bridging_back'],
   minted: ['taking', 'taken', 'withdrawing', 'bridging_back', 'failed'],
   taking: ['taken', 'minted', 'withdrawing', 'bridging_back', 'failed'],
   taken: ['withdrawing', 'bridging_back', 'minted', 'failed'],
   withdrawing: ['done', 'minted', 'failed'],
-  bridging_back: ['done', 'minted', 'failed'],
+  bridging_back: ['done', 'minted', 'partial', 'failed'],
   done: [],
-  failed: ['awaiting_funds'],
+  failed: ['awaiting_funds', 'partial'],
 };
 
 export class TransitionError extends Error {
@@ -260,8 +290,79 @@ export const isUnresolved = (w: WithdrawRecord): boolean =>
 
 export const isTerminal = (s: SwapState) => s === 'done' || s === 'failed';
 
-/** The states in which the temporary wallet may hold a coin the app can move. */
-export const WALLET_HOLDS_FUNDS: readonly SwapState[] = ['minted', 'taking', 'taken'];
+/** The states in which the temporary wallet may hold a coin the app can move (in `partial`, only a
+ *  Bridge back of what arrived). */
+export const WALLET_HOLDS_FUNDS: readonly SwapState[] = ['minted', 'taking', 'taken', 'partial'];
+
+/** Whether an attempt judged `not-included` is still re-checked by its request id (audit S1). It does
+ *  NOT hold its nonce (the next withdrawal may take it: if it landed after all, the replacement rule
+ *  settles the pair) and does not block a retry. */
+export const isRecheck = (w: WithdrawRecord, nowMs: number): boolean =>
+  w.requestId !== undefined &&
+  w.stage === 'failed' &&
+  w.resolution === 'not-included' &&
+  (w.recheckUntilMs ?? 0) > nowMs;
+
+// ── The pay token the temporary wallet received (audit S2) ─────────────────────
+
+const big = (x: string | undefined) => BigInt(x ?? '0');
+
+/** Base units of the pay token completed deposits minted into the temporary wallet. A record completed
+ *  before P4.2-fix3 in a state past the deposit minted the pay amount. */
+export function mintedTotalOf(rec: SwapRecord): bigint {
+  const d = rec.deposit;
+  if (d?.mintedTotal !== undefined) return BigInt(d.mintedTotal);
+  // Every failure reason happens before anything is minted.
+  return ['awaiting_funds', 'depositing', 'failed'].includes(rec.state) ? 0n : BigInt(rec.pay.amount);
+}
+
+/** What the temporary wallet holds of the pay token by the sponsor's accounting (minted − returned). */
+export const heldOf = (rec: SwapRecord): bigint => mintedTotalOf(rec) - big(rec.deposit?.returned);
+
+/** What is still to be deposited for the wallet to hold the whole pay amount (never negative). */
+export function remainingOf(rec: SwapRecord): bigint {
+  const r = BigInt(rec.pay.amount) - mintedTotalOf(rec);
+  return r > 0n ? r : 0n;
+}
+
+/** The state a swap holding pay tokens rests in: `minted` with the whole pay amount, else `partial`. */
+export const holdingState = (rec: SwapRecord): 'minted' | 'partial' =>
+  heldOf(rec) >= BigInt(rec.pay.amount) ? 'minted' : 'partial';
+
+/** The `partial` view (audit S2). */
+export function partialView(rec: SwapRecord): PartialDeposit {
+  const held = heldOf(rec);
+  const remaining = remainingOf(rec);
+  const options: PartialOption[] = [];
+  if (remaining > 0n) options.push('wait');
+  if (held > 0n) options.push('bridge-back');
+  return {
+    minted: (held > 0n ? held : 0n).toString(),
+    remaining: remaining.toString(),
+    atAddress: big(rec.deposit?.atAddress).toString(),
+    options,
+  };
+}
+
+/**
+ * Whether the generic retention may drop this record (audit S4): only a finished record with nothing
+ * left to recover. Never one that is recoverable, funded (its state holds funds, or it still holds
+ * pay tokens by the sponsor's accounting, or the deposit address was last seen holding some), or that
+ * has a withdrawal attempt whose outcome is unknown or still re-checked, or a deposit request that
+ * did not settle.
+ */
+export function retentionMayDrop(r: SwapRecord, nowMs: number): boolean {
+  // Only `done` (its withdrawal settled; a Bridge back from partial ends there only with nothing left)
+  // and a failure no re-open can revive.
+  if (r.state !== 'done' && !(r.state === 'failed' && r.recoverable !== true)) return false;
+  if (r.withdrawals.some((w) => isUnresolved(w) || isRecheck(w, nowMs))) return false;
+  const d = r.deposit;
+  if (r.state === 'failed' && d) {
+    if (d.requestId && !['completed', 'closed', 'abandoned'].includes(d.stage)) return false;
+    if (big(d.atAddress) > 0n || big(d.maxSeen) > 0n || heldOf(r) > 0n) return false;
+  }
+  return true;
+}
 
 export function pushStage(
   rec: { stage: string; stages: StageEntry[] },
@@ -344,6 +445,7 @@ export function swapView(rec: SwapRecord): SwapView {
     withdraw: withdrawals.at(-1) ?? null,
     withdrawals,
     withdrawal: withdrawalStatus(rec),
+    ...(rec.state === 'partial' ? { partial: partialView(rec) } : {}),
     ...(rec.outcome ? { outcome: rec.outcome } : {}),
     ...(rec.reason ? { reason: rec.reason } : {}),
     ...(rec.message ? { message: rec.message } : {}),

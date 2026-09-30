@@ -442,7 +442,7 @@ describe('R4: unfunded opens cannot monopolise the caps or the budget; revival i
     expect(reads).toBe(1);
   });
 
-  it('unfunded swaps are capped per client: an IPv4 address, or an IPv6 /64', async () => {
+  it('unfunded swaps are capped per client: an IPv4 address, or an IPv6 /48 (since P4.2-fix3, audit S5)', async () => {
     const client = { address: '203.0.113.9' };
     const hh = harness({ config: testConfig({ ...LIMITS, SWAP_MAX_UNFUNDED_PER_CLIENT: '2' }), client });
     const open = async (tag: string) => post(hh, SWAP_PATHS.swaps, await openBody(hh, bidSwap(hh, undefined, tag)));
@@ -453,11 +453,11 @@ describe('R4: unfunded opens cannot monopolise the caps or the budget; revival i
     expect(await errorOf(third)).toMatchObject({ code: 'too-many-swaps', detail: 'client' });
     client.address = '2001:db8:1:2::1';
     expect((await open('v6-1')).status).toBe(201);
-    client.address = '2001:db8:1:2:ffff::9'; // the same /64
+    client.address = '2001:db8:1:3:ffff::9'; // another /64 of the same /48
     expect((await open('v6-2')).status).toBe(201);
-    client.address = '2001:db8:1:2:aaaa:bbbb:cccc:dddd';
+    client.address = '2001:db8:1:4:aaaa:bbbb:cccc:dddd';
     expect((await open('v6-3')).status).toBe(429);
-    client.address = '2001:db8:1:3::1'; // another /64
+    client.address = '2001:db8:2:3::1'; // another /48
     expect((await open('v6-4')).status).toBe(201);
   });
 
@@ -485,9 +485,12 @@ describe('R4: unfunded opens cannot monopolise the caps or the budget; revival i
     expect(revive.status).toBe(503);
     expect((await errorOf(revive)).code).toBe('sponsor-busy');
     expect(hh.store.get(a.swapId)!.state).toBe('failed');
-    // A swap whose funds did arrive is not new work: it revives whatever the caps.
+    // Part of the funds (one base unit) is still an unfunded swap: the same admission (audit S5).
     const ra = hh.store.get(a.swapId)!;
     hh.vault.evm.setErc20(ra.pay.erc20Address, ra.depositAddress, 1n);
+    expect((await post(hh, SWAP_PATHS.swaps, await openBody(hh, a))).status).toBe(503);
+    // A swap whose WHOLE pay amount arrived is not new work: it revives whatever the caps.
+    hh.vault.evm.setErc20(ra.pay.erc20Address, ra.depositAddress, BigInt(ra.pay.amount));
     expect((await post(hh, SWAP_PATHS.swaps, await openBody(hh, a))).status).toBe(200);
     expect(hh.store.get(a.swapId)!.state).toBe('awaiting_funds');
   });
@@ -719,7 +722,7 @@ describe('R6: deposit adoption needs the sponsor’s own parameters; a request t
     });
   });
 
-  it('a foreign request for another amount that swept part of the deposit is completed too (the coin reaches the temporary wallet)', async () => {
+  it('a foreign request for another amount that swept part of the deposit is completed too (the coin reaches the temporary wallet; since P4.2-fix3 the swap is partial)', async () => {
     const s = bidSwap(h);
     const o = await openSwap(h, s);
     h.vault.evm.setErc20(o.erc20Address, o.depositAddress, 10n); // part of the token arrived
@@ -736,9 +739,10 @@ describe('R6: deposit adoption needs the sponsor’s own parameters; a request t
     await h.swaps.pollDeposits();
     await h.swaps.idle();
     const rec = h.store.get(s.swapId)!;
-    expect(rec.state).toBe('awaiting_funds');
+    expect(rec.state).toBe('partial');
     expect(rec.deposit!.foreign).toMatchObject([{ requestId: foreign.requestId, amount: '4' }]);
-    expect(rec.deposit!.stage).toBe('completed-foreign');
+    expect(rec.deposit!.stages.map((x) => x.stage)).toContain('completed-foreign');
+    expect(rec.deposit!.stage).toBe('partial');
     expect(h.vault.settles.at(-1)).toMatchObject({ circuit: 'completeDeposit', coinPk: s.payload.tempCoinPk });
   });
 });
