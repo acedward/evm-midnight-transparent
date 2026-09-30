@@ -40,8 +40,10 @@ import { internalsOf, type TempWallet } from './temp-wallet.js';
 import {
   type AnyTransaction,
   type UnprovenTx,
+  assertSameAsDraft,
   contractCalls,
   dustSpendCount,
+  erasedHex,
   hasUnshieldedOffers,
   provenFromHex,
   shieldedImbalances,
@@ -70,6 +72,12 @@ export type MakerTransaction = ledger.Transaction<ledger.SignatureEnabled, ledge
 /** `swapoffer1…` → the maker's transaction. */
 export function decodeMakerTransaction(offerBech32: string): MakerTransaction {
   return ledger.Transaction.deserialize('signature', 'proof', 'binding', decodeOffer(offerBech32));
+}
+
+/** The kernel's offer id of a served offer: sha256 of the maker's transaction bytes AS SERVED (not
+ *  re-serialised), so the page can check the kernel served the offer its record names (C10). */
+export function servedOfferId(offerBech32: string): string {
+  return offerIdOf(decodeOffer(offerBech32));
 }
 
 export interface Leg {
@@ -150,7 +158,7 @@ function assertAffordable(terms: TakeTerms, balances: Record<string, bigint>): v
 // ── The lane contract: build (unproven) → the sponsor proves → finalize → submit ──
 
 export interface TakeDraft {
-  /** The kernel's offer id (sha256 of the maker's transaction bytes). */
+  /** The kernel's offer id: sha256 of the maker's transaction bytes as served (`servedOfferId`). */
   readonly offerId: string;
   readonly terms: TakeTerms;
   /** The wallet's unproven balancing transaction, hex: what `/prove` receives for `purpose: "take"`. */
@@ -160,6 +168,9 @@ export interface TakeDraft {
   readonly makerTx: MakerTransaction;
   /** The balancing transaction's identifiers; proving keeps them, so the proven one must carry them all. */
   readonly identifiers: readonly string[];
+  /** The balancing transaction with its proofs erased, hex: every input, output (recipient,
+   *  ciphertext), and offer as built. A proven answer must erase to exactly this (P4.2-fix C10). */
+  readonly erased: string;
   /** Give the booked coins back to the wallet (the take is abandoned). Idempotent. */
   release(): Promise<void>;
   readonly released: boolean;
@@ -171,7 +182,8 @@ export interface TakeDraft {
  */
 export async function buildTake(wallet: TempWallet, offerBech32: string): Promise<TakeDraft> {
   const { keys, opened } = internalsOf(wallet);
-  const makerTx = decodeMakerTransaction(offerBech32);
+  const served = decodeOffer(offerBech32);
+  const makerTx: MakerTransaction = ledger.Transaction.deserialize('signature', 'proof', 'binding', served);
   const terms = takeTerms(makerTx);
   assertAffordable(terms, await opened.balances());
   const t0 = performance.now();
@@ -187,12 +199,13 @@ export async function buildTake(wallet: TempWallet, offerBech32: string): Promis
   try {
     assertTakeComplement(makerTx, balancing);
     return {
-      offerId: offerIdOf(makerTx.serialize()),
+      offerId: offerIdOf(served),
       terms,
       tx: txToHex(balancing),
       balancingMs,
       makerTx,
       identifiers: balancing.identifiers().map(String),
+      erased: erasedHex(balancing),
       release,
       get released() {
         return released;
@@ -214,17 +227,16 @@ export interface TakeSettlement {
 
 /**
  * The proven balancing transaction (from `/prove`) → the settlement: bind it (unless already bound),
- * check it is still exactly the offer's complement with no DUST, merge it into the maker's
- * transaction, and check every shielded colour balances.
+ * check it is EXACTLY the draft once proofs are erased (the same inputs, outputs, recipients and
+ * ciphertexts; nothing added, nothing changed: P4.2-fix C10) and still the offer's complement with
+ * no DUST, merge it into the maker's transaction, and check every shielded colour balances.
  */
 export function finalizeTake(draft: TakeDraft, provenHex: string): TakeSettlement {
   if (draft.released) throw new TakeError('released', 'this take was released; build it again');
   const { tx: proven } = provenFromHex(provenHex);
   try {
+    assertSameAsDraft(draft, proven);
     assertTakeComplement(draft.makerTx, proven);
-    const ids = new Set(proven.identifiers().map(String));
-    const missing = draft.identifiers.filter((id) => !ids.has(id));
-    if (missing.length > 0) throw new Error(`it lacks ${missing.length} of the draft's identifiers`);
   } catch (e) {
     throw new TakeError('proof-mismatch', `the proven transaction is not this take: ${(e as Error).message}`);
   }

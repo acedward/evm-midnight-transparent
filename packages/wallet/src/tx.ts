@@ -74,6 +74,31 @@ export function provenFromHex(hex: string): { tx: FinalizedTx; wasBound: boolean
   }
 }
 
+/** The transaction with its proofs (and binding) erased, hex: what proving must not change. Every
+ *  Zswap input (nullifier, value commitment), output (coin commitment, value commitment, ciphertext
+ *  to the recipient) and transient, every intent, contract call and transcript is in it; only the
+ *  proofs, their preimages and the binding randomness are not. */
+export function erasedHex(tx: AnyTransaction): string {
+  return bytesToHex(tx.eraseProofs().serialize());
+}
+
+/**
+ * A proven transaction handed back for a draft (the sponsor's `/prove` answer) must BE the draft:
+ * every identifier of the draft is there, and once proofs are erased the two are byte-identical.
+ * Identifiers alone are the outputs' value commitments, which bind neither recipients nor call
+ * arguments, and allow additions (the audit's F-A9 / F-B9, P4.2-fix C10).
+ */
+export function assertSameAsDraft(
+  draft: { readonly identifiers: readonly string[]; readonly erased: string },
+  proven: AnyTransaction,
+): void {
+  const ids = new Set(proven.identifiers().map(String));
+  const missing = draft.identifiers.filter((id) => !ids.has(id));
+  if (missing.length > 0) throw new Error(`it lacks ${missing.length} of the draft's identifiers`);
+  if (erasedHex(proven) !== draft.erased)
+    throw new Error('it is not the transaction that was built: its inputs, outputs or calls differ from the draft');
+}
+
 /** Every shielded colour's imbalance in segment 0 (fees aside): zero for a balanced settlement. */
 export function shieldedImbalances(tx: AnyTransaction): Record<string, bigint> {
   const out: Record<string, bigint> = {};

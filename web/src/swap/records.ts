@@ -1,10 +1,11 @@
 // Swap records in the browser store: one `swap` record per swap, filed under the connected wallet on
-// the network, id = the swap id's 64 hex. Every write is checked against the strict shape first
-// (./record-shape.ts), so the page can only ever write what Import would accept, and nothing secret.
+// the network, id = the PUBLIC swap id's 64 hex (never the salt, P4.2-fix C14). Every write is
+// checked against the strict shape first (./record-shape.ts), so the page can only ever write what
+// Import would accept, and nothing secret.
 
 import type { LocalStore } from '../store/store.js';
 import type { WalletScope } from '../store/schema.js';
-import { type SwapRecord, SwapRecordSchema, isFinished } from './record-shape.js';
+import { type SwapRecord, SwapRecordSchema, isResumable } from './record-shape.js';
 
 export class SwapRecordError extends Error {
   override name = 'SwapRecordError';
@@ -36,5 +37,5 @@ export function readSwapRecord(store: LocalStore, scope: WalletScope, swapId: st
   return readSwapRecords(store, scope).find((r) => r.swapId === swapId.toLowerCase()) ?? null;
 }
 
-/** Records that are not finished: the page offers "Resume" for them. */
-export const inProgress = (records: readonly SwapRecord[]) => records.filter((r) => !isFinished(r));
+/** Records the page offers "Resume" for: not finished, or failed and recoverable (P4.2-fix C5). */
+export const inProgress = (records: readonly SwapRecord[]) => records.filter((r) => isResumable(r));

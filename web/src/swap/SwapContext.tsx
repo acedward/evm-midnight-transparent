@@ -3,7 +3,8 @@
 // offer stream), the running swap sessions of this tab, and the connected wallet's swap records.
 //
 // Sessions live here, not in a page, so a swap keeps running while the user looks at another tab of
-// the app. They are closed (their secrets forgotten) when the wallet disconnects or changes account.
+// the app. They are closed (their secrets forgotten) when the wallet disconnects or changes account,
+// and their funding is paused while the wallet is on another network (P4.2-fix C9).
 
 import {
   type FeedState,
@@ -110,9 +111,15 @@ export function SwapProvider({ config, children }: { config: SiteConfig; childre
   // The connected wallet, as the ports need it.
   const connected = wallet.status === 'connected' && wallet.provider && wallet.address ? wallet : null;
   const evm = useMemo(
-    () => (connected ? evmPort(connected.provider!, connected.address!) : null),
+    () =>
+      connected
+        ? evmPort(connected.provider!, connected.address!, {
+            chainIdHex: network.evm.chainIdHex,
+            chainName: network.evm.chainName,
+          })
+        : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [connected?.provider, connected?.address],
+    [connected?.provider, connected?.address, network.evm.chainIdHex, network.evm.chainName],
   );
   useEffect(() => {
     backends?.setEvmReader(evm);
@@ -128,6 +135,16 @@ export function SwapProvider({ config, children }: { config: SiteConfig; childre
       map.clear();
     };
   }, [connected?.address]);
+
+  // The wallet left Sepolia (chainChanged): pause every session's funding until it is back (C9). An
+  // account change closes the sessions (above); each send also asks the wallet itself first.
+  const offChain = !!connected && !connected.onRightChain;
+  useEffect(() => {
+    const reason = offChain
+      ? `Your wallet switched away from ${network.evm.chainName}: funding is paused. Switch it back to ${network.evm.chainName} to send the funds.`
+      : null;
+    for (const s of sessions.current.values()) if (!s.isClosed) s.setFundingBlocked(reason);
+  }, [offChain, network.evm.chainName]);
 
   // Leaving the page while a swap runs: the browser asks first.
   useEffect(() => {
@@ -201,7 +218,11 @@ export function SwapProvider({ config, children }: { config: SiteConfig; childre
       const d = deps();
       if (!d) return;
       const old = sessions.current.get(record.swapId);
-      if (old && !old.isClosed) return;
+      // A session stopped for good (a failed swap the sponsor can revive, C5) makes way for the resume.
+      if (old && !old.isClosed) {
+        if (!old.isStuck) return;
+        void old.close();
+      }
       sessions.current.set(record.swapId, SwapSession.resume(record, d));
       bump((n) => n + 1);
     },

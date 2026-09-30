@@ -29,6 +29,7 @@ export const MockSettingsSchema = z
         refundFirstWithdrawal: z.boolean().optional(),
         refuseOpen: z.string().max(200).optional(),
         staleWithdrawOnce: z.boolean().optional(),
+        failFirstStart: z.boolean().optional(),
       })
       .strict()
       .default({}),

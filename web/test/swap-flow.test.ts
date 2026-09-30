@@ -5,7 +5,15 @@
 import type { BookSnapshot, SwapOffer } from '@evm-midnight-transparent/core';
 import { describe, expect, it } from 'vitest';
 
-import { afterMint, applyView, bridgeInStartedAt, nextAction, stageStates, stageTitle } from '../src/swap/flow.js';
+import {
+  afterMint,
+  applyView,
+  bridgeInStartedAt,
+  nextAction,
+  stageStates,
+  stageTitle,
+  withdrawalStatus,
+} from '../src/swap/flow.js';
 import {
   MIN_TIME_TO_EXPIRY_MS,
   formatPriceRatio,
@@ -14,7 +22,7 @@ import {
   lastsLongEnough,
   listOffers,
 } from '../src/swap/offers.js';
-import type { SwapRecord } from '../src/swap/record-shape.js';
+import { type SwapRecord, SwapRecordSchema, isResumable, swapIdOf } from '../src/swap/record-shape.js';
 import type { SwapView } from '../src/swap/sponsor-client.js';
 import { registry } from './swap-fixtures.js';
 
@@ -83,12 +91,15 @@ describe('the offers list', () => {
 });
 
 const H = (c: string) => c.repeat(64);
+const SALT = `0x${H('5')}`;
+const SWAP_ID = swapIdOf(SALT);
 
 function record(patch: Partial<SwapRecord> = {}): SwapRecord {
   return {
-    v: 1,
-    swapId: `0x${H('5')}`,
-    derivation: 1,
+    v: 2,
+    swapId: SWAP_ID,
+    salt: SALT,
+    derivation: 2,
     network: 'stagenet',
     vault: H('7'),
     evmAddress: '0x484738A67858305Edfc139B194Ed430Fe4D8e56b',
@@ -119,10 +130,11 @@ function record(patch: Partial<SwapRecord> = {}): SwapRecord {
 }
 
 const view = (state: SwapView['state'], patch: Partial<SwapView> = {}): SwapView => ({
-  swapId: `0x${H('5')}`,
+  swapId: SWAP_ID,
   state,
   ...patch,
 });
+const REBUILD = { rebuild: true };
 
 describe("the sponsor's view, merged into the record", () => {
   it('maps every state to a phase', () => {
@@ -181,13 +193,15 @@ describe("the sponsor's view, merged into the record", () => {
       view('withdrawing', { withdraw: { colour: H('b'), requestId: H('1'), startTx: `00${H('2')}`, refunds: 0 } }),
       1,
     );
-    const refunded = applyView(
-      first,
-      view('minted', { withdraw: { colour: H('b'), requestId: H('1'), completeTx: `00${H('3')}`, refunds: 1 } }),
-      2,
-    );
+    // The real sponsor's wire: `refunds` counts the refunds BEFORE this withdrawal (0), the signal
+    // says it ended refunded.
+    const refundedView = view('minted', {
+      withdraw: { colour: H('b'), requestId: H('1'), completeTx: `00${H('3')}`, stage: 'refunded', refunds: 0 },
+      withdrawal: { attempts: 1, last: 'refunded', retry: true },
+    });
+    const refunded = applyView(first, refundedView, 2);
     expect(refunded.bridgeOut.refunds).toBe(1);
-    expect(afterMint(refunded, { [H('b')]: 100_000_000n })).toBe('withdraw-receive');
+    expect(afterMint(refunded, { [H('b')]: 100_000_000n }, withdrawalStatus(refundedView))).toBe('withdraw-receive');
     const second = applyView(
       { ...refunded, bridgeOut: { ...refunded.bridgeOut, attempts: 2 } },
       view('withdrawing', { withdraw: { colour: H('b'), requestId: H('4'), refunds: 1 } }),
@@ -231,18 +245,107 @@ describe('what the page does next', () => {
     const pay = { [H('a')]: 1_040_000n };
     const recv = { [H('b')]: 100_000_000n };
     const none = {};
-    expect(afterMint(record(), pay)).toBe('take');
-    expect(afterMint(record(), { [H('a')]: 1_039_999n })).toBe('wait-coin');
-    expect(afterMint(record(), none)).toBe('wait-coin');
-    expect(afterMint(record(), recv)).toBe('withdraw-receive');
+    expect(afterMint(record(), pay, REBUILD)).toBe('take');
+    expect(afterMint(record(), { [H('a')]: 1_039_999n }, REBUILD)).toBe('wait-coin');
+    expect(afterMint(record(), none, REBUILD)).toBe('wait-coin');
+    expect(afterMint(record(), recv, REBUILD)).toBe('withdraw-receive');
     // Never take twice: the take landed but its coin is not synced yet.
-    expect(afterMint(record({ take: { tx: H('e') } }), pay)).toBe('wait-coin');
-    expect(afterMint(record({ take: { landed: true } }), pay)).toBe('wait-coin');
-    expect(afterMint(record({ phase: 'unavailable' }), pay)).toBe('unavailable');
-    expect(afterMint(record({ choice: 'bridge-back' }), pay)).toBe('withdraw-pay');
-    // A withdrawal in flight (submitted, not refunded): never build another.
-    expect(afterMint(record({ bridgeOut: { attempts: 1 } }), recv)).toBe('wait-withdrawal');
-    expect(afterMint(record({ bridgeOut: { attempts: 1, refunds: 1 } }), recv)).toBe('withdraw-receive');
+    expect(afterMint(record({ take: { tx: H('e') } }), pay, REBUILD)).toBe('wait-coin');
+    expect(afterMint(record({ take: { landed: true } }), pay, REBUILD)).toBe('wait-coin');
+    expect(afterMint(record({ phase: 'unavailable' }), pay, REBUILD)).toBe('unavailable');
+    expect(afterMint(record({ choice: 'bridge-back' }), pay, REBUILD)).toBe('withdraw-pay');
+    // The sponsor holds a withdrawal that has not ended: never build another.
+    expect(afterMint(record({ bridgeOut: { attempts: 1 } }), recv, { rebuild: false })).toBe('wait-withdrawal');
+  });
+});
+
+// P4.2-fix C1 (the audit's F-A1 / F-B3): against the REAL sponsor's wire the page waited forever
+// after a refund or a failed start, because it decided "in flight" from its own counters and the
+// sponsor's `withdraw.refunds` counts the refunds BEFORE the latest withdrawal. It now reads the
+// sponsor's `withdrawal` signal (and, from a sponsor without it, the latest withdrawal's stage).
+describe('a withdrawal that ended without a transfer (P4.2-fix C1, the real sponsor wire)', () => {
+  const recv = { [H('b')]: 100_000_000n };
+  const submitted = () => record({ phase: 'bridging-out', take: { tx: H('e') }, bridgeOut: { attempts: 1 } });
+  /** The page: merge the sponsor's view, then decide with the wallet's balances. */
+  const decide = (v: SwapView) => afterMint(applyView(submitted(), v, 2), recv, withdrawalStatus(v));
+
+  it('refunded (the vault nonce was taken): rebuild and retry', () => {
+    const v = view('minted', {
+      takeTx: H('e'),
+      withdraw: { colour: H('b'), requestId: H('1'), stage: 'refunded', refunds: 0 },
+      withdrawal: { attempts: 1, last: 'refunded', retry: true },
+    });
+    expect(withdrawalStatus(v)).toEqual({ ended: 1, rebuild: true, last: 'refunded' });
+    expect(decide(v)).toBe('withdraw-receive');
+    expect(applyView(submitted(), v, 2).bridgeOut.refunds).toBe(1);
+  });
+
+  it('a start that failed at the head of the lane (stale vault state or nonce): rebuild and retry', () => {
+    for (const last of ['start-failed', 'stale-vault'] as const) {
+      const v = view('minted', {
+        takeTx: H('e'),
+        withdraw: { colour: H('b'), stage: 'failed', refunds: 0 },
+        withdrawal: { attempts: 1, last, retry: true },
+      });
+      expect(decide(v), last).toBe('withdraw-receive');
+    }
+  });
+
+  it('a sponsor without the signal: the latest withdrawal stage says it ended', () => {
+    for (const stage of ['refunded', 'failed']) {
+      const v = view('minted', { takeTx: H('e'), withdraw: { colour: H('b'), stage, refunds: 0 } });
+      expect(decide(v), stage).toBe('withdraw-receive');
+    }
+    expect(withdrawalStatus(view('minted'))).toEqual({ ended: 0, rebuild: true, last: null });
+  });
+
+  it('counts every ended attempt for the "ask after 3" rule, from the signal', () => {
+    const v = view('minted', {
+      withdraw: { colour: H('b'), stage: 'refunded', refunds: 2 },
+      withdrawal: { attempts: 3, last: 'refunded', retry: true },
+    });
+    expect(withdrawalStatus(v).ended).toBe(3);
+    const inFlight = view('withdrawing', {
+      withdraw: { colour: H('b'), stage: 'started', refunds: 1 },
+      withdrawal: { attempts: 2, retry: false },
+    });
+    expect(withdrawalStatus(inFlight)).toMatchObject({ ended: 1 });
+  });
+
+  it('never builds while the sponsor holds a withdrawal that has not ended', () => {
+    const v = view('minted', { takeTx: H('e'), withdrawal: { attempts: 1, retry: false } });
+    expect(decide(v)).toBe('wait-withdrawal');
+  });
+});
+
+// P4.2-fix C5: a failure the sponsor can revive (`recoverable`) is resumable; others stay terminal.
+describe('a recoverable failure (P4.2-fix C5)', () => {
+  it('is kept on the record, offered for Resume, and cleared once the swap is revived', () => {
+    const failed = applyView(record(), view('failed', { reason: 'funds-not-received', recoverable: true }), 1);
+    expect(failed).toMatchObject({ phase: 'failed', recoverable: true, error: 'funds-not-received' });
+    expect(isResumable(failed)).toBe(true);
+    const terminal = applyView(record(), view('failed', { reason: 'deposit-returned-false' }), 1);
+    expect(terminal.recoverable).toBeUndefined();
+    expect(isResumable(terminal)).toBe(false);
+    const revived = applyView(failed, view('awaiting_funds'), 2);
+    expect(revived.phase).toBe('funding');
+    expect(revived.recoverable).toBeUndefined();
+    expect(revived.error).toBeUndefined();
+    expect(isResumable(revived)).toBe(true);
+  });
+});
+
+// P4.2-fix C14: the record keeps the salt (local only) next to the PUBLIC id derived from it.
+describe('the record: the public id and the local salt (P4.2-fix C14)', () => {
+  it("requires the id to be the salt's, and reads a version-1 record (id = salt) as legacy", () => {
+    expect(SwapRecordSchema.safeParse(record()).success).toBe(true);
+    expect(SwapRecordSchema.safeParse(record({ swapId: SALT })).success).toBe(false);
+    const { salt: _salt, ...v1 } = { ...record(), v: 1, swapId: SALT, derivation: 1 };
+    const parsed = SwapRecordSchema.safeParse(v1);
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toMatchObject({ v: 2, swapId: SALT, salt: SALT, derivation: 1 });
+    // A version-1 record claiming derivation 2 is not one this page wrote.
+    expect(SwapRecordSchema.safeParse({ ...v1, derivation: 2 }).success).toBe(false);
   });
 });
 

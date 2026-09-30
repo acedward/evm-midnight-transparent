@@ -81,7 +81,10 @@ export function LocalData({ network }: { network: string }) {
       `evm-midnight-transparent-${network}-${scope.evmAddress.toLowerCase().slice(0, 10)}-${date}.json`,
       exportFileText(file),
     );
-    setMessage({ kind: 'ok', text: `Exported ${file.records.length} records. The file holds no secret.` });
+    setMessage({
+      kind: 'ok',
+      text: `Exported ${file.records.length} records. The file holds no key, but it holds each swap's salt: keep it private, and only ever sign a swap's start message in this app.`,
+    });
   };
 
   const onImport = async (e: ChangeEvent<HTMLInputElement>) => {

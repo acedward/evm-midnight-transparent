@@ -2,7 +2,11 @@
 // "start swap" message for the swap's salt, signed by the test EVM user), sync its shielded side from
 // genesis, and print its balances and coins (public values only).
 //
-//   bun test/live/temp-check.ts <swapId (0x + 64 hex)> [evidence-name]
+//   bun test/live/temp-check.ts <salt (0x + 64 hex)> [evidence-name] [derivation]
+//
+// The salt is the swap record's `salt` (P4.2-fix C14: the swap's public id is keccak256 of it; for the
+// swaps of P3, recorded before the fix, the salt IS the id). `derivation` is the record's: 2 for
+// swaps started after P4.2-fix (the default), 1 for the P3 swaps.
 //
 // The key file (`.sepolia`, SK=) is mounted read-only at LIVE_KEY_FILE and read in-process only;
 // the seed never leaves this process. Run by test/live/run-live.sh temp-check.
@@ -10,15 +14,23 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { STAGENET, deriveSwapSeed, type StartSwapSigner } from '@evm-midnight-transparent/core';
+import {
+  STAGENET,
+  SWAP_KEY_DERIVATION_LATEST,
+  deriveSwapSeed,
+  publicSwapId,
+  type StartSwapSigner,
+} from '@evm-midnight-transparent/core';
 import { createTempWallet } from '@evm-midnight-transparent/wallet';
 import { Wallet } from 'ethers';
 
 import { readSepoliaKey } from './sepolia-key.js';
 
-const swapId = (process.argv[2] ?? '').toLowerCase();
+const salt = (process.argv[2] ?? '').toLowerCase();
 const name = process.argv[3] ?? 'temp-check';
-if (!/^0x[0-9a-f]{64}$/.test(swapId)) throw new Error('usage: temp-check.ts <swapId> [evidence-name]');
+const derivation = Number(process.argv[4] ?? SWAP_KEY_DERIVATION_LATEST);
+if (!/^0x[0-9a-f]{64}$/.test(salt) || (derivation !== 1 && derivation !== 2))
+  throw new Error('usage: temp-check.ts <salt> [evidence-name] [derivation 1|2]');
 const KEY_FILE = process.env.LIVE_KEY_FILE ?? '/secrets/sepolia';
 const OUT = process.env.LIVE_OUT_DIR ?? '';
 
@@ -30,7 +42,7 @@ const sign: StartSwapSigner = async (td) => {
 const t0 = Date.now();
 const out = await deriveSwapSeed(
   sign,
-  { network: STAGENET.midnightNetworkId, vault: STAGENET.bridge.vaultAddress, salt: swapId },
+  { network: STAGENET.midnightNetworkId, vault: STAGENET.bridge.vaultAddress, salt, derivation: derivation as 1 | 2 },
   evm.address,
 );
 const wallet = await createTempWallet(out.seedHex);
@@ -41,7 +53,8 @@ try {
   const result = {
     plan: '00048 P3',
     check: 'the temporary wallet after the swap',
-    swapId,
+    swapId: derivation === 1 ? salt : `0x${publicSwapId(salt)}`,
+    derivation,
     evmAddress: evm.address,
     deterministic: out.deterministic,
     coinPublicKey: wallet.coinPk,

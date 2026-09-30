@@ -10,6 +10,7 @@
 
 import {
   type NetworkProfile,
+  SWAP_KEY_DERIVATION_LATEST,
   deriveSwapSeed as coreDeriveSwapSeed,
   formatShieldedAddress,
   swapDepositAddress,
@@ -79,7 +80,13 @@ export function mockWalletModule(
     async deriveSwapSeed(signer: TypedDataSigner, salt: string) {
       const r = await coreDeriveSwapSeed(
         (td) => signer.signTypedData(td),
-        { network: profile.midnightNetworkId, vault: profile.bridge.vaultAddress, salt, chainId: profile.evm.chainId },
+        {
+          network: profile.midnightNetworkId,
+          vault: profile.bridge.vaultAddress,
+          salt,
+          chainId: profile.evm.chainId,
+          derivation: SWAP_KEY_DERIVATION_LATEST,
+        },
         signer.address,
       );
       return { seed: r.seedHex, deterministic: r.deterministic };
@@ -119,7 +126,16 @@ export function mockWalletModule(
       if ((chain.balances(wallet.coinPk).get(want.token) ?? 0n) < want.amount)
         throw new MockChainError('insufficient-funds: the temporary wallet does not hold what the offer wants');
       const d = draftFor(wallet.coinPk, randomHex());
-      return Object.assign(d, { tx: encodeMockTx({ kind: 'take', coinPk: wallet.coinPk, offerId, draft: d.id }) });
+      const give = offer.gives[0]!;
+      // Like the real module: the id and the terms of the offer AS SERVED (P4.2-fix C10).
+      return Object.assign(d, {
+        offerId,
+        terms: {
+          give: [{ colour: want.token, amount: want.amount }],
+          receive: [{ colour: give.token, amount: give.amount }],
+        },
+        tx: encodeMockTx({ kind: 'take', coinPk: wallet.coinPk, offerId, draft: d.id }),
+      });
     },
 
     finalizeTake(draft: TakeDraft, provenHex: string) {

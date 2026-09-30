@@ -2,6 +2,11 @@
 // transactions (the exact ERC20 amount and the sized sweep ETH to the deposit address), balance
 // reads, receipts, and the "start swap" / sponsor signatures (eth_signTypedData_v4). The page never
 // holds an EVM key.
+//
+// The port is BOUND to one chain and one account (P4.2-fix C9): before every transaction it asks the
+// wallet itself (`eth_chainId`, `eth_accounts`) and refuses unless it is still Sepolia and the swap's
+// account, and every transaction names the chain (`chainId`: a wallet that honours it refuses to
+// send on another one).
 
 import { getAddress } from 'ethers';
 
@@ -48,6 +53,9 @@ const quantity = (v: unknown): bigint => {
 
 export interface EvmPort {
   address: string;
+  /** Throws an `EvmError` unless the wallet is on the bound chain with the bound account right now. */
+  ready(): Promise<void>;
+  /** `ready()`, then the transaction, with the bound chain's id in it. */
   sendTransaction(tx: { to: string; data?: string; value?: bigint }, what: string): Promise<string>;
   ethBalance(holder: string): Promise<bigint>;
   erc20Balance(token: string, holder: string): Promise<bigint>;
@@ -55,11 +63,47 @@ export interface EvmPort {
   receipt(hash: string): Promise<'success' | 'reverted' | null>;
 }
 
-export function evmPort(provider: Eip1193Provider, address: string): EvmPort {
+/** The connected account on one chain (`chain`: its id and name, e.g. Sepolia's `0xaa36a7`). */
+export function evmPort(
+  provider: Eip1193Provider,
+  address: string,
+  chain: { chainIdHex: string; chainName: string },
+): EvmPort {
   const from = getAddress(address);
+  const chainId = chain.chainIdHex.toLowerCase();
+  const ready = async () => {
+    let id: unknown;
+    let accounts: unknown;
+    try {
+      [id, accounts] = await Promise.all([
+        provider.request({ method: 'eth_chainId' }),
+        provider.request({ method: 'eth_accounts' }),
+      ]);
+    } catch {
+      throw new EvmError('Your wallet did not say which network and account it is on. Nothing was sent.');
+    }
+    if (typeof id !== 'string' || id.toLowerCase() !== chainId)
+      throw new EvmError(
+        `Your wallet is not on ${chain.chainName}. Switch it back to ${chain.chainName}: nothing was sent.`,
+      );
+    const first = Array.isArray(accounts) ? accounts[0] : undefined;
+    const current = (() => {
+      try {
+        return typeof first === 'string' ? getAddress(first) : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (current !== from)
+      throw new EvmError(
+        'Your wallet switched to another account. Switch back to the one that started this swap: nothing was sent.',
+      );
+  };
   return {
     address: from,
+    ready,
     async sendTransaction(tx, what) {
+      await ready();
       try {
         const hash = await provider.request({
           method: 'eth_sendTransaction',
@@ -69,6 +113,7 @@ export function evmPort(provider: Eip1193Provider, address: string): EvmPort {
               to: getAddress(tx.to),
               ...(tx.data ? { data: tx.data } : {}),
               value: `0x${(tx.value ?? 0n).toString(16)}`,
+              chainId,
             },
           ],
         });

@@ -23,7 +23,7 @@ import { amountText, clockText, elapsedText, ethText, legText } from '../../swap
 import { type StageKey, bridgeInStartedAt, stageStates, stageTitle } from '../../swap/flow.js';
 import { bridgeRequestUrl, midnightTxUrl, sepoliaAddressUrl, sepoliaTxUrl } from '../../swap/links.js';
 import { BRIDGE_IN_ESTIMATE_MIN } from '../../swap/offers.js';
-import { type SwapRecord, isFinished } from '../../swap/record-shape.js';
+import { type SwapRecord, isFinished, isResumable } from '../../swap/record-shape.js';
 import type { SessionSnapshot, SessionStatus, SwapSession } from '../../swap/session.js';
 import { useSession, useSwap } from '../../swap/SwapContext.js';
 
@@ -87,12 +87,16 @@ function useNow(ms: number): number {
 }
 
 const PROMPT: Record<Extract<SessionStatus, { kind: 'signing' }>['prompt'], string> = {
-  'start-1': 'Sign “Start a swap” in your wallet (signature 1 of 3).',
+  'start-1': 'Sign “Start or resume a swap” in your wallet (signature 1 of 3).',
   'start-2':
-    'Sign the same “Start a swap” message again (2 of 3): this checks that your wallet signs it the same way every time.',
+    'Sign the same “Start or resume a swap” message again (2 of 3): this checks that your wallet signs it the same way every time.',
   sponsor: 'Sign the sponsor authorisation (the last signature): it lets the sponsor pay this swap’s Midnight fees.',
-  resume: 'Sign “Start a swap” again: it re-creates this swap’s temporary Midnight wallet.',
+  resume: 'Sign “Start or resume a swap” again: it re-creates this swap’s temporary Midnight wallet.',
 };
+
+/** Shown with every “Start or resume a swap” prompt (P4.2-fix C14): EIP-712 cannot bind the site. */
+const SIGN_HERE_ONLY =
+  'Only sign it here, in this app: the signature is the key to the swap’s tokens, and whoever gets it can take them. Never sign it on another site.';
 
 function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): string {
   if (!snap) return record && isFinished(record) ? 'Finished.' : 'Not running in this tab.';
@@ -226,19 +230,26 @@ export function SwapProgress({ swapId }: { swapId: string }) {
       </EmptyState>
     );
 
-  const running = !!session && !session.isClosed;
+  // A session stopped for good (a failed swap the sponsor can revive) is not running: Resume replaces it.
+  const running = !!session && !session.isClosed && !session.isStuck;
   const status = snap?.status ?? null;
   const offer = record?.offer ?? null;
   const pay = offer?.pay ?? (snap?.offer ? { ...legOf(snap.offer.pay) } : null);
   const receive = offer?.receive ?? (snap?.offer ? { ...legOf(snap.offer.receive) } : null);
   const states = stageStates(record);
   const finished = !!record && isFinished(record);
+  const resumable = !!record && isResumable(record);
   const unavailable = record?.phase === 'unavailable';
   const back = record?.choice === 'bridge-back';
 
   const startDetail = (
     <>
       {status?.kind === 'signing' && <p data-testid="sign-prompt">{PROMPT[status.prompt]}</p>}
+      {status?.kind === 'signing' && status.prompt !== 'sponsor' && (
+        <Notice tone="warning" data-testid="sign-here-only">
+          {SIGN_HERE_ONLY}
+        </Notice>
+      )}
       {status?.kind === 'opening' && <p>Opening the swap with the sponsor…</p>}
       {(record?.temp ?? snap?.temp) && (
         <ul className="tx-list">
@@ -265,6 +276,8 @@ export function SwapProgress({ swapId }: { swapId: string }) {
   );
 
   const fundStatus = status?.kind === 'fund' ? status.sending : null;
+  // P4.2-fix C9: no funding while the wallet is off Sepolia (or on another account).
+  const fundingPaused = snap?.fundingBlocked ?? null;
   const fundDetail = record && (
     <>
       <p>
@@ -322,9 +335,18 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           )}
         </li>
       </ul>
+      {status?.kind === 'fund' && fundingPaused && (
+        <p className="small" data-testid="funding-paused">
+          {fundingPaused}
+        </p>
+      )}
       {status?.kind === 'fund' && (
         <ButtonRow stretch>
-          <Button data-testid="send-funds" disabled={fundStatus !== null} onClick={() => void session?.sendFunds()}>
+          <Button
+            data-testid="send-funds"
+            disabled={fundStatus !== null || fundingPaused !== null}
+            onClick={() => void session?.sendFunds()}
+          >
             {fundStatus === 'eth'
               ? 'Confirm the sweep gas in your wallet…'
               : fundStatus === 'confirming'
@@ -425,7 +447,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
       {(record.bridgeOut.refunds ?? 0) > 0 && (
         <p className="small muted" data-testid="refunds">
           {record.bridgeOut.refunds} earlier {record.bridgeOut.refunds === 1 ? 'withdrawal was' : 'withdrawals were'}{' '}
-          refunded to the temporary wallet and retried.
+          refunded or could not start, and the page built it again (your tokens stayed in the temporary wallet).
         </p>
       )}
     </>
@@ -480,15 +502,17 @@ export function SwapProgress({ swapId }: { swapId: string }) {
         actions={<a href="#swap">All offers</a>}
       />
 
-      {!running && record && !finished && (
+      {!running && record && resumable && (
         <Notice
           tone="warning"
-          title="This swap is not running in this tab."
+          title={
+            finished ? 'This swap failed, and the sponsor can revive it.' : 'This swap is not running in this tab.'
+          }
           className="panel-intro"
           data-testid="resume-here"
         >
-          Resume it: your wallet signs the swap&apos;s “Start a swap” message once (it re-creates the swap&apos;s
-          Midnight wallet), then the sponsor authorisation once.
+          Resume it: your wallet signs the swap&apos;s “Start or resume a swap” message once (it re-creates the
+          swap&apos;s Midnight wallet; only ever sign it in this app), then the sponsor authorisation once.
           <ButtonRow className="gap-top">
             <Button data-testid="resume" onClick={() => ctx.resume(record)} disabled={ctx.startBlocker !== null}>
               Resume swap
@@ -517,6 +541,12 @@ export function SwapProgress({ swapId }: { swapId: string }) {
                 Retry
               </Button>
             </ButtonRow>
+          )}
+          {status.canResume && (
+            <p className="small gap-top" data-testid="can-resume">
+              The sponsor can revive this swap: resume it (above) with one signature of the start message and the
+              sponsor authorisation.
+            </p>
           )}
         </Notice>
       )}

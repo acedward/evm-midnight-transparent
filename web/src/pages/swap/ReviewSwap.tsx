@@ -91,10 +91,10 @@ function Review({ offer, blocker, onStart }: { offer: SwapOffer; blocker: string
       <h4 className="panel-title-sm gap-top">What happens</h4>
       <Steps>
         <Step title="Start the swap: three signatures">
-          Your wallet asks you to sign “Start a swap” twice. It is the same message: the signature creates this
-          swap&apos;s temporary Midnight wallet, and signing twice checks that your wallet signs it the same way every
-          time, so the swap can be recovered by signing again. Then a third signature lets {APP_NAME}&apos;s sponsor pay
-          the Midnight fees for this swap.
+          Your wallet asks you to sign “Start or resume a swap” twice. It is the same message: the signature creates
+          this swap&apos;s temporary Midnight wallet, and signing twice checks that your wallet signs it the same way
+          every time, so the swap can be recovered by signing again. Then a third signature lets {APP_NAME}&apos;s
+          sponsor pay the Midnight fees for this swap.
         </Step>
         <Step title="Send the funds: two Sepolia transactions">
           A little Sepolia ETH for the bridge&apos;s sweep of your tokens (sized by the sponsor; most of it stays at the
@@ -119,6 +119,16 @@ function Review({ offer, blocker, onStart }: { offer: SwapOffer; blocker: string
         Keep this tab open while the swap runs. If it closes, open {APP_NAME} again with the same wallet and resume the
         swap from “Your swaps” by signing the start message again. Nothing about the swap&apos;s key is stored.
       </p>
+
+      <Notice
+        tone="warning"
+        className="gap-top"
+        data-testid="start-swap-warning"
+        title="Only sign “Start or resume a swap” here, in this app."
+      >
+        That signature is the key to the swap&apos;s temporary Midnight wallet: whoever gets it can take the tokens in
+        it. Never sign it on another site, even one that shows the same message.
+      </Notice>
 
       {held !== null && (
         <Notice

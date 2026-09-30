@@ -16,7 +16,7 @@ test/live/run-live.sh build && test/live/run-live.sh keys
 test/live/run-live.sh competitor-fund <bid>  # E.3 only, BEFORE up (the gate takes the funding lock itself)
 test/live/run-live.sh up                     # takes the funding lock, holds it until stop/down
 test/live/run-live.sh phase e2 <offerId>     # E.2 + E.4
-test/live/run-live.sh temp-check <swapId> e2-07-temp-wallet
+test/live/run-live.sh temp-check <salt> e2-07-temp-wallet  # the record's salt (P4.2-fix: not its id); add 1 for P3's swaps
 test/live/run-live.sh phase e3 <bid>         # E.3; when $STATE/e3-ready.json appears:
 test/live/run-live.sh competitor-take <bid>
 test/live/run-live.sh down                   # compose down -v, lock released

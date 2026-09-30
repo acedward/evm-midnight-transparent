@@ -35,6 +35,9 @@ export interface TestWallet {
   calls: Array<{ method: string; params: unknown }>;
   /** Every transaction the page sent. */
   sent: Array<{ to: string; data: string; value: bigint; hash: string }>;
+  /** Switch the wallet's network the way a user does in the extension: `eth_chainId` answers the new
+   *  id and the page gets `chainChanged` (P4.2-fix C9). */
+  setChain(chainId: string): Promise<void>;
 }
 
 export interface FakeSepolia {
@@ -173,6 +176,13 @@ export async function installTestWallet(
     const listeners: Record<string, Array<(...a: unknown[]) => void>> = {};
     const bridge = (window as unknown as { __emtTestWallet: (m: string, p: unknown[]) => Promise<unknown> })
       .__emtTestWallet;
+    // The spec switches networks from outside the page, as a user would in the extension.
+    (window as unknown as { __emtTestWalletEmit: (event: string, arg: unknown) => void }).__emtTestWalletEmit = (
+      event,
+      arg,
+    ) => {
+      for (const h of listeners[event] ?? []) h(arg);
+    };
     const provider = {
       async request({ method, params }: { method: string; params?: unknown[] }) {
         const result = await bridge(method, params ?? []);
@@ -203,7 +213,23 @@ export async function installTestWallet(
     announce();
   });
 
-  return { address: wallet.address, privateKey: rpc ? '' : wallet.privateKey, calls, sent };
+  return {
+    address: wallet.address,
+    privateKey: rpc ? '' : wallet.privateKey,
+    calls,
+    sent,
+    async setChain(id: string) {
+      chainId = id.toLowerCase();
+      await page.evaluate(
+        (c) =>
+          (window as unknown as { __emtTestWalletEmit: (e: string, a: unknown) => void }).__emtTestWalletEmit(
+            'chainChanged',
+            c,
+          ),
+        chainId,
+      );
+    },
+  };
 }
 
 /** The same wallet (the same key and Sepolia state) in another tab: a user who comes back. */

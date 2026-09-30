@@ -34,8 +34,10 @@ import { getAddress } from 'ethers';
 
 import { internalsOf, type Eip1193Request, type TempWallet } from './temp-wallet.js';
 import {
+  assertSameAsDraft,
   contractCalls,
   dustSpendCount,
+  erasedHex,
   hasUnshieldedOffers,
   provenFromHex,
   txToHex,
@@ -205,6 +207,10 @@ export interface WithdrawDraft {
   readonly singleton: string;
   /** The transaction's identifiers; proving keeps them, so the proven transaction must carry them all. */
   readonly identifiers: readonly string[];
+  /** The merged transaction with its proofs erased, hex: both calls with their transcripts (the
+   *  amount, colour, destination, nonce, gas, refund recipient) and every Zswap input and output. A
+   *  proven answer must erase to exactly this (P4.2-fix C10). */
+  readonly erased: string;
   readonly buildMs: number;
   readonly balanceMs: number;
   /** Give the booked coins back to the wallet (the withdrawal is abandoned). Idempotent. */
@@ -362,6 +368,7 @@ export async function buildWithdraw(
       vault,
       singleton,
       identifiers: merged.identifiers().map(String),
+      erased: erasedHex(merged),
       buildMs,
       balanceMs,
       release,
@@ -383,16 +390,15 @@ export interface FinalizedWithdraw {
 }
 
 /** The proven `startWithdraw` (from `/prove`) → bound and checked, ready for the sponsor's `/withdraw`:
- *  the same two calls on the same contracts, no DUST, balanced, and every identifier of the draft
- *  (proving keeps them), so it is this withdrawal and no other. */
+ *  the same two calls on the same contracts, no DUST, balanced, and, once its proofs are erased,
+ *  byte-identical to the draft (the calls' transcripts, so every argument, and every Zswap input and
+ *  output with its recipient; P4.2-fix C10), so it is this withdrawal and no other. */
 export function finalizeWithdraw(draft: WithdrawDraft, provenHex: string): FinalizedWithdraw {
   if (draft.released) throw new WithdrawError('released', 'this withdrawal was released; build it again');
   const { tx } = provenFromHex(provenHex);
   try {
     assertWithdrawShape(tx, draft.vault, draft.singleton);
-    const ids = new Set(tx.identifiers().map(String));
-    const missing = draft.identifiers.filter((id) => !ids.has(id));
-    if (missing.length > 0) throw new Error(`it lacks ${missing.length} of the draft's identifiers`);
+    assertSameAsDraft(draft, tx);
   } catch (e) {
     throw new WithdrawError('proof-mismatch', `the proven transaction is not this withdrawal: ${(e as Error).message}`);
   }

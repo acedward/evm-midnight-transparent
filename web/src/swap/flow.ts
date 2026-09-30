@@ -4,11 +4,17 @@
 //                 the phase);
 //   nextAction    what the page does next with that record: fund, wait, look at the temporary wallet,
 //                 wait for the user's Bridge back, or stop;
+//   withdrawalStatus  what the sponsor says about the withdrawals (P4.2-fix C1): how many ended
+//                 without a transfer, and whether one must be built now (a refund or a failed start
+//                 sends the swap back to `minted` with `withdrawal.retry`);
 //   afterMint     once the bridged coin is minted, what the temporary wallet's balances say to do:
 //                 take, bridge out the received token, bridge back the paid token, or wait. The page
-//                 decides from its own record and the wallet, not from the state's name, so a refund
-//                 (back to `minted`, Q9 A) and a resume both land on the right step;
+//                 decides from its own record, the wallet and the sponsor's withdrawal signal, not
+//                 from the state's name, so a refund (back to `minted`, Q9 A), a failed start and a
+//                 resume all land on the right step;
 //   stageStates   the six stages the page shows, and which one is current.
+
+import type { WithdrawalLast } from '@evm-midnight-transparent/core';
 
 import type { SwapPhase, SwapRecord } from './record-shape.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
@@ -55,6 +61,38 @@ function phaseFor(record: SwapRecord, view: SwapView): SwapPhase {
   }
 }
 
+export interface WithdrawalStatus {
+  /** Withdrawals that ended without a transfer (refunded, or their start failed). */
+  ended: number;
+  /** The page must build a withdrawal now (none yet, or the latest ended without a transfer). */
+  rebuild: boolean;
+  /** How the latest one ended, when it ended without a transfer. */
+  last: WithdrawalLast | null;
+}
+
+const ENDED_STAGES: Readonly<Record<string, WithdrawalLast>> = {
+  refunded: 'refunded',
+  failed: 'start-failed',
+};
+
+/** The sponsor's word on the withdrawals (P4.2-fix C1). Never the page's own counters: they missed
+ *  every failed start, and the sponsor's `withdraw.refunds` once counted only the refunds BEFORE the
+ *  latest attempt (the audit's F-A1). */
+export function withdrawalStatus(view: SwapView): WithdrawalStatus {
+  const s = view.withdrawal;
+  if (s) {
+    const last = s.last ?? null;
+    const ended = s.attempts > 0 ? s.attempts - (last === null ? 1 : 0) : 0;
+    return { ended, rebuild: s.retry || s.attempts === 0, last };
+  }
+  // A sponsor without the signal (before P4.2-fix, whose `refunds` counted the refunds BEFORE the
+  // withdrawal): the latest withdrawal's stage says whether it ended.
+  const w = view.withdraw;
+  if (!w) return { ended: 0, rebuild: true, last: null };
+  const last = ENDED_STAGES[w.stage ?? ''] ?? null;
+  return { ended: (w.refunds ?? 0) + (last ? 1 : 0), rebuild: last !== null, last };
+}
+
 /** The record with the sponsor's view of the swap merged in. */
 export function applyView(record: SwapRecord, view: SwapView, now: number): SwapRecord {
   const d = view.deposit;
@@ -95,7 +133,8 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
       sepoliaTx: hashOr(w.sepoliaTx, keep.sepoliaTx),
       completeTx: hashOr(w.completeTx, keep.completeTx),
       attempts: prev.attempts,
-      refunds: Math.max(w.refunds ?? 0, prev.refunds ?? 0) || undefined,
+      // Withdrawals that ended without a transfer (refunded or not started), from the sponsor's signal.
+      refunds: Math.min(100, Math.max(withdrawalStatus(view).ended, prev.refunds ?? 0)) || undefined,
       earlier,
     });
   }
@@ -106,8 +145,16 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
   const next: SwapRecord = { ...record, bridgeIn, bridgeOut, take, phase, updatedAt: now };
   if (view.state === 'done')
     next.outcome = view.outcome ?? (record.choice === 'bridge-back' ? 'bridged-back' : 'swapped');
-  if (view.state === 'failed')
+  if (view.state === 'failed') {
     next.error = (view.message ?? view.reason ?? 'The sponsor stopped this swap.').slice(0, 500);
+    // P4.2-fix C5: a failure the sponsor can revive by a re-open; the page offers Resume.
+    if (view.recoverable === true) next.recoverable = true;
+    else delete next.recoverable;
+  } else if (record.phase === 'failed') {
+    // Revived by a re-open: the failure is over.
+    delete next.error;
+    delete next.recoverable;
+  }
   return next;
 }
 
@@ -144,18 +191,23 @@ export type MintedAction =
   | 'take'
   | 'withdraw-receive'
   | 'withdraw-pay'
-  /** A withdrawal is in flight (submitted, not refunded): the sponsor moves on. */
+  /** The sponsor holds a withdrawal that has not ended: it moves on. */
   | 'wait-withdrawal'
   /** The coin the next step needs is not visible yet: sync again. */
   | 'wait-coin'
   | 'unavailable';
 
-/** What to do with the minted coin, from the record and the temporary wallet's balances. */
-export function afterMint(record: SwapRecord, balances: Readonly<Record<string, bigint>>): MintedAction {
+/** What to do with the minted coin, from the record, the temporary wallet's balances, and the
+ *  sponsor's withdrawal signal (`withdrawalStatus` of its latest view; P4.2-fix C1). */
+export function afterMint(
+  record: SwapRecord,
+  balances: Readonly<Record<string, bigint>>,
+  withdrawal: Pick<WithdrawalStatus, 'rebuild'>,
+): MintedAction {
   const held = (colour: string) => balances[colour] ?? 0n;
   const receiveHeld = held(record.offer.receive.colour) >= BigInt(record.offer.receive.amount);
   const payHeld = held(record.offer.pay.colour) >= BigInt(record.offer.pay.amount);
-  if ((record.bridgeOut.attempts ?? 0) > (record.bridgeOut.refunds ?? 0)) return 'wait-withdrawal';
+  if (!withdrawal.rebuild) return 'wait-withdrawal';
   if (receiveHeld) return 'withdraw-receive';
   if (payHeld) {
     if (record.choice === 'bridge-back') return 'withdraw-pay';
