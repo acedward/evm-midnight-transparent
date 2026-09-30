@@ -12,6 +12,7 @@ import { type SessionDeps, SwapSession } from '../src/swap/session.js';
 import { LocalStore } from '../src/store/store.js';
 import { expectImportRoundTrip } from './roundtrip.js';
 import {
+  DelegatedSepolia,
   FakeSepolia,
   askOffer,
   backendsOf,
@@ -352,6 +353,45 @@ describe('what the page refuses', () => {
     expect(statusOf(s)).toMatchObject({ message: expect.stringMatching(/deposit address does not match/) });
     expect(evm.sent).toEqual([]);
     expect(readSwapRecords(store, { network: 'stagenet', evmAddress: signer.address })).toEqual([]);
+  });
+
+  it('a delegated account (one pending transaction): the token transfer waits until the sweep is mined', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new DelegatedSepolia(signer.address);
+    evm.pollsToMine = 3;
+    const quick = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20)));
+    const s = track(SwapSession.begin(offer, { ...deps(signer, evm), sleep: quick }));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    expect(evm.refused).toBe(0);
+    expect(evm.polls).toBe(3); // it waited for the sweep's receipt
+    expect(evm.sent.map((t) => (t.data ? 'token' : 'eth'))).toEqual(['eth', 'token']);
+    const r = s.getSnapshot().record!;
+    expect(r.funding.eth?.status).toBe('confirmed');
+    expect(r.funding.token?.status).toBe('sent');
+  });
+
+  it('a sweep not mined in time: a notice; Send funds again sends only the token, never the sweep twice', async () => {
+    env = mockEnv();
+    const offer = await askOffer(env);
+    const signer = testSigner();
+    const evm = new DelegatedSepolia(signer.address);
+    evm.pollsToMine = Number.POSITIVE_INFINITY;
+    let t = Date.now();
+    const quick = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 5)));
+    const s = track(SwapSession.begin(offer, { ...deps(signer, evm), sleep: quick, now: () => (t += 60_000) }));
+    await waitFor(() => statusOf(s).kind === 'fund', 5_000);
+    await s.sendFunds();
+    expect(evm.sent).toHaveLength(1);
+    expect(s.getSnapshot().notice).toMatch(/not confirmed on Sepolia yet/);
+    expect(statusOf(s)).toEqual({ kind: 'fund', sending: null });
+    expect(s.getSnapshot().record!.funding.eth?.status).toBe('sent');
+    evm.mine();
+    await s.sendFunds();
+    expect(evm.refused).toBe(0);
+    expect(evm.sent.map((x) => (x.data ? 'token' : 'eth'))).toEqual(['eth', 'token']);
   });
 
   it('funding without enough tokens: a notice, nothing sent', async () => {

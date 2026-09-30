@@ -99,3 +99,27 @@ condition = "AND"
 paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js$''']
 regexTarget = "match"
 regexes = ['''^vaultTokenDomainSeparator:`[0-9a-f]{64}`$''']
+# The web bundle carries the in-browser wallet since P3 (a lazily loaded chunk): the vault's vendored
+# contract module (see its entry above) with the PUBLIC verifier-key SHA-256 of `publishTokenMetadata`,
+# minified in the JavaScript and verbatim in its source map. Scoped to that rule, the bundle AND that
+# one entry's shapes.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js(\.map)?$''']
+regexTarget = "match"
+regexes = [
+  '''^publishTokenMetadata:`[0-9a-f]{64}`$''',
+  '''^publishTokenMetadata': '[0-9a-f]{64}'$''',
+]
+# The ledger's wasm-bindgen glue in the bundle's source maps: the rule reads a list of generated
+# import names (`__wbg_<name>_<16 hex>`) and two API names (`signatureVerifyingKey`,
+# `signingKeyFromBip340`) as labelled keys. Public library code. Scoped to that rule, the bundle's
+# source maps AND those shapes.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js\.map$''']
+regexTarget = "match"
+regexes = [
+  '''^__wbg_[a-z0-9_]+_[0-9a-f]{16}","__wbg_[a-z0-9_]+_[0-9a-f]{16}"$''',
+  '''^signatureVerifyingKey","signingKeyFromBip340"$''',
+]

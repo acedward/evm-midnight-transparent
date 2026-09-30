@@ -5,7 +5,7 @@
 import type { BookSnapshot, SwapOffer } from '@evm-midnight-transparent/core';
 import { describe, expect, it } from 'vitest';
 
-import { afterMint, applyView, nextAction, stageStates, stageTitle } from '../src/swap/flow.js';
+import { afterMint, applyView, bridgeInStartedAt, nextAction, stageStates, stageTitle } from '../src/swap/flow.js';
 import {
   MIN_TIME_TO_EXPIRY_MS,
   formatPriceRatio,
@@ -198,6 +198,19 @@ describe("the sponsor's view, merged into the record", () => {
     expect(second.bridgeOut.earlier).toEqual([
       { requestId: H('1'), startTx: `00${H('2')}`, completeTx: `00${H('3')}` },
     ]);
+  });
+});
+
+describe('the bridge-in timer', () => {
+  it('counts from the funds arriving, not from the swap opening (the real sponsor lists waiting-for-funds first)', () => {
+    const at = (stage: string, t: number) => ({ stage, at: t });
+    const r = (stages: Array<{ stage: string; at: number }>) => record({ bridgeIn: { stages } });
+    expect(
+      bridgeInStartedAt(r([at('waiting-for-funds', 1_000), at('funds-seen', 1_200_000), at('started', 1_225_000)])),
+    ).toBe(1_200_000);
+    expect(bridgeInStartedAt(r([at('starting', 5), at('started', 9)]))).toBe(5); // the mock's list
+    expect(bridgeInStartedAt(r([at('waiting-for-funds', 1_000)]))).toBeUndefined();
+    expect(bridgeInStartedAt(record())).toBeUndefined();
   });
 });
 

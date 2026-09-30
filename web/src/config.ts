@@ -7,7 +7,9 @@ import { z } from 'zod';
 
 export interface SiteConfig {
   network: NetworkProfile;
-  /** The sponsor service's base URL ('' when none is configured: swaps cannot start). */
+  /** The sponsor service's base URL, absolute ('' when none is configured: swaps cannot start).
+   *  config.json may give it relative to the site (`/sponsor`, the same-origin proxy of the deploy
+   *  bundle): it is resolved against the page's address. */
   sponsorUrl: string;
   /** The token list when the network has no built-in one (a local stack's colours); stagenet's
    *  comes from the vault records vendored in core. */
@@ -48,7 +50,21 @@ function parseMock(raw: unknown): MockSettings | undefined {
   return parsed.data;
 }
 
-export async function loadSiteConfig(fetchImpl: typeof fetch = fetch): Promise<SiteConfig> {
+/** An absolute sponsor URL: kept as is, or resolved against `base` (the page's address) when it is
+ *  a path; '' when absent or unusable. */
+export function resolveSponsorUrl(raw: unknown, base: string | undefined): string {
+  if (typeof raw !== 'string' || raw.trim() === '') return '';
+  try {
+    return new URL(raw.trim(), base).href.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+export async function loadSiteConfig(
+  fetchImpl: typeof fetch = fetch,
+  base: string | undefined = globalThis.location?.href,
+): Promise<SiteConfig> {
   let raw: { network?: unknown; sponsorUrl?: unknown; overrides?: unknown; tokens?: unknown; mock?: unknown } = {};
   try {
     const res = await fetchImpl('./config.json', { cache: 'no-store' });
@@ -61,7 +77,7 @@ export async function loadSiteConfig(fetchImpl: typeof fetch = fetch): Promise<S
   const mock = parseMock(raw.mock);
   return {
     network: resolveNetwork(name, overrides),
-    sponsorUrl: typeof raw.sponsorUrl === 'string' ? raw.sponsorUrl : '',
+    sponsorUrl: resolveSponsorUrl(raw.sponsorUrl, base),
     ...(raw.tokens !== undefined ? { tokens: raw.tokens } : {}),
     ...(mock ? { mock } : {}),
   };

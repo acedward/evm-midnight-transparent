@@ -1,6 +1,12 @@
-// A small browser-safe client for the sponsor's swap API (./swap-api.ts). Fetch only; every answer
-// is parsed with the shared schemas, and every error becomes a `SponsorApiError` carrying the
-// sponsor's `{code, message, detail}`.
+// A small browser-safe client for the sponsor's swap API (./swap-api.ts): the calls made BEFORE a
+// swap token exists (`config`, `nonce`, `openSwap`) and the state polling (`swap`). Fetch only;
+// every answer is parsed with the shared schemas, and every error becomes a `SponsorApiError`
+// carrying the sponsor's `{code, message, detail}`.
+//
+// One client per call (plan 00048 P3, L-SPONSOR's recommendation 3): the calls authorised by the
+// swap's bearer token (`/prove`, `/withdraw`, `withdraw-params`, `/take`) are the wallet module's
+// `sponsorClient` (@evm-midnight-transparent/wallet/sponsor-client), which types `withdraw-params`
+// for `buildWithdraw`; both throw this module's `SponsorApiError`.
 //
 // The open-swap signature: ask `nonce()`, build the message with `openSwapMessage(...)`, have the
 // user's wallet sign `sponsorActionTypedData(message)` (eth_signTypedData_v4), then `openSwap(...)`.
@@ -15,19 +21,13 @@ import {
 import { ApiErrorSchema, NonceResponseSchema, type NonceResponse } from './api.js';
 import {
   OpenSwapResponseSchema,
-  ProveResponseSchema,
   SWAP_PATHS,
   SwapConfigSchema,
   SwapResponseSchema,
-  WithdrawParamsSchema,
   type OpenSwapPayload,
   type OpenSwapResponse,
-  type ProveRequest,
   type SwapConfig,
   type SwapView,
-  type TakeReport,
-  type WithdrawKind,
-  type WithdrawParams,
 } from './swap-api.js';
 
 export class SponsorApiError extends Error {
@@ -39,6 +39,11 @@ export class SponsorApiError extends Error {
     readonly detail?: string,
   ) {
     super(message);
+  }
+
+  /** The withdrawal must be rebuilt on fresh state and proven again (a 409 on `/prove` or `/withdraw`). */
+  get rebuild(): boolean {
+    return this.code === 'stale-vault-state' || this.code === 'stale-evm-nonce';
   }
 }
 
@@ -95,7 +100,13 @@ export class SponsorClient {
       const e = ApiErrorSchema.safeParse(json);
       throw e.success
         ? new SponsorApiError(res.status, e.data.error.code, e.data.error.message, e.data.error.detail)
-        : new SponsorApiError(res.status, 'http', `the sponsor answered ${res.status}`);
+        : res.status === 429
+          ? new SponsorApiError(
+              429,
+              'rate-limited',
+              'The sponsor service is busy: too many requests. Try again shortly.',
+            )
+          : new SponsorApiError(res.status, 'http', `the sponsor answered ${res.status}`);
     }
     return json;
   }
@@ -116,33 +127,5 @@ export class SponsorClient {
 
   async swap(swapId: string, token: string): Promise<SwapView> {
     return SwapResponseSchema.parse(await this.call(SWAP_PATHS.swap(swapId), { token })).swap;
-  }
-
-  async withdrawParams(swapId: string, token: string, kind: WithdrawKind): Promise<WithdrawParams> {
-    return WithdrawParamsSchema.parse(
-      await this.call(`${SWAP_PATHS.withdrawParams(swapId)}?kind=${encodeURIComponent(kind)}`, { token }),
-    );
-  }
-
-  /** Prove on the sponsor's proof server: the answer is `Transaction<signature, proof, pre-binding>` hex. */
-  async prove(swapId: string, token: string, body: ProveRequest): Promise<string> {
-    const out = await this.call(
-      SWAP_PATHS.prove(swapId),
-      { method: 'POST', body: JSON.stringify(body), token },
-      15 * 60_000,
-    );
-    return ProveResponseSchema.parse(out).tx;
-  }
-
-  async withdraw(swapId: string, token: string, txHex: string): Promise<SwapView> {
-    return SwapResponseSchema.parse(
-      await this.call(SWAP_PATHS.withdraw(swapId), { method: 'POST', body: JSON.stringify({ tx: txHex }), token }),
-    ).swap;
-  }
-
-  async reportTake(swapId: string, token: string, report: TakeReport): Promise<SwapView> {
-    return SwapResponseSchema.parse(
-      await this.call(SWAP_PATHS.take(swapId), { method: 'POST', body: JSON.stringify(report), token }),
-    ).swap;
   }
 }

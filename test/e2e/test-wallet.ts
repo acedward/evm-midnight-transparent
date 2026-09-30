@@ -16,10 +16,20 @@
 
 import type { Page } from '@playwright/test';
 import { secp256k1 } from '@noble/curves/secp256k1';
-import { JsonRpcProvider, TypedDataEncoder, Wallet, getBytes, hexlify, type TransactionRequest } from 'ethers';
+import {
+  JsonRpcProvider,
+  NonceManager,
+  TypedDataEncoder,
+  Wallet,
+  getBytes,
+  hexlify,
+  type TransactionRequest,
+} from 'ethers';
 
 export interface TestWallet {
   address: string;
+  /** The key, for reopening a FAKE-mode wallet in another tab; '' in LIVE mode (an owner's key never
+   *  leaves `installTestWallet`). */
   privateKey: string;
   /** Every request the page made, in order. */
   calls: Array<{ method: string; params: unknown }>;
@@ -56,6 +66,9 @@ export async function installTestWallet(
 ): Promise<TestWallet> {
   const rpc = opts.live ? new JsonRpcProvider(opts.live.rpcUrl, 11155111, { staticNetwork: true }) : null;
   const wallet = opts.privateKey ? new Wallet(opts.privateKey, rpc ?? undefined) : Wallet.createRandom();
+  // LIVE: nonces are counted here, so two sends in a row never reuse one (a load-balanced public RPC
+  // can answer a stale pending count right after the first send).
+  const sender = rpc ? new NonceManager(wallet) : null;
   let chainId = opts.startChainId ?? '0x1'; // mainnet: the dApp must ask to switch to Sepolia
   const calls: TestWallet['calls'] = [];
   const sent: TestWallet['sent'] = [];
@@ -107,11 +120,16 @@ export async function installTestWallet(
       case 'eth_sendTransaction': {
         const tx = params[0] as { from?: string; to: string; data?: string; value?: string };
         const value = BigInt(tx.value ?? '0x0');
-        if (rpc) {
+        if (sender) {
           const req: TransactionRequest = { to: tx.to, data: tx.data ?? '0x', value };
-          const res = await wallet.sendTransaction(req);
-          sent.push({ to: tx.to, data: tx.data ?? '', value, hash: res.hash });
-          return res.hash;
+          try {
+            const res = await sender.sendTransaction(req);
+            sent.push({ to: tx.to, data: tx.data ?? '', value, hash: res.hash });
+            return res.hash;
+          } catch (e) {
+            sender.reset();
+            return { __error: { code: -32603, message: e instanceof Error ? e.message.slice(0, 300) : String(e) } };
+          }
         }
         // FAKE: move the balances the page (and the mock sponsor) will read back.
         s.others ??= {};
@@ -185,7 +203,7 @@ export async function installTestWallet(
     announce();
   });
 
-  return { address: wallet.address, privateKey: wallet.privateKey, calls, sent };
+  return { address: wallet.address, privateKey: rpc ? '' : wallet.privateKey, calls, sent };
 }
 
 /** The same wallet (the same key and Sepolia state) in another tab: a user who comes back. */

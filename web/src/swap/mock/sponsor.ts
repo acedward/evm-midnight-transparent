@@ -8,6 +8,11 @@
 // deposit starts when the deposit address holds the exact ERC20 amount and the sweep ETH, read
 // through the connected wallet's Sepolia reads (the test wallet's fake balances). Stages then advance
 // one per tick.
+//
+// Its answers have the REAL sponsor's shapes (core swap-api.ts): the swap view in full, in a
+// `{swap}` envelope on `GET /v1/swaps/:id`, `/withdraw` and `/take`, and with `resumed` on open;
+// the page reads them through core's and the wallet's clients, which parse them strictly
+// (web/test/sponsor-client.test.ts checks every answer against core's schemas).
 
 import {
   SEPOLIA_CHAIN_ID,
@@ -51,8 +56,11 @@ export interface MockSwap {
   payload: OpenSwapPayload;
   depositAddress: string;
   erc20Address: string;
-  sweepGas: { gasLimit: string; maxFeePerGas: string; ethWei: string };
+  sweepGas: { gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas?: string; ethWei: string };
   token: string;
+  /** Unix seconds. */
+  createdAt?: number;
+  /** The page's reading of the swap; the wire view is built from it (`wireView`). */
   view: SwapView;
   /** Which stage list the running leg follows, and where it is. */
   script: ScriptName | null;
@@ -134,7 +142,7 @@ export class MockSponsor {
     const swap = this.swaps.get(m[1]!);
     if (!swap) return fail(404, 'not-found', 'no such swap');
     if (auth !== `Bearer ${swap.token}`) return fail(401, 'unauthorised', 'the swap token is missing or wrong');
-    if (method === 'GET' && !m[2]) return json(swap.view);
+    if (method === 'GET' && !m[2]) return json({ swap: this.wireView(swap) });
     if (method === 'POST' && m[2] === '/prove') return this.prove(swap, body);
     if (method === 'POST' && m[2] === '/withdraw') return this.withdraw(swap, body);
     if (method === 'GET' && m[2] === '/withdraw-params') return this.withdrawParams(swap, url.searchParams.get('kind'));
@@ -184,7 +192,7 @@ export class MockSponsor {
       if (existing.owner !== owner || payloadHash(existing.payload) !== payloadHash(p))
         return fail(409, 'conflict', 'this swap exists with other terms');
       existing.token = randomHex(32);
-      return json(this.openAnswer(existing));
+      return json(this.openAnswer(existing, true));
     }
 
     const offer = this.o.chain.offer(p.offerId);
@@ -214,9 +222,11 @@ export class MockSponsor {
       sweepGas: {
         gasLimit: gasLimit.toString(),
         maxFeePerGas: maxFeePerGas.toString(),
+        maxPriorityFeePerGas: '500000000',
         ethWei: (gasLimit * maxFeePerGas).toString(),
       },
       token: randomHex(32),
+      createdAt: Math.floor(this.now() / 1000),
       // As the real sponsor: the id without 0x, stage times in unix seconds.
       view: { swapId: b.swap.replace(/^0x/, ''), state: 'awaiting_funds' },
       script: null,
@@ -228,14 +238,85 @@ export class MockSponsor {
     return json(this.openAnswer(swap));
   }
 
-  private openAnswer(s: MockSwap) {
+  private openAnswer(s: MockSwap, resumed = false) {
     return {
       swapToken: s.token,
       depositAddress: s.depositAddress,
-      sweepGas: s.sweepGas,
+      sweepGas: this.wireSweepGas(s),
       erc20Address: s.erc20Address,
       amount: s.payload.pay.amount,
-      swap: s.view,
+      resumed,
+      swap: this.wireView(s),
+    };
+  }
+
+  private wireSweepGas(s: MockSwap) {
+    return { maxPriorityFeePerGas: '500000000', ...s.sweepGas };
+  }
+
+  /** The swap as the real sponsor serves it (core `SwapViewSchema`): every field, nulls for the
+   *  legs not started, stage times in unix seconds. */
+  private wireView(s: MockSwap) {
+    const v = s.view;
+    const leg = (l: { colour: string; amount: string }) => {
+      const t = this.o.registry.byColour(l.colour)!;
+      return {
+        colour: l.colour,
+        amount: l.amount,
+        symbol: t.symbol,
+        erc20Address: t.sepoliaAddress,
+        decimals: t.decimals,
+      };
+    };
+    const stages = (list: SponsorStage[] | undefined) => (list ?? []).map((x) => ({ stage: x.stage, at: x.at }));
+    const d = v.deposit;
+    const w = v.withdraw;
+    const withdraw = w
+      ? {
+          kind: w.colour === s.payload.pay.colour ? ('bridge-back' as const) : ('swap' as const),
+          colour: w.colour ?? s.payload.receive.colour,
+          amount: w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount,
+          stage: w.stage ?? 'queued',
+          stages: stages(w.stages),
+          ...(w.requestId ? { requestId: w.requestId } : {}),
+          ...(w.startTx ? { startTx: w.startTx } : {}),
+          ...(w.sepoliaTx ? { sepoliaTx: w.sepoliaTx } : {}),
+          ...(w.completeTx ? { completeTx: w.completeTx } : {}),
+          refunds: w.refunds ?? 0,
+        }
+      : null;
+    const now = Math.floor(this.now() / 1000);
+    return {
+      swapId: v.swapId.replace(/^0x/, ''),
+      state: v.state,
+      evmAddress: s.owner,
+      offerId: s.payload.offerId,
+      pay: leg(s.payload.pay),
+      receive: leg(s.payload.receive),
+      tempCoinPk: s.payload.tempCoinPk,
+      depositAddress: s.depositAddress,
+      erc20Address: s.erc20Address,
+      amount: s.payload.pay.amount,
+      sweepGas: this.wireSweepGas(s),
+      deposit: d
+        ? {
+            stage: d.stage ?? 'starting',
+            stages: stages(d.stages),
+            ...(d.requestId ? { requestId: d.requestId } : {}),
+            ...(d.startTx ? { startTx: d.startTx } : {}),
+            ...(d.sweepTx ? { sweepTx: d.sweepTx } : {}),
+            ...(d.completeTx ? { completeTx: d.completeTx } : {}),
+            attempts: 1,
+          }
+        : null,
+      takeTx: v.takeTx ?? null,
+      withdraw,
+      withdrawals: withdraw ? [withdraw] : [],
+      ...(v.outcome ? { outcome: v.outcome } : {}),
+      ...(v.reason ? { reason: v.reason } : {}),
+      ...(v.message ? { message: v.message } : {}),
+      createdAt: s.createdAt ?? now,
+      updatedAt: now,
     };
   }
 
@@ -265,9 +346,10 @@ export class MockSponsor {
       amount: leg.amount,
       erc20Address: this.o.registry.byColour(leg.colour)!.sepoliaAddress,
       dest: s.owner,
-      refundRecipient: { left: s.payload.tempCoinPk },
+      refundRecipient: s.payload.tempCoinPk,
       gas: { gasLimit: '100000', maxFeePerGas: '10000000000', maxPriorityFeePerGas: '1000000000', keyVersion: '1' },
       evmNonce: String(this.evmNonce),
+      vaultAddress: '77'.repeat(32),
     });
   }
 
@@ -297,7 +379,7 @@ export class MockSponsor {
     } else if (b?.outcome === 'not-available') {
       if (s.view.state === 'taking') s.view.state = 'minted';
     } else return fail(400, 'bad-request', 'expected {outcome}');
-    return json({ swap: s.view });
+    return json({ swap: this.wireView(s) });
   }
 
   private withdraw(s: MockSwap, body: unknown): Response {
@@ -333,7 +415,7 @@ export class MockSponsor {
       stages: [this.stage('started')],
       refunds: s.view.withdraw?.refunds ?? 0,
     };
-    return json({ swap: s.view });
+    return json({ swap: this.wireView(s) });
   }
 
   private stage(stage: string): SponsorStage {

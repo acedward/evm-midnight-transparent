@@ -17,6 +17,8 @@
 #                       (for example ~/.cache/aa-00048/vault-managed, the G-BRIDGE gate's), and
 #                       put it through exactly the same verification before installing it
 #   build.sh verify     only re-verify what $OUT holds (a few seconds)
+#   build.sh ensure     the Compose job (deploy/compose.yml): verify what $OUT holds if it is
+#                       installed; otherwise import (when $IMPORT_DIR holds a directory) or compile
 # Any failure exits non-zero and installs nothing.
 set -euo pipefail
 umask 022
@@ -45,6 +47,17 @@ trap 'say "stopped by a signal"; exit 143' TERM INT
 mode="${1:-compile}"
 [[ -d "$OUT" && -w "$OUT" ]] || die "the output directory $OUT is missing or not writable by uid $(id -u)"
 mkdir -p "$MIDNIGHT_PP" 2>/dev/null || true
+
+if [[ "$mode" == ensure ]]; then
+  if [[ -f "$OUT/.vault-keys.json" && -d "$OUT/Erc20Vault" && -d "$OUT/SignetSigner" ]]; then
+    mode=verify
+  elif [[ -f "$IMPORT_DIR/Erc20Vault/contract/index.js" ]]; then
+    mode=import
+  else
+    mode=compile
+  fi
+  say "ensure: $mode"
+fi
 
 if [[ "$mode" == verify ]]; then
   "${TOOL[@]}" verify "$OUT" >/dev/null || die "$OUT does not verify against the chain"
@@ -88,7 +101,7 @@ case "$mode" in
       cp -RL "$IMPORT_DIR/$b" "$W/$b"
     done
     ;;
-  *) die "unknown mode $mode (compile, import or verify)" ;;
+  *) die "unknown mode $mode (compile, import, verify or ensure)" ;;
 esac
 say "$mode took $((SECONDS - started)) s ($(du -sh "$W" | cut -f1))"
 

@@ -97,8 +97,44 @@ export class FakeSepolia implements EvmPort {
     return this.erc20.get(`${token.toLowerCase()}:${holder.toLowerCase()}`) ?? 0n;
   }
 
-  async receipt(): Promise<'success'> {
+  async receipt(_hash?: string): Promise<'success' | 'reverted' | null> {
     return 'success';
+  }
+}
+
+/**
+ * An EIP-7702-delegated account (a MetaMask smart account), as a Sepolia node treats it: ONE pending
+ * transaction at a time; a second send while one is in flight is refused with the node's message
+ * (plan P3 E.2 attempt 1). A transaction is mined after `pollsToMine` receipt reads.
+ */
+export class DelegatedSepolia extends FakeSepolia {
+  inFlight: string | null = null;
+  polls = 0;
+  refused = 0;
+  pollsToMine = 2;
+
+  override async sendTransaction(tx: { to: string; data?: string; value?: bigint }): Promise<string> {
+    if (this.inFlight) {
+      this.refused++;
+      throw Object.assign(new Error('in-flight transaction limit reached for delegated accounts'), { code: -32000 });
+    }
+    const hash = await super.sendTransaction(tx);
+    this.inFlight = hash;
+    return hash;
+  }
+
+  override async receipt(hash?: string): Promise<'success' | 'reverted' | null> {
+    if (hash !== undefined && hash === this.inFlight) {
+      this.polls++;
+      if (this.polls < this.pollsToMine) return null;
+      this.inFlight = null;
+    }
+    return 'success';
+  }
+
+  /** Mine whatever is in flight. */
+  mine(): void {
+    this.inFlight = null;
   }
 }
 

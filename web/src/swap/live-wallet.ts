@@ -1,11 +1,8 @@
 // The real wallet module (`@evm-midnight-transparent/wallet`, L-WALLET) as the page's port
 // (./ports.ts), with the network profile bound. Only its TYPES are imported here, so this file adds
-// nothing to the bundle and the compiler checks that the real module fits the port the pages and the
-// mocks use. P3 wires it in ./wiring.ts:
-//
-//   const w = await import('@evm-midnight-transparent/wallet');
-//   w.ensureBufferGlobal();
-//   return adaptWalletModule(w, network);
+// nothing to the first bundle and the compiler checks that the real module fits the port the pages
+// and the mocks use. ./wiring.ts (`lazyWalletModule`) loads the module on first use, calls
+// `ensureBufferGlobal()`, and hands it to `adaptWalletModule(w, network)`.
 
 import { type NetworkProfile, swapDepositAddress } from '@evm-midnight-transparent/core';
 import type * as Wallet from '@evm-midnight-transparent/wallet';

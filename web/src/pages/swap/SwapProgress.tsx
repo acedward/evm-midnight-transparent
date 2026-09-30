@@ -20,7 +20,7 @@ import {
   type TrackerStage,
 } from '../../design/index.js';
 import { amountText, clockText, elapsedText, ethText, legText } from '../../swap/display.js';
-import { type StageKey, stageStates, stageTitle } from '../../swap/flow.js';
+import { type StageKey, bridgeInStartedAt, stageStates, stageTitle } from '../../swap/flow.js';
 import { bridgeRequestUrl, midnightTxUrl, sepoliaAddressUrl, sepoliaTxUrl } from '../../swap/links.js';
 import { BRIDGE_IN_ESTIMATE_MIN } from '../../swap/offers.js';
 import { type SwapRecord, isFinished } from '../../swap/record-shape.js';
@@ -105,7 +105,11 @@ function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): st
     case 'opening':
       return 'Opening the swap with the sponsor…';
     case 'fund':
-      return s.sending ? 'Confirm the transfers in your wallet.' : 'Send the funds to start the bridge.';
+      return s.sending === 'confirming'
+        ? 'Waiting for the sweep gas transfer to be confirmed on Sepolia before the token transfer.'
+        : s.sending
+          ? 'Confirm the transfers in your wallet.'
+          : 'Send the funds to start the bridge.';
     case 'working':
       return `${s.what}…`;
     case 'unavailable':
@@ -323,18 +327,20 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           <Button data-testid="send-funds" disabled={fundStatus !== null} onClick={() => void session?.sendFunds()}>
             {fundStatus === 'eth'
               ? 'Confirm the sweep gas in your wallet…'
-              : fundStatus === 'token'
-                ? `Confirm the ${record.offer.pay.symbol} transfer in your wallet…`
-                : fundStatus === 'checking'
-                  ? 'Checking…'
-                  : 'Send funds'}
+              : fundStatus === 'confirming'
+                ? 'Waiting for the sweep gas to be confirmed…'
+                : fundStatus === 'token'
+                  ? `Confirm the ${record.offer.pay.symbol} transfer in your wallet…`
+                  : fundStatus === 'checking'
+                    ? 'Checking…'
+                    : 'Send funds'}
           </Button>
         </ButtonRow>
       )}
     </>
   );
 
-  const inStart = record?.bridgeIn.stages?.[0]?.at;
+  const inStart = record ? bridgeInStartedAt(record) : undefined;
   const bridgeInDetail = record && (
     <>
       <p className="small">

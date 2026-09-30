@@ -21,7 +21,11 @@ The pages use three ports (`src/swap/ports.ts`, the plan's "Lane contracts" as L
 
   `evmWallet: true` announces a built-in "Mock wallet (no real funds)"; `scenario` can set `offerGoneAtTake`, `refundFirstWithdrawal`, `staleWithdrawOnce` or `refuseOpen`; `book: "empty"`; `persist` (default true) keeps the mock world in localStorage (`emt-mock/world`) across a reload or a new tab. The specs steer it through `window.__emtMock`.
 
-- without it (live), the real exchange and the sponsor at `sponsorUrl`, and `liveWalletModule()`, which cannot start a swap yet. P3 replaces it with `adaptWalletModule(await import('@evm-midnight-transparent/wallet'), network)` (`src/swap/live-wallet.ts`: the real module behind the same port, checked by the compiler and `test/live-wallet.test.ts`; call the module's `ensureBufferGlobal()` once) and deploys `config.json` without the `mock` block.
+- without it (live), the real exchange, the sponsor at `sponsorUrl` (absolute, or a path such as `/sponsor` resolved against the page: the deploy bundle's same-origin proxy), and the real wallet module (`@evm-midnight-transparent/wallet`) through `adaptWalletModule` (`src/swap/live-wallet.ts`, checked by the compiler and `test/live-wallet.test.ts`). `lazyWalletModule` (`src/swap/wiring.ts`) loads it on first use, as a separate chunk with its ledger and runtime WASM (about 11 MB), and calls its `ensureBufferGlobal()` first; the offers list never waits for it. The deployed `config.json` has no `mock` block (`deploy/web/entrypoint.sh` writes it).
+
+The sponsor port (`src/swap/sponsor-client.ts`, `HttpSponsorApi`) has no HTTP of its own: core's `SponsorClient` makes the calls before a swap token exists and the state polling, the wallet module's `sponsorClient` (`@evm-midnight-transparent/wallet/sponsor-client`, no WASM) the calls the token authorises; errors are core's `SponsorApiError` (as `SponsorError`).
+
+The live end-to-end runs (plan 00048 P3) drive this site in the deploy bundle: `test/live/README.md`.
 
 ## Tests
 
