@@ -47,6 +47,8 @@ export interface MockControls {
   consumeOffer(offerId: string): void;
   liveOfferIds(): string[];
   setScenario(patch: Partial<MockScenario>): void;
+  /** Fail every swap still waiting for its funds (`funds-not-received`), recoverable or not (C5). */
+  failAwaitingFunds(recoverable: boolean): void;
   setStepMs(ms: number): void;
   /** Answer every exchange request with this HTTP status (null: back up). */
   setKernelDown(status: number | null): void;
@@ -136,6 +138,10 @@ export function createMockEnvironment(input: {
     consumeOffer: (id) => chain.consume(id),
     liveOfferIds: () => chain.liveOffers().map((o) => o.offerId),
     setScenario: (patch) => Object.assign(settings.scenario, patch),
+    failAwaitingFunds: (recoverable) => {
+      sponsor.failAwaitingFunds(recoverable);
+      persist();
+    },
     setStepMs: (ms) => {
       settings.stepMs = ms;
       clock();

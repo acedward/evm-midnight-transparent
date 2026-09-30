@@ -1,6 +1,7 @@
 // The swap record in the browser store: its strict shape (no secret field fits), the store helpers,
 // and Import accepting only swap records this page writes, filed under their own swap and wallet.
 
+import { swapIdFromSalt } from '@evm-midnight-transparent/core';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { SwapRecordSchema, type SwapRecord } from '../src/swap/record-shape.js';
@@ -12,12 +13,16 @@ import { expectImportRoundTrip } from './roundtrip.js';
 const H = (c: string) => c.repeat(64);
 const ME = '0x484738A67858305Edfc139B194Ed430Fe4D8e56b';
 const scope = { network: 'stagenet', evmAddress: ME };
+/** A swap's public id from its salt `0x<c…c>` (P4.2-fix C14), and the store key's id (no 0x). */
+const idOf = (c: string) => swapIdFromSalt(`0x${H(c)}`);
+const keyId = (c: string) => idOf(c).slice(2);
 
 function rec(id: string, createdAt: number, patch: Partial<SwapRecord> = {}): SwapRecord {
   return {
-    v: 1,
-    swapId: `0x${H(id)}`,
-    derivation: 1,
+    v: 2,
+    swapId: idOf(id),
+    salt: `0x${H(id)}`,
+    derivation: 2,
     network: 'stagenet',
     vault: H('7'),
     evmAddress: ME,
@@ -67,16 +72,18 @@ describe('the swap record', () => {
   it('is filed under its wallet and swap, and read back newest first', () => {
     saveSwapRecord(store, rec('5', 1));
     saveSwapRecord(store, rec('6', 2));
-    expect(localStorage.getItem(recordKey(scope, 'swap', { id: H('5') }))).not.toBeNull();
-    expect(readSwapRecords(store, scope).map((r) => r.swapId)).toEqual([`0x${H('6')}`, `0x${H('5')}`]);
-    expect(readSwapRecord(store, scope, `0x${H('5')}`)?.createdAt).toBe(1);
+    expect(localStorage.getItem(recordKey(scope, 'swap', { id: keyId('5') }))).not.toBeNull();
+    // Filed under the PUBLIC id, never the salt (P4.2-fix C14).
+    expect(localStorage.getItem(recordKey(scope, 'swap', { id: H('5') }))).toBeNull();
+    expect(readSwapRecords(store, scope).map((r) => r.swapId)).toEqual([idOf('6'), idOf('5')]);
+    expect(readSwapRecord(store, scope, idOf('5'))?.createdAt).toBe(1);
     // Another wallet sees none of them.
     expect(readSwapRecords(store, { network: 'stagenet', evmAddress: `0x${'11'.repeat(20)}` })).toEqual([]);
   });
 
   it('skips a stored record that is not in its shape', () => {
     saveSwapRecord(store, rec('5', 1));
-    localStorage.setItem(recordKey(scope, 'swap', { id: H('6') }), encodeRecord('swap', { swapId: 'nonsense' }, 1));
+    localStorage.setItem(recordKey(scope, 'swap', { id: keyId('6') }), encodeRecord('swap', { swapId: 'nonsense' }, 1));
     expect(readSwapRecords(store, scope)).toHaveLength(1);
   });
 
@@ -103,16 +110,28 @@ describe('Import of swap records', () => {
   });
 
   it('accepts a record the page writes', () => {
-    expect(store.importWallet(file([entry(H('5'), rec('5', 1))]), scope).imported).toBe(1);
+    expect(store.importWallet(file([entry(keyId('5'), rec('5', 1))]), scope).imported).toBe(1);
+  });
+
+  it('accepts a version-1 record (before P4.2-fix: its id is its salt) and reads it as legacy', () => {
+    const { salt: _salt, ...v1 } = { ...rec('5', 1), v: 1, swapId: `0x${H('5')}`, derivation: 1 };
+    expect(store.importWallet(file([entry(H('5'), v1)]), scope).imported).toBe(1);
+    expect(readSwapRecord(store, scope, `0x${H('5')}`)).toMatchObject({ v: 2, salt: `0x${H('5')}`, derivation: 1 });
+  });
+
+  it("refuses a record whose id is not its salt's (P4.2-fix C14)", () => {
+    expect(() => store.importWallet(file([entry(keyId('5'), { ...rec('5', 1), salt: `0x${H('6')}` })]), scope)).toThrow(
+      ImportError,
+    );
   });
 
   it('refuses a record with a secret in it, filed under another swap, or naming another wallet', () => {
-    expect(() => store.importWallet(file([entry(H('5'), { ...rec('5', 1), seed: H('f') })]), scope)).toThrow(
+    expect(() => store.importWallet(file([entry(keyId('5'), { ...rec('5', 1), seed: H('f') })]), scope)).toThrow(
       ImportError,
     );
-    expect(() => store.importWallet(file([entry(H('6'), rec('5', 1))]), scope)).toThrow(/filed under another swap/);
+    expect(() => store.importWallet(file([entry(keyId('6'), rec('5', 1))]), scope)).toThrow(/filed under another swap/);
     expect(() =>
-      store.importWallet(file([entry(H('5'), { ...rec('5', 1), evmAddress: `0x${'22'.repeat(20)}` })]), scope),
+      store.importWallet(file([entry(keyId('5'), { ...rec('5', 1), evmAddress: `0x${'22'.repeat(20)}` })]), scope),
     ).toThrow(/another wallet/);
     expect(localStorage.length).toBe(0);
   });

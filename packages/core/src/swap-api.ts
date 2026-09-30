@@ -170,6 +170,15 @@ export const WithdrawViewSchema = z.object({
 });
 export type WithdrawView = z.infer<typeof WithdrawViewSchema>;
 
+/** How a withdrawal ended when it ended without a transfer (P4.2-fix C1). */
+export const WITHDRAWAL_ENDINGS = ['refunded', 'start-failed', 'stale-vault'] as const;
+export const WithdrawalSignalSchema = z.object({
+  attempts: z.number().int().nonnegative(),
+  last: z.enum(WITHDRAWAL_ENDINGS).nullable(),
+  retry: z.boolean(),
+});
+export type WithdrawalSignal = z.infer<typeof WithdrawalSignalSchema>;
+
 export const SwapLegViewSchema = z.object({
   colour: z.string(),
   amount: z.string(),
@@ -197,6 +206,10 @@ export const SwapViewSchema = z.object({
   withdraw: WithdrawViewSchema.nullable(),
   /** Every withdrawal attempt, oldest first (refunded ones included). */
   withdrawals: z.array(WithdrawViewSchema),
+  /** P4.2-fix C1: the latest withdrawal's outcome and whether the page must rebuild it. */
+  withdrawal: WithdrawalSignalSchema.optional(),
+  /** P4.2-fix C5: on `failed`, whether a re-open (the same open-swap, a resume) revives it. */
+  recoverable: z.boolean().optional(),
   /** On `done`. */
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
   /** On `failed`: a stable code, and a sentence for the page. */

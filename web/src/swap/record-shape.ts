@@ -4,14 +4,22 @@
 // re-derives the key by signing the swap's "start swap" message again, and re-opens the swap with
 // the sponsor for a new token.
 //
-// Everything here is public: the salt (swap id), the offer, amounts, addresses, the temporary
-// wallet's PUBLIC keys, request ids, transaction hashes and states. The shape is strict: Import
-// accepts only records this page could have written (./store/record-schemas.ts).
+// Public: the swap id, the offer, amounts, addresses, the temporary wallet's PUBLIC keys, request ids,
+// transaction hashes and states. LOCAL ONLY (P4.2-fix C14): the salt. It is no key, but with it a
+// site could show the user the exact "start swap" prompt whose signature is the key, so it never
+// leaves this browser (the sponsor, URLs and logs see the swap id = keccak256(tag ‖ salt)); Export
+// carries it, because Import → Resume needs it. The shape is strict: Import accepts only records
+// this page could have written (./store/record-schemas.ts).
+//
+// Version 2 (P4.2-fix): `salt` next to the public `swapId`, derivation 2 (the warning prompt), and
+// `recoverable` on a failed swap the sponsor can revive (C5). A version-1 record (written before:
+// its id IS its salt, derivation 1) is read as a legacy version 2 and still resumes.
 
+import { swapIdFromSalt } from '@evm-midnight-transparent/core';
 import { z } from 'zod';
 
 /** The record format's version (inside the store's own schema version 1). */
-export const SWAP_RECORD_VERSION = 1;
+export const SWAP_RECORD_VERSION = 2;
 
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 const swapId = z.string().regex(/^0x[0-9a-f]{64}$/);
@@ -65,13 +73,16 @@ export const SWAP_PHASES = [
 ] as const;
 export type SwapPhase = (typeof SWAP_PHASES)[number];
 
-export const SwapRecordSchema = z
+const SwapRecordV2 = z
   .object({
     v: z.literal(SWAP_RECORD_VERSION),
-    /** The swap's salt: 32 random bytes, public, the id the sponsor knows the swap by. */
+    /** The swap's PUBLIC id, the one the sponsor knows it by: `swapIdFromSalt(salt)` (a legacy
+     *  derivation-1 record: the salt itself). */
     swapId,
-    /** The key derivation spec's version (core swap-key.ts). */
-    derivation: z.literal(1),
+    /** The "start swap" salt: 32 random bytes. LOCAL ONLY: never sent, never in a URL or a log. */
+    salt: swapId,
+    /** The key derivation spec's version (core swap-key.ts): 2 for new swaps (the warning prompt). */
+    derivation: z.union([z.literal(1), z.literal(2)]),
     network: z.string().regex(/^[a-z0-9-]{1,32}$/),
     vault: hex64,
     evmAddress,
@@ -143,11 +154,35 @@ export const SwapRecordSchema = z
     outcome: z.enum(['swapped', 'bridged-back']).optional(),
     /** Why the swap failed or stopped, as shown to the user. */
     error: z.string().max(500).optional(),
+    /** A failed swap the sponsor says a re-open revives (P4.2-fix C5): the page offers Resume. */
+    recoverable: z.boolean().optional(),
     createdAt: ms,
     updatedAt: ms,
   })
-  .strict();
-export type SwapRecord = z.infer<typeof SwapRecordSchema>;
+  .strict()
+  .superRefine((r, ctx) => {
+    // The id is the salt's (derivation 2), or the salt itself (a legacy derivation-1 record).
+    const want = r.derivation === 1 ? r.salt : swapIdFromSalt(r.salt);
+    if (r.swapId !== want) ctx.addIssue({ code: 'custom', message: "the swap id is not its salt's", path: ['swapId'] });
+  });
 
-/** Terminal phases: nothing more will happen. */
+/** A version-1 record (before P4.2-fix: the salt was the swap's id) as a legacy version 2. */
+function upgradeV1(v: unknown): unknown {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+  const r = v as Record<string, unknown>;
+  if (r.v !== 1 || 'salt' in r || r.derivation !== 1) return v;
+  return { ...r, v: SWAP_RECORD_VERSION, salt: r.swapId };
+}
+
+export const SwapRecordSchema = z.preprocess(upgradeV1, SwapRecordV2);
+export type SwapRecord = z.output<typeof SwapRecordV2>;
+
+/** Terminal phases: nothing more will happen (unless a failed swap is `recoverable`: `isResumable`). */
 export const isFinished = (r: Pick<SwapRecord, 'phase'>) => r.phase === 'done' || r.phase === 'failed';
+
+/** A failed swap the sponsor can revive by a re-open (P4.2-fix C5). */
+export const isRecoverable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
+  r.phase === 'failed' && r.recoverable === true;
+
+/** What the page offers Resume for: not finished, or failed and recoverable. */
+export const isResumable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) => !isFinished(r) || isRecoverable(r);

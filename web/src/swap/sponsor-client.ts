@@ -28,6 +28,7 @@ import {
   OPEN_SWAP_ACTION,
   SponsorApiError,
   SponsorClient,
+  WITHDRAWAL_ENDINGS,
   payloadHash,
   sponsorActionTypedData,
   type NonceResponse,
@@ -103,10 +104,21 @@ const SwapViewShape = z.object({
   deposit: LegProgressSchema.optional(),
   takeTx: optText,
   withdraw: LegProgressSchema.optional(),
+  /** P4.2-fix C1: the latest withdrawal's ending and whether the page must rebuild it (`last`
+   *  absent = null: the sponsor's nulls are dropped). An older sponsor sends none. */
+  withdrawal: z
+    .object({
+      attempts: z.number().int().nonnegative(),
+      last: z.enum(WITHDRAWAL_ENDINGS).optional(),
+      retry: z.boolean(),
+    })
+    .optional(),
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
   /** On `failed`: a stable code, and the sentence for the page. */
   reason: z.string().max(500).optional(),
   message: z.string().max(500).optional(),
+  /** On `failed`: a re-open (resume) revives the swap (P4.2-fix C5). */
+  recoverable: z.boolean().optional(),
 });
 export type SwapView = z.infer<typeof SwapViewShape>;
 export const SwapViewSchema = z.preprocess(dropNulls, SwapViewShape);

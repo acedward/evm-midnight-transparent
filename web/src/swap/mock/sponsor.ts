@@ -13,6 +13,14 @@
 // `{swap}` envelope on `GET /v1/swaps/:id`, `/withdraw` and `/take`, and with `resumed` on open;
 // the page reads them through core's and the wallet's clients, which parse them strictly
 // (web/test/sponsor-client.test.ts checks every answer against core's schemas).
+//
+// And the real sponsor's SEMANTICS (P4.2-fix C1: the mock once counted a refund on the refunded
+// withdrawal itself, which the real sponsor does not, and so the page's specs passed while the page
+// waited forever against the real one): `withdraw.refunds` = the refunds BEFORE the current
+// withdrawal; `withdrawals` = every attempt; `withdrawal = {attempts, last, retry}` says how the
+// latest one ended and whether the page must rebuild; a start that fails after `/withdraw` accepted
+// it (`failFirstStart`) goes back to `minted` with stage `failed`; and a failure can be
+// `recoverable` (C5: a re-open revives it, as the real sponsor revives `funds-not-received`).
 
 import {
   SEPOLIA_CHAIN_ID,
@@ -36,6 +44,9 @@ export interface MockScenario {
   refuseOpen?: string;
   /** Each swap's first `/withdraw` answers 409 stale-vault-state: the page must rebuild and prove again. */
   staleWithdrawOnce?: boolean;
+  /** Each swap's first withdrawal is accepted, then its start fails in the lane (stale vault state or
+   *  nonce at the head of the lane): back to `minted`, `withdrawal.retry` (P4.2-fix C1). */
+  failFirstStart?: boolean;
 }
 
 export interface EvmReader {
@@ -47,6 +58,8 @@ const SCRIPTS = {
   deposit: ['starting', 'started', 'mpc-signed', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
   withdraw: ['started', 'mpc-signed', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
   refund: ['started', 'mpc-signed', 'evm-failed', 'attested', 'refunded'],
+  /** Accepted, then refused at the head of the lane: the start never lands. */
+  failStart: ['queued', 'failed'],
 } as const;
 type ScriptName = keyof typeof SCRIPTS;
 const DEPOSIT_STAGES = SCRIPTS.deposit;
@@ -68,6 +81,14 @@ export interface MockSwap {
   withdrawals: number;
   /** `/withdraw` calls refused as stale (the staleWithdrawOnce scenario). */
   stale: number;
+  /** The earlier withdrawals' views (every attempt stays in `withdrawals`, as the real sponsor's). */
+  earlier?: NonNullable<SwapView['withdraw']>[];
+  /** Withdrawals refunded so far (the next one's `refunds`, as the real sponsor counts). */
+  refunded?: number;
+  /** How the latest withdrawal ended without a transfer, or null. */
+  lastEnding?: 'refunded' | 'start-failed' | 'stale-vault' | null;
+  /** On `failed`: a re-open revives it (C5). */
+  recoverable?: boolean;
 }
 
 export interface MockSponsorDump {
@@ -192,6 +213,14 @@ export class MockSponsor {
       if (existing.owner !== owner || payloadHash(existing.payload) !== payloadHash(p))
         return fail(409, 'conflict', 'this swap exists with other terms');
       existing.token = randomHex(32);
+      if (existing.view.state === 'failed' && existing.recoverable) {
+        // C5: the real sponsor revives a recoverable failure on a re-open (funds-not-received: it
+        // watches the deposit address again).
+        existing.view.state = 'awaiting_funds';
+        delete existing.view.reason;
+        delete existing.view.message;
+        existing.recoverable = false;
+      }
       return json(this.openAnswer(existing, true));
     }
 
@@ -270,21 +299,21 @@ export class MockSponsor {
     };
     const stages = (list: SponsorStage[] | undefined) => (list ?? []).map((x) => ({ stage: x.stage, at: x.at }));
     const d = v.deposit;
-    const w = v.withdraw;
-    const withdraw = w
-      ? {
-          kind: w.colour === s.payload.pay.colour ? ('bridge-back' as const) : ('swap' as const),
-          colour: w.colour ?? s.payload.receive.colour,
-          amount: w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount,
-          stage: w.stage ?? 'queued',
-          stages: stages(w.stages),
-          ...(w.requestId ? { requestId: w.requestId } : {}),
-          ...(w.startTx ? { startTx: w.startTx } : {}),
-          ...(w.sepoliaTx ? { sepoliaTx: w.sepoliaTx } : {}),
-          ...(w.completeTx ? { completeTx: w.completeTx } : {}),
-          refunds: w.refunds ?? 0,
-        }
-      : null;
+    const wire = (w: NonNullable<SwapView['withdraw']>) => ({
+      kind: w.colour === s.payload.pay.colour ? ('bridge-back' as const) : ('swap' as const),
+      colour: w.colour ?? s.payload.receive.colour,
+      amount: w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount,
+      stage: w.stage ?? 'queued',
+      stages: stages(w.stages),
+      ...(w.requestId ? { requestId: w.requestId } : {}),
+      ...(w.startTx ? { startTx: w.startTx } : {}),
+      ...(w.sepoliaTx ? { sepoliaTx: w.sepoliaTx } : {}),
+      ...(w.completeTx ? { completeTx: w.completeTx } : {}),
+      // As the real sponsor: the refunds BEFORE this withdrawal.
+      refunds: w.refunds ?? 0,
+    });
+    const withdraw = v.withdraw ? wire(v.withdraw) : null;
+    const last = s.lastEnding ?? null;
     const now = Math.floor(this.now() / 1000);
     return {
       swapId: v.swapId.replace(/^0x/, ''),
@@ -311,10 +340,16 @@ export class MockSponsor {
         : null,
       takeTx: v.takeTx ?? null,
       withdraw,
-      withdrawals: withdraw ? [withdraw] : [],
+      withdrawals: [...(s.earlier ?? []).map(wire), ...(withdraw ? [withdraw] : [])],
+      withdrawal: {
+        attempts: s.withdrawals,
+        last,
+        retry: last !== null && ['minted', 'taking', 'taken'].includes(v.state),
+      },
       ...(v.outcome ? { outcome: v.outcome } : {}),
       ...(v.reason ? { reason: v.reason } : {}),
       ...(v.message ? { message: v.message } : {}),
+      ...(v.state === 'failed' ? { recoverable: !!s.recoverable } : {}),
       createdAt: s.createdAt ?? now,
       updatedAt: now,
     };
@@ -403,19 +438,36 @@ export class MockSponsor {
     }
     const back = tx.colour === s.payload.pay.colour;
     const refund = !!this.o.scenario.refundFirstWithdrawal && s.withdrawals === 0;
+    const failStart = !!this.o.scenario.failFirstStart && s.withdrawals === 0;
     s.withdrawals++;
-    s.script = refund ? 'refund' : 'withdraw';
+    s.lastEnding = null;
+    if (s.view.withdraw) (s.earlier ??= []).push(structuredClone(s.view.withdraw));
+    s.script = failStart ? 'failStart' : refund ? 'refund' : 'withdraw';
     s.step = 0;
     s.view.state = back ? 'bridging_back' : 'withdrawing';
-    s.view.withdraw = {
-      colour: tx.colour!,
-      requestId: this.o.chain.newHash('withdraw-request'),
-      startTx: `00${this.o.chain.newHash('start-withdraw')}`,
-      stage: 'started',
-      stages: [this.stage('started')],
-      refunds: s.view.withdraw?.refunds ?? 0,
-    };
+    s.view.withdraw = failStart
+      ? { colour: tx.colour!, stage: 'queued', stages: [this.stage('queued')], refunds: s.refunded ?? 0 }
+      : {
+          colour: tx.colour!,
+          requestId: this.o.chain.newHash('withdraw-request'),
+          startTx: `00${this.o.chain.newHash('start-withdraw')}`,
+          stage: 'started',
+          stages: [this.stage('started')],
+          refunds: s.refunded ?? 0,
+        };
     return json({ swap: this.wireView(s) });
+  }
+
+  /** Fail every swap still waiting for its funds (the real sponsor's `funds-not-received` after its
+   *  funding window), recoverable or not (C5). */
+  failAwaitingFunds(recoverable: boolean): void {
+    for (const s of this.swaps.values()) {
+      if (s.view.state !== 'awaiting_funds') continue;
+      s.view.state = 'failed';
+      s.view.reason = 'funds-not-received';
+      s.view.message = 'The funds did not reach the deposit address in time.';
+      s.recoverable = recoverable;
+    }
   }
 
   private stage(stage: string): SponsorStage {
@@ -499,14 +551,19 @@ export class MockSponsor {
       const next = s.script ? SCRIPTS[s.script][++s.step] : undefined;
       const w = v.withdraw;
       if (next === undefined) {
-        if (s.script === 'refund') {
-          // Refunded to the temporary wallet: back to `minted`, the app rebuilds and retries.
+        if (s.script === 'refund' || s.script === 'failStart') {
+          // Refunded to the temporary wallet, or the start never landed (the coin was never spent):
+          // back to `minted` with `withdrawal.retry`; the app rebuilds and retries. As the real
+          // sponsor: the refunded withdrawal's own `refunds` is NOT incremented (it counts the ones
+          // before it); the next withdrawal's is.
           chain.mint(
             s.payload.tempCoinPk,
             w.colour!,
             BigInt(w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount),
           );
-          w.refunds = (w.refunds ?? 0) + 1;
+          if (s.script === 'refund') s.refunded = (s.refunded ?? 0) + 1;
+          s.lastEnding = s.script === 'refund' ? 'refunded' : 'start-failed';
+          s.script = null;
           v.state = 'minted';
           return;
         }
