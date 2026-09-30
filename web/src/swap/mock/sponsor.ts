@@ -22,6 +22,14 @@
 // (`failFirstStart`) goes back to `minted` with stage `failed` and no refund at all (the case the
 // page's counters never saw); a failure can be `recoverable` (C5: a re-open revives it); and the
 // sweep gas may RISE while the swap waits for its funds (`raiseSweepGas`: the page tops up).
+//
+// And a PARTIAL deposit as FS3's sponsor reports it (P4.2-fix3 S2; plan "Lane contracts", P4.2-fix3
+// lane FS3 items 1–8; `partialSweep`): another party's request swept part of the deposit address,
+// won the race and the sponsor completed it, so part of the pay amount is in the temporary wallet
+// and the rest at the address. The swap is `partial` with `partial = {minted, remaining, atAddress,
+// options}`; it deposits the REST by itself once the address holds it and the sweep ETH (then
+// `minted`); Bridge back takes what arrived (`withdraw-params` answers `minted`), and afterwards what
+// waits at the address is deposited and shows as `minted` again, for a second Bridge back.
 
 import {
   SEPOLIA_CHAIN_ID,
@@ -90,6 +98,14 @@ export interface MockSwap {
   lastEnding?: 'refunded' | 'start-failed' | 'stale-vault' | null;
   /** On `failed`: a re-open revives it (C5). */
   recoverable?: boolean;
+  /** A partial deposit (S2): every pay-token base unit minted to the temporary wallet so far (decimal),
+   *  what Bridge backs from `partial` returned, and the pay token last read at the deposit address. */
+  mintedTotal?: string;
+  returned?: string;
+  atAddress?: string;
+  /** The running (or last) Bridge back is of a partial deposit, for `backAmount` (S2). */
+  partialBack?: boolean;
+  backAmount?: string;
 }
 
 export interface MockSponsorDump {
@@ -304,7 +320,7 @@ export class MockSponsor {
     const wire = (w: NonNullable<SwapView['withdraw']>) => ({
       kind: w.colour === s.payload.pay.colour ? ('bridge-back' as const) : ('swap' as const),
       colour: w.colour ?? s.payload.receive.colour,
-      amount: w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount,
+      amount: w.colour === s.payload.pay.colour ? (s.backAmount ?? s.payload.pay.amount) : s.payload.receive.amount,
       stage: w.stage ?? 'queued',
       stages: stages(w.stages),
       ...(w.requestId ? { requestId: w.requestId } : {}),
@@ -340,13 +356,14 @@ export class MockSponsor {
             attempts: 1,
           }
         : null,
+      ...(v.state === 'partial' ? { partial: this.partialOf(s) } : {}),
       takeTx: v.takeTx ?? null,
       withdraw,
       withdrawals: [...(s.earlier ?? []).map(wire), ...(withdraw ? [withdraw] : [])],
       withdrawal: {
         attempts: s.withdrawals,
         last,
-        retry: last !== null && ['minted', 'taking', 'taken'].includes(v.state),
+        retry: last !== null && ['minted', 'taking', 'taken', 'partial'].includes(v.state),
       },
       ...(v.outcome ? { outcome: v.outcome } : {}),
       ...(v.reason ? { reason: v.reason } : {}),
@@ -355,6 +372,25 @@ export class MockSponsor {
       createdAt: s.createdAt ?? now,
       updatedAt: now,
     };
+  }
+
+  /** A partial deposit's report (FS3 item 2): what the temporary wallet holds from deposits, what is
+   *  still to be deposited, what the address held at the last read, and the two options. */
+  private partialOf(s: MockSwap) {
+    const total = BigInt(s.mintedTotal ?? '0');
+    const minted = total - BigInt(s.returned ?? '0');
+    const remaining = BigInt(s.payload.pay.amount) - total;
+    return {
+      minted: minted.toString(),
+      remaining: remaining.toString(),
+      atAddress: s.atAddress ?? '0',
+      options: [...(remaining > 0n ? ['wait' as const] : []), ...(minted > 0n ? ['bridge-back' as const] : [])],
+    };
+  }
+
+  /** What a Bridge back withdraws now: `partial.minted` on `partial` (S2), else the pay amount. */
+  private bridgeBackAmount(s: MockSwap): string {
+    return s.view.state === 'partial' ? this.partialOf(s).minted : s.payload.pay.amount;
   }
 
   // ── /prove and /withdraw ─────────────────────────────────────────────────
@@ -370,17 +406,24 @@ export class MockSponsor {
     if (tx.kind !== 'withdraw') return 'not a withdrawal';
     if (tx.dest !== s.owner) return "not to the swap's EVM address";
     const receive = tx.colour === s.payload.receive.colour && tx.amount === s.payload.receive.amount;
-    const payBack = tx.colour === s.payload.pay.colour && tx.amount === s.payload.pay.amount;
+    const payBack = tx.colour === s.payload.pay.colour && tx.amount === this.bridgeBackAmount(s);
     return receive || payBack ? null : 'not the swap amount of a swap token';
   }
 
   private withdrawParams(s: MockSwap, kind: string | null): Response {
     if (kind !== 'swap' && kind !== 'bridge-back') return fail(400, 'bad-request', 'kind must be swap or bridge-back');
+    // FS3 item 4: a partial deposit bridges back in `partial` only (not while the rest deposits), and
+    // never swaps.
+    if (
+      (s.view.state === 'partial' && kind === 'swap') ||
+      (s.view.state === 'depositing' && s.mintedTotal !== undefined)
+    )
+      return fail(409, 'wrong-state', `the swap is ${s.view.state}`);
     const leg = kind === 'swap' ? s.payload.receive : s.payload.pay;
     return json({
       kind,
       colour: leg.colour,
-      amount: leg.amount,
+      amount: kind === 'swap' ? leg.amount : this.bridgeBackAmount(s),
       erc20Address: this.o.registry.byColour(leg.colour)!.sepoliaAddress,
       dest: s.owner,
       refundRecipient: s.payload.tempCoinPk,
@@ -444,14 +487,17 @@ export class MockSponsor {
     if (!tx?.proven || !tx.bound) return fail(400, 'bad-request', 'expected a proven, bound withdrawal');
     const why = this.refusal(s, tx, 'withdraw');
     if (why) return fail(422, 'refused', why);
-    if (!['minted', 'taking', 'taken'].includes(s.view.state))
-      return fail(409, 'conflict', `the swap is ${s.view.state}`);
+    const partialBack = s.view.state === 'partial' && tx.colour === s.payload.pay.colour;
+    if (!['minted', 'taking', 'taken'].includes(s.view.state) && !partialBack)
+      return fail(409, 'wrong-state', `the swap is ${s.view.state}`);
     if (this.o.scenario.staleWithdrawOnce && s.stale === 0) {
       s.stale++;
       return fail(409, 'stale-vault-state', 'the vault state moved on: rebuild the withdrawal');
     }
     if (tx.evmNonce !== String(this.evmNonce)) return fail(409, 'stale-evm-nonce', 'the vault account moved on');
     const back = tx.colour === s.payload.pay.colour;
+    s.partialBack = partialBack;
+    if (back) s.backAmount = tx.amount!;
     const refund = !!this.o.scenario.refundFirstWithdrawal && s.withdrawals === 0;
     const failStart = !!this.o.scenario.failFirstStart && s.withdrawals === 0;
     if ((this.o.chain.balances(s.payload.tempCoinPk).get(tx.colour!) ?? 0n) < BigInt(tx.amount!))
@@ -494,6 +540,28 @@ export class MockSponsor {
         maxFeePerGas: maxFeePerGas.toString(),
         ethWei: (BigInt(s.sweepGas.gasLimit) * maxFeePerGas).toString(),
       };
+    }
+  }
+
+  /** Another party's request swept `units` of the pay token off the deposit address of every swap
+   *  waiting for or running its deposit, won the sweep race, and the sponsor completed it (S2, the
+   *  audit's F-A32): the units are minted to the temporary wallet, the sponsor's own sweep is
+   *  abandoned, and the swap is `partial`. The caller moves the units (and the sweep ETH the other
+   *  sweep used) off the deposit address in its fake Sepolia. */
+  partialSweep(units: bigint): void {
+    for (const s of this.swaps.values()) {
+      if (s.view.state !== 'awaiting_funds' && s.view.state !== 'depositing') continue;
+      this.o.chain.mint(s.payload.tempCoinPk, s.payload.pay.colour, units);
+      s.mintedTotal = (BigInt(s.mintedTotal ?? '0') + units).toString();
+      s.atAddress = (BigInt(s.payload.pay.amount) - BigInt(s.mintedTotal)).toString();
+      s.script = null;
+      s.step = 0;
+      const v = s.view;
+      v.state = 'partial';
+      const stages = [...(v.deposit?.stages ?? [])];
+      if (v.deposit?.requestId) stages.push(this.stage('abandoned'));
+      stages.push(this.stage('completed-foreign'), this.stage('partial'));
+      v.deposit = { stage: 'partial', stages };
     }
   }
 
@@ -557,6 +625,32 @@ export class MockSponsor {
   private async advance(s: MockSwap): Promise<void> {
     const v = s.view;
     const chain = this.o.chain;
+    if (v.state === 'partial') {
+      // FS3 item 3: the rest is deposited by the sponsor itself once the address holds it and the
+      // sweep ETH.
+      if (!this.evm) return;
+      try {
+        const [token, eth] = await Promise.all([
+          this.evm.erc20Balance(s.erc20Address, s.depositAddress),
+          this.evm.ethBalance(s.depositAddress),
+        ]);
+        s.atAddress = token.toString();
+        const rest = BigInt(s.payload.pay.amount) - BigInt(s.mintedTotal ?? '0');
+        if (rest > 0n && token >= rest && eth >= BigInt(s.sweepGas.ethWei)) {
+          v.state = 'depositing';
+          s.script = 'deposit';
+          s.step = 0;
+          v.deposit = {
+            ...v.deposit,
+            stage: DEPOSIT_STAGES[0],
+            stages: [...(v.deposit?.stages ?? []), this.stage(DEPOSIT_STAGES[0]!)],
+          };
+        }
+      } catch {
+        /* the reads failed: try again next tick */
+      }
+      return;
+    }
     if (v.state === 'awaiting_funds') {
       if (!this.evm) return;
       try {
@@ -578,8 +672,17 @@ export class MockSponsor {
     if (v.state === 'depositing' && v.deposit) {
       const next = DEPOSIT_STAGES[++s.step];
       if (next === undefined) {
+        // The whole pay amount, or after a partial deposit (S2) the rest of it.
+        const total = BigInt(s.mintedTotal ?? '0');
+        chain.mint(s.payload.tempCoinPk, s.payload.pay.colour, BigInt(s.payload.pay.amount) - total);
+        if (s.mintedTotal !== undefined && s.returned !== undefined) {
+          // After a Bridge back of what arrived first: the rest shows as `minted`, to bridge back (FS3 5).
+          s.mintedTotal = s.payload.pay.amount;
+          v.state = 'partial';
+          return;
+        }
+        delete s.mintedTotal;
         v.state = 'minted';
-        chain.mint(s.payload.tempCoinPk, s.payload.pay.colour, BigInt(s.payload.pay.amount));
         if (this.o.scenario.offerGoneAtTake) chain.consume(s.payload.offerId);
         return;
       }
@@ -614,7 +717,9 @@ export class MockSponsor {
             chain.mint(
               s.payload.tempCoinPk,
               w.colour!,
-              BigInt(w.colour === s.payload.pay.colour ? s.payload.pay.amount : s.payload.receive.amount),
+              BigInt(
+                w.colour === s.payload.pay.colour ? (s.backAmount ?? s.payload.pay.amount) : s.payload.receive.amount,
+              ),
             );
           if (s.script === 'refund') {
             s.refunded = (s.refunded ?? 0) + 1;
@@ -622,8 +727,20 @@ export class MockSponsor {
           }
           s.lastEnding = s.script === 'refund' ? 'refunded' : 'start-failed';
           s.script = null;
-          v.state = 'minted';
+          // A Bridge back of a partial deposit goes back to `partial` (FS3 item 4).
+          v.state = s.partialBack ? 'partial' : 'minted';
           return;
+        }
+        if (s.partialBack) {
+          // FS3 item 5: what came back is counted; what waits at the deposit address is deposited
+          // next (then bridged back too); with nothing left to recover the swap is done.
+          s.returned = (BigInt(s.returned ?? '0') + BigInt(s.backAmount ?? '0')).toString();
+          s.partialBack = false;
+          const left = BigInt(s.payload.pay.amount) - BigInt(s.mintedTotal ?? '0');
+          if (left > 0n && BigInt(s.atAddress ?? '0') > 0n) {
+            v.state = 'partial';
+            return;
+          }
         }
         v.outcome = v.state === 'bridging_back' ? 'bridged-back' : 'swapped';
         v.state = 'done';

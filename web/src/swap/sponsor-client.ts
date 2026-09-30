@@ -64,6 +64,8 @@ function dropNulls(v: unknown): unknown {
 export const SWAP_STATES = [
   'awaiting_funds',
   'depositing',
+  /** P4.2-fix3 S2 (FS3): part of the pay amount is in the temporary wallet, the rest not deposited. */
+  'partial',
   'minted',
   'taking',
   'taken',
@@ -105,8 +107,22 @@ const SwapViewShape = z.object({
     .transform((v) => `0x${v.replace(/^0x/i, '').toLowerCase()}`),
   state: z.enum(SWAP_STATES),
   deposit: LegProgressSchema.optional(),
+  /** On `partial` (P4.2-fix3 S2, FS3's wire): the temporary wallet holds PART of the pay amount.
+   *  Read only through ./partial.ts. Unknown options are kept and ignored there. */
+  partial: z
+    .object({
+      minted: decimal,
+      remaining: decimal,
+      atAddress: decimal.optional(),
+      options: z.array(z.string().max(32)).max(8),
+    })
+    .optional(),
   takeTx: optText,
   withdraw: LegProgressSchema.optional(),
+  /** Every withdrawal attempt, oldest first: the page counts the ones that ended without a transfer
+   *  (refunded, or not started) from their stages (P4.2-fix3 S2: a completed Bridge back of a partial
+   *  deposit is an attempt that did NOT end that way). */
+  withdrawals: z.array(LegProgressSchema).optional(),
   /** The sweep gas: it may RISE while the swap waits for its funds (FS's C2); the page tops up. */
   sweepGas: SweepGasSchema.optional(),
   /** P4.2-fix C1: the latest withdrawal's ending and whether the page must rebuild it (`last`

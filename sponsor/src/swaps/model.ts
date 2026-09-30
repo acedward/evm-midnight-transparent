@@ -196,6 +196,8 @@ export interface SwapRecord {
 export const TRANSITIONS: Readonly<Record<SwapState, readonly SwapState[]>> = {
   awaiting_funds: ['depositing', 'failed'],
   depositing: ['minted', 'awaiting_funds', 'failed'],
+  // P4.2-fix3 S2: core's new state (FS3's wire). This sponsor never enters it; FS3 defines its moves.
+  partial: [],
   minted: ['taking', 'taken', 'withdrawing', 'bridging_back', 'failed'],
   taking: ['taken', 'minted', 'withdrawing', 'bridging_back', 'failed'],
   taken: ['withdrawing', 'bridging_back', 'minted', 'failed'],

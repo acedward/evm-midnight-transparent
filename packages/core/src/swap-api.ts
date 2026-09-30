@@ -104,10 +104,15 @@ export type SweepGas = z.infer<typeof SweepGasSchema>;
  *   awaiting_funds → depositing → minted → taking → taken → withdrawing → done
  *                                    └──────────────────→ bridging_back → done   ("Swap is not available")
  *   a refund (the vault's transfer did not happen) → back to minted; any → failed
+ *   awaiting_funds → partial: a completed deposit request minted LESS than the pay amount (e.g. anyone's
+ *   small `startDeposit` that won the deposit address's nonce race); partial → depositing (the sponsor
+ *   deposits the remainder once it is at the address) → minted, or partial → bridging_back (the page
+ *   returns what arrived) (plan 00048 P4.2-fix3, audit S2).
  */
 export const SWAP_STATES = [
   'awaiting_funds',
   'depositing',
+  'partial',
   'minted',
   'taking',
   'taken',
@@ -197,6 +202,31 @@ export const WithdrawalStatusSchema = z.object({
 });
 export type WithdrawalStatus = z.infer<typeof WithdrawalStatusSchema>;
 
+/** What a `partial` swap lets the page do (plan 00048 P4.2-fix3, audit S2):
+ *  - `wait`: the sponsor deposits the remainder BY ITSELF once the deposit address holds `remaining` of
+ *    the pay token and the sweep's ETH (`sweepGas.ethWei`, which may rise); the page tops the address up
+ *    with what is missing (usually only ETH: a foreign sweep paid its gas from the address);
+ *  - `bridge-back`: `withdraw-params?kind=bridge-back` answers `amount = minted`, and the usual
+ *    build → /prove → /withdraw returns what the temporary wallet received. */
+export const PARTIAL_OPTIONS = ['wait', 'bridge-back'] as const;
+export type PartialOption = (typeof PARTIAL_OPTIONS)[number];
+
+const baseUnits = z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units');
+
+/** The `partial` state's amounts (present iff `state === 'partial'`), pay-token base units. */
+export const PartialDepositSchema = z.object({
+  /** What the temporary wallet holds from completed deposits (every completed request for its recipient,
+   *  whoever started it), minus what a Bridge back from `partial` already returned. */
+  minted: baseUnits,
+  /** What is still to be deposited for the wallet to hold the whole pay amount. */
+  remaining: baseUnits,
+  /** The pay token the sponsor last read at the deposit address (informative). */
+  atAddress: baseUnits,
+  /** `wait` iff `remaining > 0`; `bridge-back` iff `minted > 0`. */
+  options: z.array(z.enum(PARTIAL_OPTIONS)),
+});
+export type PartialDeposit = z.infer<typeof PartialDepositSchema>;
+
 export const SwapLegViewSchema = z.object({
   colour: z.string(),
   amount: z.string(),
@@ -227,6 +257,9 @@ export const SwapViewSchema = z.object({
   /** Whether the page should rebuild and retry the withdrawal now (audit C1). This sponsor always
    *  sends it; optional in the schema only so views recorded before the field still parse. */
   withdrawal: WithdrawalStatusSchema.optional(),
+  /** On `partial` (always present then): what arrived, what is missing, and what the page may do
+   *  (audit S2). */
+  partial: PartialDepositSchema.optional(),
   /** On `done`. */
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
   /** On `failed`: a stable code, and a sentence for the page. */
@@ -352,7 +385,8 @@ export const SWAP_ERRORS = {
   offerMismatch: 'offer-mismatch',
   /** 422: the transaction is not the one this swap may have proven or paid for (detail says why). */
   invalidTx: 'invalid-tx',
-  /** 409: the vault moved since the transaction was built: rebuild and prove again. */
+  /** 409: the vault moved since the transaction was built: rebuild and prove again. Also (detail
+   *  `approval-outdated`) at `/withdraw`, for a proof approved by an older sponsor (audit S8). */
   staleVaultState: 'stale-vault-state',
   /** 409: the EVM nonce is not the one the sponsor's withdrawal lane expects next (the vault
    *  account's pending nonce past this sponsor's live reservations), or the gas it signs no longer
@@ -365,7 +399,8 @@ export const SWAP_ERRORS = {
   /** 429: the swap's proof budget is spent. */
   proofBudget: 'proof-budget',
   /** 429: too many open swaps for this EVM address, or its daily swap allowance is used, or (detail
-   *  `client`) too many swaps waiting for funds from this client (its IPv4 address or IPv6 /64). */
+   *  `client`) too many swaps waiting for funds from this client (its IPv4 address or IPv6 /48). A
+   *  swap waits for funds until its WHOLE pay amount reached the deposit address (audit S5). */
   tooManySwaps: 'too-many-swaps',
   /** 422: a new swap (or the revival of one that received nothing) needs the EVM address to hold the
    *  pay amount of the pay token (detail `token`) and the sweep's ETH (detail `eth`) (audit R4). */
