@@ -1,7 +1,8 @@
-// Badges and pills: short labels that classify a row or a value.
+// Badges and pills: short labels that classify a row or a value (rounded pills; the accent tone is
+// the magenta tint).
 //
 //   <Badge tone="green">Two-sided</Badge>            a market's status
-//   <NetworkBadge network="sepolia" />               "SEPOLIA" (on the masthead, or onLight)
+//   <NetworkBadge network="sepolia" />               a "Sepolia" chip with a dot (in the header, or onLight)
 //   <StatusPill status="live">Live</StatusPill>      an offer's or transfer's state, with a dot
 //   <NoValue>no liquidity</NoValue>                  a value that is deliberately absent
 //   <YoursBadge />                                   the account's own offer in a book
@@ -10,7 +11,7 @@ import type { HTMLAttributes, ReactNode } from 'react';
 
 import { cx } from './format.js';
 
-export type BadgeTone = 'navy' | 'gold' | 'grey' | 'green' | 'red';
+export type BadgeTone = 'accent' | 'amber' | 'grey' | 'green' | 'red';
 
 export function Badge({ tone = 'grey', className, ...rest }: HTMLAttributes<HTMLSpanElement> & { tone?: BadgeTone }) {
   return <span className={cx('tag', `tag-${tone}`, className)} {...rest} />;
@@ -42,7 +43,7 @@ export function NoValue({ className, ...rest }: HTMLAttributes<HTMLSpanElement>)
 
 export function YoursBadge({ children = 'Your offer', ...rest }: HTMLAttributes<HTMLSpanElement>) {
   return (
-    <Badge tone="gold" {...rest}>
+    <Badge tone="accent" {...rest}>
       {children}
     </Badge>
   );

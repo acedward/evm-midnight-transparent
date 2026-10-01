@@ -1,5 +1,5 @@
 // The vertical stage tracker for long jobs (opening an account, a bridge transfer): done stages
-// in navy with a tick, the current one ringed in gold, the rest waiting in grey.
+// in magenta with a tick, the current one ringed in magenta with a soft glow, the rest waiting in grey.
 //
 //   <StageTracker label="Deposit 25.00 stkA" stages={[
 //     { key: 'sent', title: 'Tokens sent', state: 'done', time: '14:06',

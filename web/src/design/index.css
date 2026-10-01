@@ -1,4 +1,5 @@
-/* The design system's styles (copied from MN Bank), in cascade order. Imported once, by web/src/main.tsx. */
+/* The design system's styles (adapted from MN Bank, restyled in P4.4), in cascade order. Imported once, by
+   web/src/main.tsx (the font face is in fonts.css, imported by fonts.ts). */
 @import './tokens.css';
 @import './base.css';
 @import './components.css';

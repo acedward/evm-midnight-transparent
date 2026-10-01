@@ -1,6 +1,6 @@
 // Buttons, at least 44 px tall (the small size grows to 44 px on touch screens).
 //
-//   <Button onClick={…}>Open account</Button>                       primary (navy)
+//   <Button onClick={…}>Open account</Button>                       primary (magenta)
 //   <Button variant="secondary" size="small">Refresh</Button>
 //   <Button variant="danger">CLEAR ALL</Button>
 //   <Button variant="link">Close</Button>                           an inline text action

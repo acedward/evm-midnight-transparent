@@ -5,7 +5,7 @@
 //             note="Stocks are valued at the best bid…" />
 //     <Figure label="Ethereum (Sepolia)" value={<Money … />} />
 //   </Figures>
-//   <PendingItem what="Deposit 25.00 stkA to wStkA" badge={<Badge tone="gold">5 of 7</Badge>}
+//   <PendingItem what="Deposit 25.00 stkA to wStkA" badge={<Badge tone="accent">5 of 7</Badge>}
 //                state="Waiting for Sepolia finality" meta={<>request <Hash value={id} /></>} />
 
 import type { HTMLAttributes, ReactNode } from 'react';
