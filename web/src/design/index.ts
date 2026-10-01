@@ -1,5 +1,6 @@
-// The design system, copied from MN Bank (acedward/passport-evm-dapp @ 911647b): tokens and styles
-// in ./index.css (imported once by main.tsx), components below.
+// The design system, adapted from MN Bank (acedward/passport-evm-dapp @ 911647b) and restyled in P4.4
+// (light, one magenta accent): tokens and styles in ./index.css (imported once by main.tsx), components
+// below.
 
 export { Badge, NetworkBadge, NoValue, StatusPill, YoursBadge } from './Badge.js';
 export type { BadgeTone, PillStatus } from './Badge.js';

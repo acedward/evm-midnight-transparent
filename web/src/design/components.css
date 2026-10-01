@@ -1,7 +1,7 @@
 /*
- * Components, copied from MN Bank's design system (following its approved mockup). Class names match
- * the React components in web/src/design/*.tsx; pages should use the components rather than
- * these classes directly. Colours come only from tokens.css.
+ * Components (P4.4 restyle: light, modern, one magenta accent). Class names match the React
+ * components in web/src/design/*.tsx; pages should use the components rather than these classes
+ * directly. Colours, shadows and radii come only from tokens.css.
  */
 
 /* ── app frame ─────────────────────────────────────────────────────── */
@@ -13,12 +13,12 @@
 .app > main {
   flex: 1 0 auto;
   width: 100%;
-  padding-top: var(--space-7);
+  padding-top: var(--space-8);
   padding-bottom: var(--space-9);
 }
 @media (max-width: 480px) {
   .app > main {
-    padding-top: var(--space-5);
+    padding-top: var(--space-6);
   }
 }
 .app-banner {
@@ -33,12 +33,11 @@
   display: none;
 }
 
-/* ── masthead ──────────────────────────────────────────────────────── */
+/* ── header (masthead + tab bar: one white block) ──────────────────── */
 .masthead {
   position: relative;
-  background: var(--navy);
-  color: var(--on-navy);
-  border-bottom: 2px solid var(--gold);
+  background: var(--surface);
+  color: var(--ink);
 }
 .masthead-inner {
   display: flex;
@@ -46,8 +45,8 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3) var(--space-6);
-  padding-top: 14px;
-  padding-bottom: 14px;
+  padding-top: var(--space-4);
+  padding-bottom: var(--space-3);
 }
 .brand {
   display: flex;
@@ -55,47 +54,45 @@
   gap: var(--space-3);
   margin: 0;
   font: inherit;
-  color: var(--on-navy);
+  color: var(--ink);
 }
 .brand a {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  color: var(--on-navy);
+  color: var(--ink);
   text-decoration: none;
+  border-radius: var(--radius);
 }
 .brand a:hover {
-  color: var(--on-navy);
+  color: var(--ink);
 }
-.brand a:focus-visible {
-  outline-color: var(--on-navy);
-}
+/* The logo mark: the two letters on a magenta tile. */
 .monogram {
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   flex: none;
   display: grid;
   place-items: center;
-  border: 1px solid var(--gold);
-  outline: 1px solid var(--gold);
-  outline-offset: -5px;
-  font: 700 1rem/1 var(--serif);
-  letter-spacing: 0.02em;
-  color: var(--on-navy);
+  border-radius: 12px;
+  background-color: var(--accent);
+  background-image: linear-gradient(140deg, var(--accent-bright) 0%, var(--accent) 52%, var(--accent-deep) 100%);
+  box-shadow: var(--shadow-accent);
+  font: 700 0.875rem/1 var(--sans);
+  letter-spacing: -0.01em;
+  color: var(--on-accent);
 }
 .brand-name {
   display: block;
-  font: 400 var(--text-xl) / 1.1 var(--serif);
-  letter-spacing: 0.01em;
-  color: var(--on-navy);
+  font: 680 1.0625rem/1.2 var(--sans);
+  letter-spacing: -0.016em;
+  color: var(--ink);
 }
 .brand-tagline {
   display: block;
-  margin-top: 3px;
-  font: 600 0.6875rem/1.2 var(--sans);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--on-navy-muted);
+  margin-top: 2px;
+  font: 450 var(--text-sm) / 1.3 var(--sans);
+  color: var(--muted);
 }
 .identity {
   display: flex;
@@ -113,45 +110,55 @@
   min-width: 0;
 }
 .id-chip .id-label {
-  color: var(--on-navy-muted);
+  color: var(--muted);
 }
 .id-chip .id-value {
   font-family: var(--mono);
   font-size: var(--text-sm);
-  color: var(--on-navy);
+  color: var(--ink);
+  background: var(--surface-alt);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
 }
 .id-chip .id-none {
-  color: var(--on-navy-muted);
+  color: var(--muted);
   font-style: italic;
 }
+/* Network chips: a pill with a dot (the Sepolia dot is green: the wallet is on the right chain). */
 .net {
-  display: inline-block;
-  font: 600 0.6875rem/1 var(--sans);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  padding: 4px 7px;
-  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 600 var(--text-xs) / 1 var(--sans);
+  letter-spacing: 0.01em;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
   white-space: nowrap;
 }
-.net-sepolia {
-  background: var(--sepolia-bg);
-  border: 1px solid var(--sepolia-border);
-  color: var(--on-navy);
+.net::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
 }
-.net-midnight {
-  border: 1px solid var(--gold);
-  color: var(--on-navy-gold);
-}
-/* The same badges on a light surface (inside the page, not the masthead). */
+.net-sepolia,
 .net-light.net-sepolia {
-  background: var(--navy-soft);
-  border-color: var(--navy-soft-border);
-  color: var(--navy);
+  background: var(--surface-alt);
+  border-color: var(--rule);
+  color: var(--slate);
 }
+.net-sepolia::before {
+  background: var(--positive);
+}
+.net-midnight,
 .net-light.net-midnight {
-  background: var(--gold-soft);
-  border-color: var(--gold-soft-border);
-  color: var(--gold-ink);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-border);
+  color: var(--accent-ink);
 }
 .wallet-area {
   position: relative;
@@ -163,14 +170,14 @@
 .wallet-menu {
   position: absolute;
   right: 0;
-  top: calc(100% + 6px);
+  top: calc(100% + 8px);
   z-index: 5;
   width: min(320px, calc(100vw - 2 * var(--gutter)));
   background: var(--surface);
   color: var(--ink);
-  border: 1px solid var(--rule);
-  border-top: 3px solid var(--navy);
-  border-radius: var(--radius);
+  border: var(--rule-hair);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-md);
   padding: var(--space-3);
   display: flex;
   flex-direction: column;
@@ -179,6 +186,8 @@
 .wallet-menu .wallet-menu-title {
   font-weight: 600;
   font-size: var(--text-md);
+  color: var(--muted);
+  padding: 2px 4px;
 }
 .wallet-menu .btn {
   justify-content: flex-start;
@@ -186,75 +195,83 @@
 }
 .wallet-menu img {
   flex: none;
+  border-radius: 6px;
 }
 .masthead .wallet-error {
   flex-basis: 100%;
 }
-/* On a phone the menu spans the page under the masthead instead of hanging off the button. */
+/* Disconnect: a quiet text action in the header (magenta on hover). */
+.masthead .btn-link {
+  color: var(--slate);
+  font-weight: 500;
+  text-decoration-color: var(--rule-strong);
+}
+.masthead .btn-link:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+/* On a phone the menu spans the page under the header instead of hanging off the button, and the
+   chips speak for themselves: their "Wallet" / "Network" labels stay for screen readers only. */
 @media (max-width: 640px) {
   .wallet-area {
     position: static;
   }
+  .id-chip .id-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
   .wallet-menu {
-    top: calc(100% + 2px);
+    top: calc(100% + 4px);
     left: var(--gutter);
     right: var(--gutter);
     width: auto;
   }
 }
 
-/* ── tab bar ───────────────────────────────────────────────────────── */
+/* ── tab bar: pills, the current one in the magenta tint ───────────── */
 .tabs {
   background: var(--surface);
   border-bottom: var(--rule-hair);
+  box-shadow: var(--shadow-xs);
 }
 .tabs ul {
   list-style: none;
-  margin: 0;
-  padding: 0;
+  margin: 0 -4px;
+  padding: 4px 4px 12px;
   display: flex;
-  gap: var(--space-7);
+  gap: var(--space-1);
   overflow-x: auto;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 .tabs a {
   display: flex;
   align-items: center;
-  min-height: var(--tap);
-  padding: 11px 2px 8px;
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: var(--radius-pill);
   color: var(--slate);
   text-decoration: none;
   white-space: nowrap;
   font-weight: 600;
-  font-size: 0.9375rem;
-  border-bottom: 3px solid transparent;
+  font-size: var(--text-md);
   transition:
     color var(--motion-fast),
-    border-color var(--motion-fast);
+    background-color var(--motion-fast);
 }
 .tabs a:hover {
-  color: var(--navy);
-  border-bottom-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface-alt);
 }
 .tabs a[aria-current='page'] {
-  color: var(--navy);
-  border-bottom-color: var(--navy);
+  color: var(--accent-ink);
+  background: var(--accent-soft);
 }
 .tabs a:focus-visible {
-  outline-offset: -2px;
-}
-@media (max-width: 480px) {
-  .tabs ul {
-    gap: 18px;
-  }
-}
-@media (max-width: 400px) {
-  .tabs ul {
-    gap: 14px;
-  }
-  .tabs a {
-    font-size: var(--text-md);
-  }
+  outline-offset: 0;
 }
 
 /* ── page scaffolding ──────────────────────────────────────────────── */
@@ -264,18 +281,23 @@
   align-items: flex-end;
   justify-content: space-between;
   gap: var(--space-3) var(--space-6);
-  padding-bottom: 18px;
-  margin-bottom: var(--space-6);
-  border-bottom: var(--rule-hair);
+  margin-bottom: var(--space-7);
+}
+.page-head .eyebrow {
+  margin-bottom: var(--space-2);
 }
 .page-title {
   font-size: var(--text-2xl);
-  line-height: 1.2;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: var(--tracking-tight);
 }
 .page-head .lede {
   color: var(--slate);
-  margin-top: 6px;
-  max-width: 62ch;
+  font-size: 1rem;
+  line-height: 1.6;
+  margin-top: var(--space-3);
+  max-width: 64ch;
 }
 .page-head-actions {
   display: flex;
@@ -302,8 +324,9 @@
 .panel {
   background: var(--surface);
   border: var(--rule-hair);
-  border-radius: var(--radius);
-  padding: var(--space-5);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-6);
   min-width: 0;
 }
 .panel + .panel {
@@ -311,20 +334,28 @@
 }
 .panel-quiet {
   background: var(--surface-alt);
+  box-shadow: none;
 }
+/* The one card that invites an action: a magenta cap and a faint magenta glow. */
 .panel-accent {
-  border-top: 3px solid var(--gold);
+  border-color: var(--accent-soft-border);
+  background:
+    linear-gradient(90deg, var(--accent), var(--accent-bright)) top / 100% 3px no-repeat,
+    var(--surface);
+  box-shadow: var(--shadow-accent-soft);
 }
 .panel-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: var(--space-1) var(--space-4);
-  margin-bottom: 14px;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-4);
 }
 .panel-title {
   font-size: var(--text-xl);
+  font-weight: 650;
+  letter-spacing: -0.016em;
 }
 .panel-quiet .panel-title,
 .panel-title-sm {
@@ -340,12 +371,12 @@
 }
 .panel-intro {
   color: var(--slate);
-  margin-bottom: var(--space-4);
+  margin-bottom: var(--space-5);
 }
 .table-note {
   color: var(--muted);
   font-size: var(--text-sm);
-  margin-top: 10px;
+  margin-top: var(--space-4);
 }
 @media (max-width: 480px) {
   .panel {
@@ -360,61 +391,69 @@
   justify-content: center;
   gap: var(--space-2);
   min-height: var(--tap);
-  padding: 0 18px;
-  font: 600 0.9375rem/1 var(--sans);
-  border: 1px solid var(--navy);
+  padding: 0 20px;
+  font: 600 var(--text-base) / 1 var(--sans);
+  letter-spacing: -0.005em;
+  border: 1px solid var(--accent);
   border-radius: var(--radius);
-  background: var(--navy);
+  background: var(--accent);
   color: var(--on-accent);
+  box-shadow: var(--shadow-accent);
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
   transition:
     background-color var(--motion-fast),
     border-color var(--motion-fast),
-    color var(--motion-fast);
+    color var(--motion-fast),
+    box-shadow var(--motion-fast);
 }
 .btn:hover {
-  background: var(--navy-hover);
-  border-color: var(--navy-hover);
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
   color: var(--on-accent);
+}
+.btn:active:not(:disabled) {
+  box-shadow: var(--shadow-xs);
 }
 .btn-secondary {
   background: var(--surface);
-  color: var(--navy);
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  box-shadow: var(--shadow-xs);
 }
 .btn-secondary:hover {
-  background: var(--navy-soft);
-  color: var(--navy);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-border);
+  color: var(--accent-ink);
 }
 .btn-danger {
   background: var(--danger);
   border-color: var(--danger);
-  letter-spacing: 0.04em;
+  box-shadow: var(--shadow-xs);
+  letter-spacing: 0.03em;
 }
 .btn-danger:hover {
   background: var(--danger-hover);
   border-color: var(--danger-hover);
 }
-/* On the navy masthead. */
+/* The header's call to action (Connect wallet, Switch network): the primary look. */
 .btn-inverse {
-  background: var(--on-navy);
-  border-color: var(--on-navy);
-  color: var(--navy);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
 }
 .btn-inverse:hover {
-  background: var(--surface);
-  border-color: var(--surface);
-  color: var(--navy);
-}
-.btn-inverse:focus-visible {
-  outline-color: var(--on-navy);
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--on-accent);
 }
 /* Small buttons are compact on a desktop, and 44 px tall on a phone or any touch screen. */
 .btn-small {
-  min-height: 32px;
-  padding: 0 12px;
-  font-size: var(--text-sm);
+  min-height: 34px;
+  padding: 0 14px;
+  font-size: var(--text-md);
+  border-radius: 8px;
 }
 @media (max-width: 640px), (pointer: coarse) {
   .btn-small {
@@ -426,6 +465,7 @@
   background: var(--disabled-bg);
   border-color: var(--disabled-border);
   color: var(--disabled-ink);
+  box-shadow: none;
   cursor: not-allowed;
 }
 .btn-link {
@@ -434,21 +474,21 @@
   border: 0;
   padding: 0;
   min-height: 0;
-  color: var(--navy);
+  color: var(--accent);
   font: 600 var(--text-md) / 1.4 var(--sans);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration-color: var(--accent-soft-border);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
   cursor: pointer;
 }
 .btn-link:hover {
-  color: var(--navy-hover);
+  color: var(--accent-hover);
+  text-decoration-color: currentColor;
 }
 .btn-link:disabled {
   color: var(--disabled-ink);
   cursor: not-allowed;
-}
-.masthead .btn-link {
-  color: var(--on-navy);
 }
 .btn-row {
   display: flex;
@@ -464,8 +504,8 @@
 
 /* ── tooltip: why a control is greyed out (Tooltip.tsx, AA 00044) ──── */
 /* The wrapper is what is hovered, focused and tapped: a disabled control lets pointer events
-   through to it. The bubble opens above, right-aligned to the control (the book's Action column
-   is at the right edge), and wraps within the page at 375 px. */
+   through to it. The bubble opens above, right-aligned to the control, and wraps within the page
+   at 375 px. */
 .tip {
   position: relative;
   display: inline-block;
@@ -482,15 +522,16 @@
   display: none;
   position: absolute;
   right: 0;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + 8px);
   z-index: 20;
   width: max-content;
   max-width: min(18rem, calc(100vw - 2 * var(--space-4)));
-  padding: 6px 10px;
-  border-radius: var(--radius);
-  background: var(--navy);
-  color: var(--on-navy);
-  font: 400 var(--text-sm) / 1.4 var(--sans);
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--tooltip-bg);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-md);
+  font: 450 var(--text-sm) / 1.45 var(--sans);
   letter-spacing: normal;
   text-align: left;
   text-transform: none;
@@ -501,68 +542,91 @@
   display: block;
 }
 
-/* ── badges and statuses ───────────────────────────────────────────── */
+/* ── badges and statuses: pills ────────────────────────────────────── */
 .tag {
   display: inline-block;
-  font: 600 0.6875rem/1 var(--sans);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  padding: 4px 7px;
-  border-radius: var(--radius-sm);
+  font: 600 var(--text-xs) / 1 var(--sans);
+  letter-spacing: 0.01em;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
   white-space: nowrap;
   vertical-align: middle;
 }
-.tag-navy {
-  background: var(--navy-soft);
-  color: var(--navy);
-  border: 1px solid var(--navy-soft-border);
+.tag::first-letter {
+  text-transform: uppercase;
 }
-.tag-gold {
-  background: var(--gold-soft);
-  color: var(--gold-ink);
-  border: 1px solid var(--gold-soft-border);
+.tag-accent {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: var(--accent-soft-border);
+}
+.tag-amber {
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  border-color: var(--warn-soft-border);
 }
 .tag-grey {
   background: var(--surface-alt);
   color: var(--slate);
-  border: 1px solid var(--rule);
+  border-color: var(--rule);
 }
 .tag-green {
   background: var(--positive-soft);
   color: var(--positive);
-  border: 1px solid var(--positive-soft-border);
+  border-color: var(--positive-soft-border);
 }
 .tag-red {
   background: var(--danger-soft);
   color: var(--danger);
-  border: 1px solid var(--danger-soft-border);
+  border-color: var(--danger-soft-border);
 }
 .status {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  padding: 4px 10px 4px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-alt);
+  color: var(--slate);
   font-weight: 600;
-  font-size: var(--text-md);
+  font-size: var(--text-sm);
+  line-height: 1.25;
   white-space: nowrap;
 }
 .status::before {
   content: '';
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: currentColor;
   flex: none;
 }
 .st-live {
   color: var(--positive);
+  background: var(--positive-soft);
+}
+.st-live::before {
+  animation: live-pulse 2.4s ease-out infinite;
+}
+@keyframes live-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--positive-halo);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 6px transparent;
+  }
 }
 .st-filled,
 .st-done {
-  color: var(--navy);
+  color: var(--accent-ink);
+  background: var(--accent-soft);
 }
 .st-cancelled,
 .st-idle {
   color: var(--muted);
+  background: var(--surface-alt);
 }
 .st-cancelled::before,
 .st-idle::before {
@@ -571,12 +635,15 @@
 }
 .st-progress {
   color: var(--warn-ink);
+  background: var(--warn-soft);
 }
 .st-refunded {
-  color: var(--gold-ink);
+  color: var(--slate);
+  background: var(--surface-alt);
 }
 .st-failed {
   color: var(--danger);
+  background: var(--danger-soft);
 }
 /* "no liquidity", "not valued", "no bids": a value that is deliberately absent. */
 .no-value {
@@ -593,20 +660,21 @@
   font-weight: 600;
 }
 
-/* ── notices ───────────────────────────────────────────────────────── */
+/* ── notices: tinted callouts ──────────────────────────────────────── */
 .notice {
-  border: var(--rule-hair);
-  border-left: 4px solid var(--navy);
-  background: var(--surface);
-  padding: var(--space-3) 14px;
-  border-radius: var(--radius-sm);
-  font-size: 0.9375rem;
+  border: 1px solid var(--accent-soft-border);
+  background: var(--accent-soft);
+  color: var(--ink);
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  font-size: var(--text-base);
+  line-height: 1.55;
   overflow-wrap: anywhere;
 }
 .notice strong,
 .notice .notice-title {
-  color: var(--navy);
-  font-weight: 700;
+  color: var(--accent-ink);
+  font-weight: 650;
 }
 .notice ul {
   margin: var(--space-2) 0 0;
@@ -614,7 +682,6 @@
 }
 .notice-warn {
   border-color: var(--warn-soft-border);
-  border-left-color: var(--gold);
   background: var(--warn-soft);
 }
 .notice-warn strong,
@@ -623,7 +690,6 @@
 }
 .notice-danger {
   border-color: var(--danger-soft-border);
-  border-left-color: var(--danger);
   background: var(--danger-soft);
 }
 .notice-danger strong,
@@ -632,7 +698,6 @@
 }
 .notice-success {
   border-color: var(--positive-soft-border);
-  border-left-color: var(--positive);
   background: var(--positive-soft);
 }
 .notice-success strong,
@@ -652,18 +717,18 @@
   color: var(--muted);
   text-align: left;
   vertical-align: bottom;
-  padding: 0 var(--space-3) var(--space-2);
+  padding: 0 var(--space-3) var(--space-3);
   border-bottom: var(--rule-head);
 }
 .ledger th .th-sub {
   display: block;
   text-transform: none;
   letter-spacing: 0;
-  font-weight: 400;
+  font-weight: 450;
   font-size: var(--text-xs);
 }
 .ledger td {
-  padding: var(--space-3);
+  padding: var(--space-4) var(--space-3);
   border-bottom: var(--rule-hair);
   vertical-align: top;
 }
@@ -678,10 +743,14 @@
 .ledger .r {
   text-align: right;
 }
+.ledger td .num,
+.ledger td.num {
+  font-weight: 500;
+}
 .ledger tfoot td {
-  border-top: 1px solid var(--ink);
+  border-top: 1px solid var(--rule-strong);
   border-bottom: var(--rule-total);
-  font-weight: 700;
+  font-weight: 650;
   padding-top: 10px;
   padding-bottom: 10px;
 }
@@ -699,16 +768,16 @@
   text-align: left;
 }
 .cell-asset .sym {
-  font-weight: 700;
+  font-weight: 650;
   color: var(--ink);
 }
-/* A symbol that opens something (the Markets book): full size, still a link. */
+/* A symbol that opens something: full size, still a link. */
 .cell-asset .sym .btn-link,
 .cell-asset .btn-link.sym {
-  font: 700 var(--text-base) / 1.4 var(--sans);
+  font: 650 var(--text-base) / 1.4 var(--sans);
 }
-/* A value with a second line under it ("largest single payment", a time): one block, so the
-   stacked phone layout keeps the second line under the value. */
+/* A value with a second line under it: one block, so the stacked phone layout keeps the second
+   line under the value. */
 .num-wrap {
   display: inline-block;
   text-align: right;
@@ -728,7 +797,7 @@
   color: var(--muted);
   font-size: var(--text-sm);
   font-weight: 400;
-  margin-top: 2px;
+  margin-top: 3px;
   white-space: nowrap;
 }
 .sub.multiline {
@@ -740,10 +809,10 @@
   word-break: break-all;
 }
 .row-selected td {
-  background: var(--gold-soft);
+  background: var(--accent-soft);
 }
 .row-selected td:first-child {
-  box-shadow: inset 3px 0 0 var(--gold);
+  box-shadow: inset 3px 0 0 var(--accent);
   padding-left: var(--space-3);
 }
 .row-empty td {
@@ -767,19 +836,19 @@
     display: block;
     width: 100%;
   }
+  /* Each row becomes a small card of its own. */
   .ledger.stack tbody tr {
-    padding: var(--space-3) 0;
-    border-bottom: var(--rule-hair);
+    padding: var(--space-3) 14px;
+    background: var(--paper);
+    border: var(--rule-hair);
+    border-radius: var(--radius);
   }
-  .ledger.stack tbody tr:first-child {
-    border-top: var(--rule-head);
-  }
-  .ledger.stack tbody tr:last-child {
-    border-bottom: 0;
+  .ledger.stack tbody tr + tr {
+    margin-top: 10px;
   }
   .ledger.stack td {
     border: 0;
-    padding: 3px 0;
+    padding: 4px 0;
     display: flex;
     justify-content: space-between;
     align-items: baseline;
@@ -791,7 +860,7 @@
     flex: none;
     color: var(--muted);
     font-size: var(--text-sm);
-    font-weight: 400;
+    font-weight: 450;
     text-align: left;
   }
   .ledger.stack td > * {
@@ -818,7 +887,7 @@
     display: none;
   }
   .ledger.stack tfoot tr {
-    border-top: 1px solid var(--ink);
+    border-top: 1px solid var(--rule-strong);
     border-bottom: var(--rule-total);
     padding: var(--space-2) 0;
   }
@@ -831,8 +900,8 @@
     padding-left: 0;
   }
   .ledger.stack tr.row-selected {
-    box-shadow: inset 3px 0 0 var(--gold);
-    background: var(--gold-soft);
+    box-shadow: inset 3px 0 0 var(--accent);
+    background: var(--accent-soft);
     padding-left: var(--space-3);
     padding-right: var(--space-2);
   }
@@ -860,11 +929,11 @@
   display: block;
   text-transform: none;
   letter-spacing: 0.02em;
-  font-weight: 400;
+  font-weight: 450;
 }
 .book td {
   text-align: right;
-  padding: 9px var(--space-2);
+  padding: 10px var(--space-2);
   border-bottom: var(--rule-hair);
   vertical-align: middle;
 }
@@ -896,25 +965,25 @@
 
 /* ── money ─────────────────────────────────────────────────────────── */
 .money-unit {
-  font-size: var(--text-md);
-  font-weight: 600;
+  font-size: 0.85em;
+  font-weight: 550;
   color: var(--muted);
   margin-left: 4px;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.01em;
 }
 
-/* ── summary figures (the statement's top strip) ───────────────────── */
+/* ── summary figures (a top strip of key numbers) ──────────────────── */
 .figures {
   display: grid;
   grid-template-columns: 1.6fr 1fr 1fr;
   background: var(--surface);
   border: var(--rule-hair);
-  border-top: 3px solid var(--navy);
-  border-radius: var(--radius);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sm);
   margin-bottom: var(--space-7);
 }
 .figure {
-  padding: 18px var(--space-5);
+  padding: var(--space-5) var(--space-6);
   min-width: 0;
 }
 .figure + .figure {
@@ -922,15 +991,17 @@
 }
 .figure .figure-value {
   display: block;
-  font: 600 var(--text-xl) / 1.2 var(--sans);
+  font: 650 var(--text-xl) / 1.2 var(--sans);
+  font-variant-numeric: tabular-nums lining-nums;
   color: var(--ink);
   margin-top: var(--space-2);
   overflow-wrap: anywhere;
 }
 .figure-main .figure-value {
   font-size: var(--text-2xl);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
   line-height: 1.15;
-  color: var(--navy);
   margin-top: 6px;
 }
 .figure .figure-note {
@@ -1018,16 +1089,17 @@
   margin-top: 2px;
 }
 .progress {
-  height: 4px;
-  background: var(--rule);
-  border-radius: 2px;
+  height: 6px;
+  background: var(--accent-soft);
+  border-radius: var(--radius-pill);
   margin-top: var(--space-2);
   overflow: hidden;
 }
 .progress > span {
   display: block;
   height: 100%;
-  background: var(--navy);
+  border-radius: inherit;
+  background: var(--accent);
 }
 .pending-item .actions {
   margin-top: var(--space-2);
@@ -1046,7 +1118,7 @@
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-2) var(--space-3);
   font-size: var(--text-md);
   color: var(--slate);
 }
@@ -1073,7 +1145,7 @@
   margin-bottom: var(--space-2);
 }
 .book-side-head h4 {
-  font-size: 1.0625rem;
+  font-size: var(--text-lg);
 }
 .book-side-head .depth {
   display: block;
@@ -1121,22 +1193,27 @@
   font-weight: 600;
   margin-top: 6px;
 }
+/* 16 px in fields: a smaller size makes a phone zoom in on focus. */
 .input {
   width: 100%;
   min-width: 0;
   height: var(--tap);
   padding: 0 var(--space-3);
-  font: 400 var(--text-base) / 1 var(--sans);
+  font: 400 1rem / 1 var(--sans);
   font-variant-numeric: tabular-nums lining-nums;
   color: var(--ink);
   background: var(--surface);
   border: 1px solid var(--field-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
+  transition:
+    border-color var(--motion-fast),
+    box-shadow var(--motion-fast);
 }
 .input:focus {
-  outline: 2px solid var(--navy);
+  outline: 2px solid var(--accent);
   outline-offset: 0;
-  border-color: var(--navy);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 5px var(--accent-ring);
 }
 .input.mono {
   font-family: var(--mono);
@@ -1151,14 +1228,14 @@
 }
 .input-unit .input {
   border-right: 0;
-  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  border-radius: var(--radius) 0 0 var(--radius);
 }
 .input-unit .unit {
   display: flex;
   align-items: center;
   padding: 0 var(--space-3);
   border: 1px solid var(--field-border);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
   background: var(--surface-alt);
   color: var(--slate);
   font-weight: 600;
@@ -1168,10 +1245,11 @@
 .copy-field {
   display: flex;
   align-items: stretch;
-  border: 1px solid var(--field-border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
   background: var(--surface-alt);
   min-width: 0;
+  overflow: hidden;
 }
 .copy-field code {
   flex: 1 1 auto;
@@ -1184,13 +1262,14 @@
   word-break: break-all;
 }
 .copy-field .btn {
-  border-radius: 0 1px 1px 0;
+  border-radius: 0;
+  box-shadow: none;
   align-self: stretch;
 }
 .kv {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 6px var(--space-4);
+  gap: 10px var(--space-4);
   font-size: var(--text-md);
   margin: 0;
 }
@@ -1201,57 +1280,73 @@
   margin: 0;
   min-width: 0;
   text-align: right;
+  font-variant-numeric: tabular-nums lining-nums;
   overflow-wrap: anywhere;
 }
 .seg {
   display: inline-flex;
-  border: 1px solid var(--navy);
-  border-radius: var(--radius);
-  overflow: hidden;
+  gap: 2px;
+  padding: 3px;
+  border: var(--rule-hair);
+  border-radius: var(--radius-pill);
+  background: var(--surface-alt);
 }
 .seg button {
-  min-height: var(--tap);
-  padding: 0 22px;
+  min-height: calc(var(--tap) - 8px);
+  padding: 0 20px;
   border: 0;
-  background: var(--surface);
-  color: var(--navy);
-  font: 600 0.9375rem/1 var(--sans);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--slate);
+  font: 600 var(--text-md) / 1 var(--sans);
   cursor: pointer;
-}
-.seg button + button {
-  border-left: 1px solid var(--navy);
 }
 .seg button[aria-pressed='true'],
 .seg button[aria-checked='true'] {
-  background: var(--navy);
+  background: var(--accent);
   color: var(--on-accent);
+  box-shadow: var(--shadow-xs);
 }
+/* The two legs of a swap ("You pay" / "You receive"), large figures on the right. */
 .legs {
   border: var(--rule-hair);
-  border-radius: var(--radius-sm);
-  margin: var(--space-1) 0 18px;
+  border-radius: var(--radius);
+  margin: var(--space-1) 0 var(--space-5);
+  overflow: hidden;
 }
 .legs .leg {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) 14px;
+  padding: var(--space-4) var(--space-4);
+  background: var(--surface);
 }
 .legs .leg + .leg {
   border-top: var(--rule-hair);
+}
+/* The second leg is what the user receives: the highlight. */
+.legs .leg + .leg:last-of-type {
+  background: var(--accent-soft);
+  border-top-color: var(--accent-soft-border);
+}
+.legs .leg > .num {
+  font-size: 1.375rem;
+  font-weight: 650;
+  letter-spacing: -0.016em;
+  color: var(--ink);
 }
 .legs .leg .k {
   color: var(--slate);
 }
 .legs .leg .v {
-  font-weight: 700;
+  font-weight: 650;
   font-size: var(--text-lg);
 }
 .legs .foot {
   background: var(--surface-alt);
   border-top: var(--rule-hair);
-  padding: 10px 14px;
+  padding: 10px var(--space-4);
   font-size: var(--text-sm);
   color: var(--slate);
 }
@@ -1270,7 +1365,7 @@
   padding: 0 var(--space-4);
   cursor: pointer;
   font-weight: 600;
-  color: var(--navy);
+  color: var(--ink);
   list-style: none;
 }
 .disclosure > summary::-webkit-details-marker {
@@ -1280,8 +1375,8 @@
   content: '';
   width: 7px;
   height: 7px;
-  border-right: 2px solid currentColor;
-  border-bottom: 2px solid currentColor;
+  border-right: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
   transform: rotate(-45deg);
   transition: transform var(--motion-fast);
   flex: none;
@@ -1294,45 +1389,60 @@
   border-top: var(--rule-hair);
 }
 
-/* ── numbered steps ────────────────────────────────────────────────── */
+/* ── numbered steps: magenta-tint counters joined by a line ─────────── */
 .steps {
   list-style: none;
-  margin: 18px 0 0;
+  margin: var(--space-4) 0 0;
   padding: 0;
   counter-reset: step;
 }
 .steps > li {
   counter-increment: step;
   position: relative;
-  padding: var(--space-3) 0 var(--space-3) 40px;
-  border-top: var(--rule-hair);
+  padding: 3px 0 var(--space-5) 44px;
+}
+.steps > li:last-child {
+  padding-bottom: 0;
 }
 .steps > li::before {
   content: counter(step);
   position: absolute;
   left: 0;
-  top: var(--space-3);
-  width: 26px;
-  height: 26px;
+  top: 0;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  font: 700 var(--text-sm) / 1 var(--sans);
-  color: var(--navy);
-  border: 1.5px solid var(--navy);
+  font: 650 var(--text-sm) / 1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft-border);
+}
+.steps > li:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: 13.5px;
+  top: 34px;
+  bottom: 6px;
+  width: 1px;
+  background: var(--accent-soft-border);
 }
 .steps > li.done::before {
   content: '✓';
-  background: var(--navy);
+  background: var(--accent);
+  border-color: var(--accent);
   color: var(--on-accent);
 }
 .steps .step-title {
   color: var(--ink);
+  font-weight: 600;
 }
 .steps .step-body {
   color: var(--slate);
   font-size: var(--text-md);
-  margin-top: 2px;
+  margin-top: 4px;
 }
 .steps .step-body > * + * {
   margin-top: var(--space-2);
@@ -1341,7 +1451,7 @@
   margin-top: 10px;
 }
 
-/* ── stage tracker ─────────────────────────────────────────────────── */
+/* ── stage tracker: done in magenta, the current stage glowing ─────── */
 .stage-tracker {
   list-style: none;
   margin: 0;
@@ -1349,32 +1459,38 @@
 }
 .stage {
   position: relative;
-  padding: 0 0 18px 40px;
+  padding: 0 0 var(--space-6) 46px;
 }
 .stage::before {
   content: '';
   position: absolute;
-  left: 11px;
-  top: 26px;
-  bottom: 2px;
+  left: 13px;
+  top: 32px;
+  bottom: 4px;
   width: 2px;
+  border-radius: 2px;
   background: var(--rule);
 }
 .stage:last-child {
   padding-bottom: 0;
 }
+@media (max-width: 480px) {
+  .stage {
+    padding-left: 40px;
+  }
+}
 .stage:last-child::before {
   display: none;
 }
 .stage.done::before {
-  background: var(--navy);
+  background: var(--accent);
 }
 .stage .marker {
   position: absolute;
   left: 0;
-  top: 0;
-  width: 24px;
-  height: 24px;
+  top: -2px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -1383,19 +1499,26 @@
   color: var(--on-accent);
 }
 .stage.done .marker {
-  background: var(--navy);
-  border-color: var(--navy);
+  background: var(--accent);
+  border-color: var(--accent);
 }
 .stage.current .marker {
-  border-color: var(--gold);
-  background: var(--gold-soft);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 6px var(--accent-halo);
 }
 .stage.current .marker::after {
   content: '';
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
-  background: var(--gold);
+  background: var(--accent);
+  animation: stage-pulse 1.6s ease-in-out infinite;
+}
+@keyframes stage-pulse {
+  50% {
+    transform: scale(0.6);
+  }
 }
 .stage.failed .marker {
   background: var(--danger);
@@ -1409,10 +1532,14 @@
 }
 .stage .title {
   font-weight: 600;
+  color: var(--ink);
+}
+.stage.current .title {
+  color: var(--accent-ink);
 }
 .stage.pending .title {
-  color: var(--slate);
-  font-weight: 400;
+  color: var(--muted);
+  font-weight: 500;
 }
 .stage.failed .title {
   color: var(--danger);
@@ -1423,13 +1550,10 @@
   white-space: nowrap;
 }
 .stage .detail {
-  color: var(--muted);
-  font-size: var(--text-sm);
-  margin-top: 2px;
+  color: var(--slate);
+  font-size: var(--text-md);
+  margin-top: 4px;
   overflow-wrap: anywhere;
-}
-.stage.current .detail {
-  color: var(--warn-ink);
 }
 .tracker-summary {
   margin-bottom: var(--space-4);
@@ -1443,16 +1567,28 @@
   gap: 6px;
   white-space: nowrap;
 }
+.hash .mono {
+  color: var(--ink);
+}
+.hash a.mono {
+  color: var(--accent);
+}
 .hash-copy {
-  background: none;
-  border: 0;
-  padding: 4px 6px;
+  background: var(--surface);
+  border: var(--rule-hair);
+  border-radius: var(--radius-pill);
+  padding: 3px 9px;
   min-height: 24px; /* an inline text action: WCAG 2.5.8's 24 px target */
-  color: var(--navy);
+  color: var(--accent-ink);
   font: 600 var(--text-xs) / 1.2 var(--sans);
-  text-decoration: underline;
-  text-underline-offset: 2px;
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast),
+    border-color var(--motion-fast);
+}
+.hash-copy:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-border);
 }
 
 /* ── dialog ────────────────────────────────────────────────────────── */
@@ -1461,29 +1597,32 @@
   max-width: 540px;
   max-height: calc(100dvh - 2 * var(--gutter));
   overflow-y: auto;
-  padding: var(--space-6);
+  padding: var(--space-7);
   border: var(--rule-hair);
-  border-top: 4px solid var(--navy);
-  border-radius: var(--radius);
+  border-radius: var(--radius-card);
   background: var(--surface);
   color: var(--ink);
-}
-.mnb-dialog.tone-danger {
-  border-top-color: var(--danger);
+  box-shadow: var(--shadow-md);
 }
 .mnb-dialog::backdrop {
   background: var(--overlay);
+  backdrop-filter: blur(3px);
 }
 .mnb-dialog .dialog-title {
-  margin-bottom: 10px;
+  margin-bottom: var(--space-3);
   font-size: var(--text-xl);
+  font-weight: 650;
+  letter-spacing: -0.016em;
+}
+.mnb-dialog.tone-danger .dialog-title {
+  color: var(--danger);
 }
 .mnb-dialog .dialog-body {
   color: var(--slate);
-  font-size: 0.9375rem;
+  font-size: var(--text-base);
 }
 .mnb-dialog .dialog-notice {
-  margin: 14px 0 0;
+  margin: var(--space-4) 0 0;
 }
 .mnb-dialog .confirm-steps {
   border-top: var(--rule-hair);
@@ -1506,11 +1645,11 @@
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
-  margin-top: 18px;
+  margin-top: var(--space-6);
 }
 @media (max-width: 480px) {
   .mnb-dialog {
-    padding: 18px;
+    padding: var(--space-5);
   }
   .mnb-dialog .dialog-actions .btn {
     flex: 1 1 100%;
@@ -1522,11 +1661,12 @@
   text-align: center;
   padding: var(--space-8) var(--space-5);
   background: var(--surface);
-  border: 1px dashed var(--rule-strong);
-  border-radius: var(--radius);
+  border: 1.5px dashed var(--rule-strong);
+  border-radius: var(--radius-card);
 }
 .empty-state .empty-title {
   font-size: var(--text-lg);
+  font-weight: 650;
   margin-bottom: 6px;
 }
 .empty-state .empty-body {
@@ -1542,7 +1682,7 @@
   gap: 10px;
 }
 
-/* ── Trade (from the mockup, for lane L-TRD to adopt) ──────────────── */
+/* ── Trade ─────────────────────────────────────────────────────────── */
 .trade-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
@@ -1558,11 +1698,10 @@
 .trade-grid > .panel + .panel {
   margin-top: 0;
 }
-/* The book in the Take panel: asks above bids (the panel is the narrower column). */
 .book-stack > * + * {
   margin-top: var(--space-5);
 }
-/* The compact price ladder beside the order form: asks above the spread, bids below. */
+/* The compact price ladder beside an order form: asks above the spread, bids below. */
 .ladder {
   border-collapse: collapse;
   width: 100%;
@@ -1603,7 +1742,8 @@
   min-width: 0;
 }
 .transfer-card:first-child {
-  border-top: var(--rule-head);
+  border-top: 0;
+  padding-top: 0;
 }
 .transfer-card .transfer-head {
   display: flex;
@@ -1673,8 +1813,8 @@
   justify-content: space-between;
   align-items: center;
   gap: var(--space-4);
-  margin-top: var(--space-5);
-  padding-top: 18px;
+  margin-top: var(--space-6);
+  padding-top: var(--space-5);
   border-top: var(--rule-hair);
 }
 .danger-zone .explain {
@@ -1688,7 +1828,7 @@
 .site-foot {
   border-top: var(--rule-hair);
   background: var(--surface);
-  padding: var(--space-5) 0 var(--space-7);
+  padding: var(--space-6) 0 var(--space-8);
 }
 .site-foot .testnet {
   font-weight: 600;

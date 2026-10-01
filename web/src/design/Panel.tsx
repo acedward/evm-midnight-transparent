@@ -2,8 +2,8 @@
 //
 //   <PageHead eyebrow="Statement" title="Accounts" lede="…" actions={<Button …>Refresh</Button>} />
 //   <Panel title="Ethereum (Sepolia)" meta={<>Wallet <span className="mono">0x4847…e56b</span></>}>…</Panel>
-//   <Panel tone="quiet" as="aside" title="Pending">…</Panel>      the ivory-grey side box
-//   <Card title="Your swap">…</Card>                       a panel with the gold top rule
+//   <Panel tone="quiet" as="aside" title="Pending">…</Panel>      the lilac-grey side box
+//   <Card title="Your swap">…</Card>                       a card with the magenta cap
 //
 // Headings: the masthead's app name is the page's h1, a page title is an h2, a panel title an h3.
 
@@ -86,7 +86,7 @@ export function Panel({
   );
 }
 
-/** A panel with the gold top rule, for the one card that invites an action. */
+/** A card with the magenta cap and glow, for the one card that invites an action. */
 export function Card(props: Omit<PanelProps, 'tone'>) {
   return <Panel tone="accent" {...props} />;
 }

@@ -1,6 +1,7 @@
-// The frame every page sits in: the navy masthead (the monogram, the app's name and tagline from
-// ../brand.ts, and the user's identity on the right), the white tab bar, and the testnet footer.
-// Copied from MN Bank's design system (acedward/passport-evm-dapp @ 911647b, web/src/design).
+// The frame every page sits in: the white header (the magenta logo mark, the app's name and tagline
+// from ../brand.ts, and the user's identity and network chips on the right), the pill tab bar, and the
+// testnet footer. Adapted from MN Bank's design system (acedward/passport-evm-dapp @ 911647b,
+// web/src/design); restyled in P4.4.
 //
 //   <Masthead>
 //     <IdentityChip label="Wallet" value={<span title={addr}>0x4847…e56b</span>} badge={<NetworkBadge network="sepolia" />} />

@@ -1,74 +1,77 @@
 /*
- * Design tokens, copied from MN Bank's design system (taken there from its owner-approved mockup).
+ * Design tokens (P4.4 restyle, owner 2026-10-01: "light colors, but modern. Magenta highlights,
+ * almost white background").
  *
- * One primary (navy), ONE muted accent (antique gold, used sparingly: the masthead rule, the
- * monogram, the selected row, the current tracker stage, warnings), slate text on ivory.
- * No gradients, no glass, no shadows beyond a hairline. Every text pair below is checked
- * against WCAG AA by web/test/design-contrast.test.ts, so change a colour there first.
+ * A near-white page, white cards with soft lilac-grey borders and very soft shadows, ink text, and
+ * ONE accent: magenta, for primary buttons, links, the active tab, focus rings, the stage tracker
+ * and highlights (its pale tint marks selected rows, badges and the active tab). Every text pair
+ * below is checked against WCAG AA by web/test/design-contrast.test.ts, so change a colour there
+ * first. Colours stay hex (the rendered-contrast check in test/e2e parses rgb() only).
  */
 :root {
   /* ── colour: surfaces ─────────────────────────────────────────────── */
-  --paper: #f8f5ee; /* page background, ivory */
-  --surface: #ffffff; /* panels, tables, the tab bar */
-  --surface-alt: #f3efe6; /* quiet fills: the pending box, unit suffixes, copy fields */
-  --overlay: rgb(14 31 61 / 55%); /* behind a dialog: navy-deep at 55 % */
+  --paper: #fbfafc; /* page background, almost white with a lilac breath */
+  --surface: #ffffff; /* cards, tables, the header */
+  --surface-alt: #f6f3f8; /* quiet fills: unit suffixes, copy fields, the review's foot */
+  --surface-hover: #fcf7fa; /* a hovered table row */
+  --overlay: rgb(26 21 35 / 42%); /* behind a dialog: ink at 42 % */
 
-  /* ── colour: brand ────────────────────────────────────────────────── */
-  --navy: #152c55; /* primary */
-  --navy-deep: #0e1f3d;
-  --navy-hover: #1e3b6e;
-  --navy-soft: #e8edf5; /* navy tint: badges, secondary-button hover */
-  --navy-soft-border: #c8d2e3;
-  --gold: #a8864a; /* THE accent: rules, markers, the monogram ring (never text) */
-  --gold-ink: #7a5a1f; /* gold when it has to be text */
-  --gold-soft: #f6efdd;
-  --gold-soft-border: #e3d3ae;
+  /* ── colour: the accent (magenta) ─────────────────────────────────── */
+  --accent: #c8157a; /* primary buttons, links, the tracker, focus rings */
+  --accent-hover: #a90f66;
+  --accent-ink: #a8115f; /* magenta as small text on the tint or the page (eyebrows, badges) */
+  --accent-soft: #fdeaf4; /* the tint: the active tab, badges, selected rows, highlights */
+  --accent-soft-border: #f7cde3;
+  --accent-bright: #e2389b; /* the light end of the logo mark's and the card cap's gradient (never text) */
+  --accent-deep: #8f0d55; /* the dark end of the logo mark's gradient (never text) */
+  --accent-ring: rgb(200 21 122 / 22%); /* the soft halo around a focused field */
+  --accent-halo: rgb(200 21 122 / 12%); /* the glow around the current tracker stage */
 
   /* ── colour: text ─────────────────────────────────────────────────── */
-  --ink: #1d2733; /* body text, slate-navy */
-  --slate: #465262; /* secondary text */
-  --muted: #5b6573; /* captions, labels */
-  --on-navy: #f7f3ea; /* text on the navy masthead */
-  --on-navy-muted: #c9d1e0;
-  --on-navy-gold: #eadcb9; /* the "Midnight stagenet" badge on navy */
-  --on-accent: #ffffff; /* text on a filled navy or danger button */
+  --ink: #1a1523; /* body text and titles */
+  --slate: #5b5466; /* secondary text, ledes */
+  --muted: #6b6375; /* captions, labels, table heads */
+  --on-accent: #ffffff; /* text on a filled magenta, danger or ink surface */
 
   /* ── colour: rules and fields ─────────────────────────────────────── */
-  --rule: #ddd6c8; /* hairlines */
-  --rule-strong: #a9a08e;
-  --field-border: #767c86; /* ≥ 3:1 against white (WCAG 1.4.11) */
+  --rule: #ece7ef; /* soft borders and hairlines */
+  --rule-strong: #d6cedc; /* a pending tracker marker, a dashed empty state */
+  --field-border: #8e8599; /* ≥ 3:1 against white (WCAG 1.4.11) */
 
   /* ── colour: states ───────────────────────────────────────────────── */
-  --positive: #2c6340;
-  --positive-soft: #e7f0e9;
-  --positive-soft-border: #c3d8c8;
-  --warn-ink: #7a4b00;
-  --warn-soft: #fbf2df;
-  --warn-soft-border: #ead9b5;
-  --danger: #9c2b2b;
-  --danger-hover: #822222;
-  --danger-soft: #f8e9e7;
-  --danger-soft-border: #ebcfcb;
-  --disabled-bg: #e4e1da;
-  --disabled-border: #d2cdc3;
-  --disabled-ink: #545b65;
-  --sepolia-bg: #22396a; /* the "Sepolia" badge on navy */
-  --sepolia-border: #4a6296;
+  --positive: #137a4b;
+  --positive-soft: #e9f7ef;
+  --positive-soft-border: #c4e8d3;
+  --positive-halo: rgb(19 122 75 / 28%); /* the "Live" dot's pulse */
+  --warn: #d9890f; /* the amber marker of a warning (never text) */
+  --warn-ink: #8a4a00;
+  --warn-soft: #fff6e8;
+  --warn-soft-border: #f6dcae;
+  --danger: #c42b2b;
+  --danger-hover: #a52222;
+  --danger-soft: #fdeeee;
+  --danger-soft-border: #f6caca;
+  --disabled-bg: #f1eef4;
+  --disabled-border: #e4dee9;
+  --disabled-ink: #625b6c;
+  --tooltip-bg: #1f1a29; /* the tooltip bubble: why a control is greyed out */
 
   /* ── type ─────────────────────────────────────────────────────────── */
-  --serif: 'Libre Caslon Text', Georgia, 'Times New Roman', Times, serif;
+  /* Inter (variable, self-hosted: fonts.css); the system UI stack until it loads, or for a glyph
+     outside its Latin subset. */
   --sans:
-    'Source Sans 3', 'Source Sans Pro', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica,
-    Arial, sans-serif;
-  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
-  --text-xs: 0.75rem; /* 12 px: table heads, eyebrows */
+    'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --text-xs: 0.75rem; /* 12 px: table heads, eyebrows, badges */
   --text-sm: 0.8125rem; /* 13 px: captions, notes */
   --text-md: 0.875rem; /* 14 px: secondary text */
-  --text-base: 1rem; /* 16 px: body */
-  --text-lg: 1.125rem; /* 18 px: sub-section titles */
-  --text-xl: 1.375rem; /* 22 px: panel titles */
-  --text-2xl: 2rem; /* 32 px: page titles, the big figure */
+  --text-base: 0.9375rem; /* 15 px: body */
+  --text-lg: 1.0625rem; /* 17 px: sub-section titles */
+  --text-xl: 1.25rem; /* 20 px: card titles */
+  --text-2xl: 2rem; /* 32 px: page titles */
   --tracking-caps: 0.06em;
+  --tracking-tight: -0.022em; /* large titles */
 
   /* ── spacing ──────────────────────────────────────────────────────── */
   --space-1: 4px;
@@ -77,22 +80,29 @@
   --space-4: 16px;
   --space-5: 20px;
   --space-6: 24px;
-  --space-7: 28px;
-  --space-8: 32px;
-  --space-9: 48px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
   --gutter: 16px; /* 32 px from 768 px up */
   --page-max: 1120px;
   --tap: 44px; /* minimum touch target (buttons, fields) */
 
-  /* ── rules and shape ──────────────────────────────────────────────── */
+  /* ── shape and depth ──────────────────────────────────────────────── */
   --rule-hair: 1px solid var(--rule);
-  --rule-head: 1.5px solid var(--navy); /* under a table head */
-  --rule-total: 3px double var(--ink); /* under a subtotal */
-  --radius: 3px;
-  --radius-sm: 2px;
+  --rule-head: 1px solid var(--rule); /* under a table head */
+  --rule-total: 2px solid var(--ink); /* under a subtotal */
+  --radius-card: 14px; /* cards, dialogs, empty states */
+  --radius: 10px; /* buttons, fields, notices */
+  --radius-sm: 6px;
+  --radius-pill: 999px; /* badges, chips, tabs */
+  --shadow-xs: 0 1px 2px rgb(26 21 35 / 5%);
+  --shadow-sm: 0 1px 2px rgb(26 21 35 / 4%), 0 4px 14px rgb(26 21 35 / 4%);
+  --shadow-md: 0 2px 6px rgb(26 21 35 / 5%), 0 18px 40px rgb(26 21 35 / 10%);
+  --shadow-accent: 0 1px 2px rgb(168 17 95 / 18%), 0 4px 12px rgb(200 21 122 / 20%); /* a primary button */
+  --shadow-accent-soft: 0 1px 2px rgb(168 17 95 / 6%), 0 12px 32px rgb(200 21 122 / 8%); /* the action card */
 
   /* ── motion (off under prefers-reduced-motion, base.css) ─────────── */
-  --motion-fast: 0.12s ease;
+  --motion-fast: 0.14s ease;
 }
 
 @media (min-width: 768px) {

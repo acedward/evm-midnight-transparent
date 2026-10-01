@@ -1,7 +1,7 @@
 /*
- * Base styles (copied from MN Bank): reset, typography and small utilities. Bare elements get the app's look
- * at zero specificity (:where), so a page that has not adopted the components yet still reads
- * as the app; every component class overrides them.
+ * Base styles: reset, typography and small utilities. Bare elements get the app's look at zero
+ * specificity (:where), so a page that has not adopted the components yet still reads as the app;
+ * every component class overrides them.
  */
 *,
 *::before,
@@ -16,21 +16,31 @@ body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
-  font: 400 var(--text-base) / 1.5 var(--sans);
+  font: 400 var(--text-base) / 1.55 var(--sans);
   font-variant-numeric: lining-nums;
-  /* No overflow-x clipping here on purpose: layouts are built to fit 375 px, and the visual
-     test (test/e2e/visual.spec.ts) must see a real overflow if one ever appears. */
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* No overflow-x clipping here on purpose: layouts are built to fit 375 px, and the layout spec
+     (test/e2e/layout.spec.ts) must see a real overflow if one ever appears. */
+}
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
 }
 
 :where(h1, h2, h3, h4) {
-  font-family: var(--serif);
-  font-weight: 400;
-  color: var(--navy);
+  font-family: var(--sans);
+  font-weight: 650;
+  color: var(--ink);
+  letter-spacing: -0.011em;
   margin: 0;
 }
 :where(h1) {
   font-size: var(--text-2xl);
-  line-height: 1.2;
+  line-height: 1.15;
+  letter-spacing: var(--tracking-tight);
 }
 :where(h2) {
   font-size: var(--text-xl);
@@ -41,8 +51,8 @@ body {
   line-height: 1.35;
 }
 :where(h4) {
-  font-size: 1.0625rem;
-  line-height: 1.35;
+  font-size: var(--text-base);
+  line-height: 1.4;
 }
 :where(p) {
   margin: 0;
@@ -51,14 +61,22 @@ body {
   margin-top: var(--space-2);
 }
 :where(a) {
-  color: var(--navy);
-  text-underline-offset: 2px;
+  color: var(--accent);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--accent-soft-border);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  transition:
+    color var(--motion-fast),
+    text-decoration-color var(--motion-fast);
 }
 :where(a:hover) {
-  color: var(--navy-hover);
+  color: var(--accent-hover);
+  text-decoration-color: currentColor;
 }
 :focus-visible {
-  outline: 2px solid var(--navy);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 :where(code) {
@@ -68,8 +86,12 @@ body {
 :where(small) {
   font-size: var(--text-sm);
 }
+:where(strong) {
+  font-weight: 600;
+}
 
 /* ── utilities ─────────────────────────────────────────────────────── */
+/* Amounts: tabular figures, so the digits of a column line up. */
 .num,
 .amount {
   font-variant-numeric: tabular-nums lining-nums;
@@ -93,7 +115,7 @@ body {
   font: 600 var(--text-xs) / 1.3 var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--accent-ink);
 }
 .muted {
   color: var(--muted);

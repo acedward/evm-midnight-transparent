@@ -1,7 +1,8 @@
 // @vitest-environment node
-// Every text colour the design system (copied from MN Bank) puts on a background meets WCAG 2.2 AA
-// (4.5:1 for text; 3:1 for large text and for the parts of a control, 1.4.11). The pairs are
-// read from web/src/design/tokens.css, so a colour change that breaks contrast fails here.
+// Every text colour the design system (restyled in P4.4: light, one magenta accent) puts on a
+// background meets WCAG 2.2 AA (4.5:1 for text; 3:1 for large text and for the parts of a control,
+// 1.4.11). The pairs are read from web/src/design/tokens.css, so a colour change that breaks
+// contrast fails here.
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +26,8 @@ function luminance(h: string): number {
   return 0.2126 * lin(r!) + 0.7152 * lin(g!) + 0.0722 * lin(b!);
 }
 
+const luminanceOf = (name: string): number => luminance(hex(name));
+
 export function contrast(fg: string, bg: string): number {
   const [a, b] = [luminance(fg), luminance(bg)].sort((x, y) => y - x);
   return (a! + 0.05) / (b! + 0.05);
@@ -35,48 +38,47 @@ const TEXT = 4.5;
 const LARGE_OR_UI = 3;
 export const PAIRS: ReadonlyArray<readonly [string, string, number, string]> = [
   ['ink', 'paper', TEXT, 'body text on the page'],
-  ['ink', 'surface', TEXT, 'body text in panels and tables'],
-  ['ink', 'surface-alt', TEXT, 'text in the pending box and copy fields'],
+  ['ink', 'surface', TEXT, 'body text in cards, tables and the header'],
+  ['ink', 'surface-alt', TEXT, 'text in copy fields, sub-stages, address chips'],
+  ['ink', 'accent-soft', TEXT, 'body text in an info notice, a selected row'],
   ['slate', 'paper', TEXT, 'ledes'],
-  ['slate', 'surface', TEXT, 'secondary text, "no liquidity"'],
-  ['slate', 'surface-alt', TEXT, 'unit suffixes, grey badges'],
-  ['muted', 'paper', TEXT, 'eyebrows and captions on the page'],
-  ['muted', 'surface', TEXT, 'table heads, notes, hints'],
-  ['muted', 'surface-alt', TEXT, 'notes in the pending box'],
-  ['muted', 'gold-soft', TEXT, 'a sub line in the selected market row'],
-  ['navy', 'paper', TEXT, 'page titles, links'],
-  ['navy', 'surface', TEXT, 'panel titles, secondary buttons, links'],
-  ['navy', 'surface-alt', TEXT, 'links in the pending box'],
-  ['navy', 'navy-soft', TEXT, 'navy badges, secondary-button hover'],
-  ['on-accent', 'navy', TEXT, 'primary buttons'],
-  ['on-accent', 'navy-hover', TEXT, 'primary buttons, hovered'],
+  ['slate', 'surface', TEXT, 'secondary text, tab labels, "no liquidity"'],
+  ['slate', 'surface-alt', TEXT, 'unit suffixes, grey badges, the Sepolia chip'],
+  ['muted', 'paper', TEXT, 'captions on the page'],
+  ['muted', 'surface', TEXT, 'table heads, notes, hints, the tagline'],
+  ['muted', 'surface-alt', TEXT, 'idle status pills, notes in quiet boxes'],
+  ['muted', 'accent-soft', TEXT, 'a sub line in a selected row'],
+  ['accent', 'paper', TEXT, 'links on the page'],
+  ['accent', 'surface', TEXT, 'links and hashes in cards'],
+  ['accent', 'surface-alt', TEXT, 'links in quiet boxes'],
+  ['accent', 'warn-soft', TEXT, 'a link in a warning notice'],
+  ['accent', 'danger-soft', TEXT, 'a link in a danger notice'],
+  ['accent-ink', 'accent-soft', TEXT, 'the active tab, accent badges, the Midnight chip, info notice titles'],
+  ['accent-ink', 'paper', TEXT, 'eyebrows'],
+  ['accent-ink', 'surface', TEXT, 'the current stage, the copy action, a hovered secondary button'],
+  ['on-accent', 'accent', TEXT, 'primary buttons, the logo mark'],
+  ['on-accent', 'accent-hover', TEXT, 'primary buttons, hovered'],
   ['on-accent', 'danger', TEXT, 'the CLEAR ALL button'],
   ['on-accent', 'danger-hover', TEXT, 'the CLEAR ALL button, hovered'],
-  ['navy', 'on-navy', TEXT, 'the masthead Connect button'],
-  ['on-navy', 'navy', TEXT, 'the masthead'],
-  ['on-navy', 'navy', TEXT, 'a tooltip: why a button is greyed out (AA 00044)'],
-  ['on-navy-muted', 'navy', TEXT, 'masthead labels, the tagline'],
-  ['on-navy-gold', 'navy', TEXT, 'the "Midnight stagenet" badge'],
-  ['on-navy', 'sepolia-bg', TEXT, 'the "Sepolia" badge'],
-  ['gold-ink', 'gold-soft', TEXT, '"Your offer", gold badges'],
-  ['gold-ink', 'surface', TEXT, '"refunded"'],
-  ['warn-ink', 'warn-soft', TEXT, 'warning notices'],
-  ['warn-ink', 'surface', TEXT, 'the current stage'],
-  ['positive', 'positive-soft', TEXT, 'green badges, success notices'],
+  ['on-accent', 'tooltip-bg', TEXT, 'a tooltip: why a button is greyed out (AA 00044)'],
+  ['warn-ink', 'warn-soft', TEXT, 'warning notices, "in progress" pills'],
+  ['warn-ink', 'surface', TEXT, 'warning text in a card'],
+  ['positive', 'positive-soft', TEXT, 'green badges, the "Live" pill, success notices'],
   ['positive', 'surface', TEXT, 'bids, "live"'],
-  ['positive', 'gold-soft', TEXT, 'a bid in the selected market row'],
-  ['danger', 'danger-soft', TEXT, 'danger notices'],
-  ['danger', 'surface', TEXT, 'asks, field errors'],
-  ['danger', 'gold-soft', TEXT, 'an ask in the selected market row'],
+  ['positive', 'accent-soft', TEXT, 'a bid in a selected row'],
+  ['danger', 'danger-soft', TEXT, 'danger notices, failed pills'],
+  ['danger', 'surface', TEXT, 'asks, field errors, a failed stage, a danger dialog title'],
+  ['danger', 'accent-soft', TEXT, 'an ask in a selected row'],
   ['ink', 'danger-soft', TEXT, 'body text in a danger notice'],
   ['ink', 'warn-soft', TEXT, 'body text in a warning notice'],
   ['ink', 'positive-soft', TEXT, 'body text in a success notice'],
   ['disabled-ink', 'disabled-bg', TEXT, 'a disabled button (exempt in WCAG; kept legible anyway)'],
-  // Non-text contrast (WCAG 1.4.11): control borders and focus indicators.
+  // Non-text contrast (WCAG 1.4.11): control borders, focus indicators, the tracker's markers.
   ['field-border', 'surface', LARGE_OR_UI, 'input borders'],
-  ['navy', 'paper', LARGE_OR_UI, 'the focus ring'],
-  ['on-navy', 'navy', LARGE_OR_UI, 'the focus ring on the masthead'],
-  ['navy', 'surface', LARGE_OR_UI, 'the current tab underline, secondary-button borders'],
+  ['accent', 'paper', LARGE_OR_UI, 'the focus ring on the page'],
+  ['accent', 'surface', LARGE_OR_UI, 'the focus ring in cards, a focused field, done and current tracker markers'],
+  ['accent', 'accent-soft', LARGE_OR_UI, 'the current tracker marker ring on its tint'],
+  ['danger', 'surface', LARGE_OR_UI, 'a failed tracker marker'],
 ];
 
 describe('the colour tokens (WCAG 2.2 AA)', () => {
@@ -96,9 +98,18 @@ describe('the colour tokens (WCAG 2.2 AA)', () => {
     },
   );
 
-  it('uses the gold accent only as a rule or marker, never as small text on a light surface', () => {
-    // --gold on white is below 4.5:1 by design; text in gold uses --gold-ink instead.
-    expect(contrast(hex('gold'), hex('surface'))).toBeLessThan(TEXT);
-    expect(contrast(hex('gold-ink'), hex('surface'))).toBeGreaterThanOrEqual(TEXT);
+  it('keeps magenta the one accent: AA as text and as a filled button, and the page almost white', () => {
+    // Owner, P4.4: "light colors, but modern. Magenta highlights, almost white background".
+    expect(contrast(hex('accent'), hex('surface'))).toBeGreaterThanOrEqual(TEXT);
+    expect(contrast(hex('on-accent'), hex('accent'))).toBeGreaterThanOrEqual(TEXT);
+    expect(contrast(hex('ink'), hex('paper'))).toBeGreaterThanOrEqual(15);
+    expect(luminanceOf('paper')).toBeGreaterThan(0.9);
+    expect(luminanceOf('accent-soft')).toBeGreaterThan(0.8);
+  });
+
+  it('uses the gradient ends of the logo mark only behind the white letters, never as text', () => {
+    // --accent-bright is lighter than --accent; text in magenta uses --accent or --accent-ink.
+    expect(contrast(hex('accent-bright'), hex('surface'))).toBeLessThan(contrast(hex('accent'), hex('surface')));
+    expect(contrast(hex('accent-ink'), hex('accent-soft'))).toBeGreaterThanOrEqual(TEXT);
   });
 });
