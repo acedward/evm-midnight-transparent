@@ -1,0 +1,112 @@
+/*
+ * Design tokens (P4.4 restyle, owner 2026-10-01: "light colors, but modern. Magenta highlights,
+ * almost white background").
+ *
+ * A near-white page, white cards with soft lilac-grey borders and very soft shadows, ink text, and
+ * ONE accent: magenta, for primary buttons, links, the active tab, focus rings, the stage tracker
+ * and highlights (its pale tint marks selected rows, badges and the active tab). Every text pair
+ * below is checked against WCAG AA by web/test/design-contrast.test.ts, so change a colour there
+ * first. Colours stay hex (the rendered-contrast check in test/e2e parses rgb() only).
+ */
+:root {
+  /* ── colour: surfaces ─────────────────────────────────────────────── */
+  --paper: #fbfafc; /* page background, almost white with a lilac breath */
+  --surface: #ffffff; /* cards, tables, the header */
+  --surface-alt: #f6f3f8; /* quiet fills: unit suffixes, copy fields, the review's foot */
+  --surface-hover: #fcf7fa; /* a hovered table row */
+  --overlay: rgb(26 21 35 / 42%); /* behind a dialog: ink at 42 % */
+
+  /* ── colour: the accent (magenta) ─────────────────────────────────── */
+  --accent: #c8157a; /* primary buttons, links, the tracker, focus rings */
+  --accent-hover: #a90f66;
+  --accent-ink: #a8115f; /* magenta as small text on the tint or the page (eyebrows, badges) */
+  --accent-soft: #fdeaf4; /* the tint: the active tab, badges, selected rows, highlights */
+  --accent-soft-border: #f7cde3;
+  --accent-bright: #e2389b; /* the light end of the logo mark's and the card cap's gradient (never text) */
+  --accent-deep: #8f0d55; /* the dark end of the logo mark's gradient (never text) */
+  --accent-ring: rgb(200 21 122 / 22%); /* the soft halo around a focused field */
+  --accent-halo: rgb(200 21 122 / 12%); /* the glow around the current tracker stage */
+
+  /* ── colour: text ─────────────────────────────────────────────────── */
+  --ink: #1a1523; /* body text and titles */
+  --slate: #5b5466; /* secondary text, ledes */
+  --muted: #6b6375; /* captions, labels, table heads */
+  --on-accent: #ffffff; /* text on a filled magenta, danger or ink surface */
+
+  /* ── colour: rules and fields ─────────────────────────────────────── */
+  --rule: #ece7ef; /* soft borders and hairlines */
+  --rule-strong: #d6cedc; /* a pending tracker marker, a dashed empty state */
+  --field-border: #8e8599; /* ≥ 3:1 against white (WCAG 1.4.11) */
+
+  /* ── colour: states ───────────────────────────────────────────────── */
+  --positive: #137a4b;
+  --positive-soft: #e9f7ef;
+  --positive-soft-border: #c4e8d3;
+  --positive-halo: rgb(19 122 75 / 28%); /* the "Live" dot's pulse */
+  --warn: #d9890f; /* the amber marker of a warning (never text) */
+  --warn-ink: #8a4a00;
+  --warn-soft: #fff6e8;
+  --warn-soft-border: #f6dcae;
+  --danger: #c42b2b;
+  --danger-hover: #a52222;
+  --danger-soft: #fdeeee;
+  --danger-soft-border: #f6caca;
+  --disabled-bg: #f1eef4;
+  --disabled-border: #e4dee9;
+  --disabled-ink: #625b6c;
+  --tooltip-bg: #1f1a29; /* the tooltip bubble: why a control is greyed out */
+
+  /* ── type ─────────────────────────────────────────────────────────── */
+  /* Inter (variable, self-hosted: fonts.css); the system UI stack until it loads, or for a glyph
+     outside its Latin subset. */
+  --sans:
+    'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --text-xs: 0.75rem; /* 12 px: table heads, eyebrows, badges */
+  --text-sm: 0.8125rem; /* 13 px: captions, notes */
+  --text-md: 0.875rem; /* 14 px: secondary text */
+  --text-base: 0.9375rem; /* 15 px: body */
+  --text-lg: 1.0625rem; /* 17 px: sub-section titles */
+  --text-xl: 1.25rem; /* 20 px: card titles */
+  --text-2xl: 2rem; /* 32 px: page titles */
+  --tracking-caps: 0.06em;
+  --tracking-tight: -0.022em; /* large titles */
+
+  /* ── spacing ──────────────────────────────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+  --gutter: 16px; /* 32 px from 768 px up */
+  --page-max: 1120px;
+  --tap: 44px; /* minimum touch target (buttons, fields) */
+
+  /* ── shape and depth ──────────────────────────────────────────────── */
+  --rule-hair: 1px solid var(--rule);
+  --rule-head: 1px solid var(--rule); /* under a table head */
+  --rule-total: 2px solid var(--ink); /* under a subtotal */
+  --radius-card: 14px; /* cards, dialogs, empty states */
+  --radius: 10px; /* buttons, fields, notices */
+  --radius-sm: 6px;
+  --radius-pill: 999px; /* badges, chips, tabs */
+  --shadow-xs: 0 1px 2px rgb(26 21 35 / 5%);
+  --shadow-sm: 0 1px 2px rgb(26 21 35 / 4%), 0 4px 14px rgb(26 21 35 / 4%);
+  --shadow-md: 0 2px 6px rgb(26 21 35 / 5%), 0 18px 40px rgb(26 21 35 / 10%);
+  --shadow-accent: 0 1px 2px rgb(168 17 95 / 18%), 0 4px 12px rgb(200 21 122 / 20%); /* a primary button */
+  --shadow-accent-soft: 0 1px 2px rgb(168 17 95 / 6%), 0 12px 32px rgb(200 21 122 / 8%); /* the action card */
+
+  /* ── motion (off under prefers-reduced-motion, base.css) ─────────── */
+  --motion-fast: 0.14s ease;
+}
+
+@media (min-width: 768px) {
+  :root {
+    --gutter: 32px;
+  }
+}

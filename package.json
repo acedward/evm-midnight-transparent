@@ -1,0 +1,44 @@
+{
+  "name": "evm-midnight-transparent",
+  "private": true,
+  "type": "module",
+  "description": "Swap on Midnight from an EVM wallet: a temporary in-browser Midnight wallet per swap, bridged in and out through the ERC20 vault, with a sponsor service paying the bridge legs' DUST.",
+  "license": "Apache-2.0",
+  "packageManager": "bun@1.3.11",
+  "workspaces": [
+    "packages/*",
+    "sponsor",
+    "web"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p packages/core && tsc -p packages/wallet && tsc -p sponsor && tsc -p web && tsc -p .",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "build:web": "vite build web",
+    "e2e": "playwright test -c test/e2e/playwright.config.ts",
+    "sponsor": "bun sponsor/src/main.ts",
+    "secret-scan": "bash scripts/secret-scan.sh",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@noble/curves": "1.2.0",
+    "@playwright/test": "1.62.0",
+    "@types/node": "24.19.0",
+    "eslint": "10.11.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.12.0",
+    "happy-dom": "20.14.5",
+    "playwright-core": "1.62.0",
+    "prettier": "3.9.9",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.1",
+    "vite": "8.3.0",
+    "vitest": "5.0.2"
+  },
+  "overrides": {
+    "@midnight-ntwrk/compact-runtime": "0.19.0"
+  }
+}

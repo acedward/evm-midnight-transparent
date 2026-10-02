@@ -1,0 +1,129 @@
+# gitleaks configuration: the default rules plus this repository's own patterns.
+# Run through scripts/secret-scan.sh (before every push) and in CI.
+
+title = "evm-midnight-transparent"
+
+[extend]
+useDefault = true
+
+# ── Custom rules ─────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "env-style-wallet-secret"
+description = "A wallet secret assigned in an env-style file (WALLET=, SK=, SEED=, MNEMONIC=, PRIVATE_KEY=, SPONSOR_SEED=)"
+regex = '''(?im)^\s*(?:export\s+)?(?:WALLET|SK|SEED|MNEMONIC|PRIVATE_KEY|SPONSOR_SEED|DEPLOYER_KEY)\s*=\s*["']?((?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8}|[^\s"'#]{16,})'''
+keywords = ["wallet=", "sk=", "seed=", "mnemonic=", "private_key=", "sponsor_seed=", "deployer_key="]
+
+[[rules]]
+id = "bip39-mnemonic-labelled"
+description = "Twelve to twenty-four lowercase words after a seed, mnemonic or recovery-phrase label"
+regex = '''(?i)(?:mnemonic|seed ?phrase|recovery ?phrase|secret ?phrase)["'\s:=]+((?:[a-z]{3,8}[ \t]+){11,23}[a-z]{3,8})\b'''
+keywords = ["mnemonic", "seed phrase", "seedphrase", "recovery phrase", "secret phrase"]
+
+[[rules]]
+id = "keyed-rpc-url"
+description = "An RPC URL that carries a provider API key"
+regex = '''https://[a-z0-9.-]*(?:infura\.io|alchemy\.com|alchemyapi\.io|quiknode\.pro|ankr\.com|drpc\.org|blastapi\.io|chainstack\.com|getblock\.io|nodereal\.io|tenderly\.co)/[A-Za-z0-9/_-]{16,}'''
+keywords = ["infura", "alchemy", "quiknode", "ankr", "drpc", "blastapi", "chainstack", "getblock", "nodereal", "tenderly"]
+
+[[rules]]
+id = "labelled-hex-private-key"
+description = "A 32-byte hex value labelled as a private, secret or signing key"
+regex = '''(?i)(?:private[_-]?key|secret[_-]?key|signing[_-]?key|seed[_-]?hex)["']?\s*[:=]\s*["']?(?:0x)?([0-9a-f]{64})\b'''
+keywords = ["private", "secret", "signing", "seed"]
+
+# ── Allowlists ───────────────────────────────────────────────────────────────
+
+[[allowlists]]
+description = "Not this repository's content: installed packages (never committed; CI scans the tree after an install)"
+paths = [
+  '''(^|/)node_modules/''',
+]
+
+# The vendored vault deployment records (PROVENANCE.md): the values the default generic-api-key
+# rule flags there are PUBLIC: the MPC's and the deployer's public keys, the SHA-256 of public
+# verifier keys, and the vault's per-token domain separators (public hashes the token colours are
+# derived from). Scoped to that rule, those files AND those field names only. (A top-level
+# [[allowlists]] with targetRules does not reach a default rule in gitleaks 8.28; extending the
+# rule's own allowlist does.)
+[[rules]]
+id = "generic-api-key"
+# The lockfile IS this repository's content, so every custom rule scans it (audit F-A18); only this
+# generic rule, which can read its package integrity hashes as keys, skips it.
+[[rules.allowlists]]
+paths = ['''(^|/)bun\.lock$''']
+
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/core/src/tokens/deployments/[a-z0-9-]+\.json$''']
+regexTarget = "match"
+regexes = ['''^(?:mpcResponseKey|mpcRootPublicKey|deployerPublicKey|publishTokenMetadata|verifierKeySha256|vaultTokenDomainSeparator)"''']
+
+# The staging kernel's GET /v1/known-tokens, captured verbatim (a test fixture): the values the
+# rule flags there are PUBLIC token colours. Scoped to that rule, that capture AND that field.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/core/test/fixtures/kernel/staging-[0-9-]+/known-tokens\.json$''']
+regexTarget = "match"
+regexes = ['''^token_color"''']
+
+# The vault's generated contract module, vendored byte for byte (packages/wallet/src/vendor/vault/
+# PROVENANCE.md): its `expectedVk` map holds the SHA-256 of each circuit's PUBLIC verifier key, and the
+# rule reads the circuit name `publishTokenMetadata` as a token label. Scoped to that rule, that file
+# AND that one entry's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/wallet/src/vendor/vault/Erc20Vault/contract/index\.js$''']
+regexTarget = "match"
+regexes = ['''^publishTokenMetadata': '[0-9a-f]{64}'$''']
+
+# The test that pins that same map against the chain (packages/wallet/test/vendor-vault.test.ts):
+# the same PUBLIC verifier-key SHA-256, keyed by the circuit's name. Scoped to that rule, that file
+# AND that one entry's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)packages/wallet/test/vendor-vault\.test\.ts$''']
+regexTarget = "match"
+regexes = ['''^publishTokenMetadata: '[0-9a-f]{64}'$''']
+
+# The vault key job pins the SHA-256 of the vault's PUBLIC Compact sources (deploy/vault-keys/build.sh);
+# the rule reads the variable name `TOKEN_METADATA_SHA256` (the MIP-0018 module's source hash) as a
+# token label. Scoped to that rule, that file AND that one assignment's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)deploy/vault-keys/build\.sh$''']
+regexTarget = "match"
+regexes = ['''^TOKEN_METADATA_SHA256=[0-9a-f]{64}$''']
+
+# The web bundle (CI scans web/dist): the page builds the token registry from those same vendored
+# records, so the build carries their PUBLIC per-token domain separators. Scoped to that rule, the
+# bundle's JavaScript AND that one field's shape.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js$''']
+regexTarget = "match"
+regexes = ['''^vaultTokenDomainSeparator:`[0-9a-f]{64}`$''']
+# The web bundle carries the in-browser wallet since P3 (a lazily loaded chunk): the vault's vendored
+# contract module (see its entry above) with the PUBLIC verifier-key SHA-256 of `publishTokenMetadata`,
+# minified in the JavaScript and verbatim in its source map. Scoped to that rule, the bundle AND that
+# one entry's shapes.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js(\.map)?$''']
+regexTarget = "match"
+regexes = [
+  '''^publishTokenMetadata:`[0-9a-f]{64}`$''',
+  '''^publishTokenMetadata': '[0-9a-f]{64}'$''',
+]
+# The ledger's wasm-bindgen glue in the bundle's source maps: the rule reads a list of generated
+# import names (`__wbg_<name>_<16 hex>`) and two API names (`signatureVerifyingKey`,
+# `signingKeyFromBip340`) as labelled keys. Public library code. Scoped to that rule, the bundle's
+# source maps AND those shapes.
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)web/dist/assets/[A-Za-z0-9_.-]+\.js\.map$''']
+regexTarget = "match"
+regexes = [
+  '''^__wbg_[a-z0-9_]+_[0-9a-f]{16}","__wbg_[a-z0-9_]+_[0-9a-f]{16}"$''',
+  '''^signatureVerifyingKey","signingKeyFromBip340"$''',
+]

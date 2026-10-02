@@ -1,0 +1,155 @@
+# EVM Midnight Swap: the deployment bundle (plan 00048 P3 E.1; the same-host deployment next to MN
+# Bank is P4.1). Every setting is in deploy/.env.example.
+#
+#   cp deploy/.env.example deploy/.env          # then edit it; secrets stay in files, never here
+#   docker compose -f deploy/compose.yml build
+#   docker compose -f deploy/compose.yml up vault-keys   # first time: compile + verify (~2-5 min)
+#   docker compose -f deploy/compose.yml up -d
+#   docker compose -f deploy/compose.yml ps               # everything healthy?
+#
+# Services, in start order:
+#   vault-keys    one-shot (deploy/vault-keys/build.sh ensure): the ERC20 vault and the Signet
+#                 singleton compiled WITH keys by compactc 0.34.0 from the pinned sources into the
+#                 `vault-keys` volume, and verified against the chain (every bridge circuit's verifier
+#                 key = the deployed one). Later starts only re-verify. A failure stops everything below.
+#   proof-server  midnightntwrk/proof-server 9.0.0-rc.6 (pinned by digest): the sponsor proves the
+#                 swaps' takes and withdrawals and its own DUST spends there. Internal only.
+#   sponsor       pays the bridge legs' DUST from its own wallet, drives the deposits and the one
+#                 withdrawal lane, runs the MPC relayer, proves for the swaps (sponsor/README.md).
+#                 Mounts `vault-keys` read-only; keeps its swaps (public values only) in `sponsor-data`.
+#   web           the static site on unprivileged nginx, with /sponsor/ proxied to the sponsor.
+#
+# Nothing secret is in this file or in any image: the sponsor seed and the Sepolia RPC URL are
+# files on the host (SPONSOR_SEED_HOST_FILE, SEPOLIA_RPC_URL_HOST_FILE), mounted as secrets.
+# Adapted from MN Bank (acedward/passport-evm-dapp @ 911647b, deploy/compose.yml).
+
+name: ${COMPOSE_PROJECT_NAME:-emt}
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: '5'
+
+services:
+  vault-keys:
+    <<: [*hardening, *logging]
+    build:
+      context: ..
+      dockerfile: deploy/vault-keys.Dockerfile
+    image: evm-midnight-transparent/vault-keys:${IMAGE_TAG:-local}
+    command: ['ensure']
+    environment:
+      MIDNIGHT_INDEXER_URL: ${MIDNIGHT_INDEXER_URL:-}
+      IMPORT_DIR: /import
+    volumes:
+      - vault-keys:/app/vault-managed
+    mem_limit: ${VAULT_KEYS_JOB_MEM_LIMIT:-8g}
+    restart: 'no'
+
+  proof-server:
+    <<: [*hardening, *logging]
+    # 9.0.0-rc.6, the stagenet pin. It has no shell or HTTP client, so it has no Docker health
+    # check: the sponsor's /v1/health reports it (proofServer.reachable, version).
+    image: midnightntwrk/proof-server:9.0.0-rc.6@sha256:38a819eacde273f725551fdf90ca7c31ebf3c0ff145f3ed58ee35f92fb7ce95b
+    environment:
+      PORT: '6300'
+      MIDNIGHT_PP: /proof-params
+    volumes:
+      - proof-params:/proof-params
+    mem_limit: ${PROOF_SERVER_MEM_LIMIT:-10g}
+    restart: unless-stopped
+
+  sponsor:
+    <<: [*hardening, *logging]
+    build:
+      context: ..
+      dockerfile: deploy/sponsor.Dockerfile
+    image: evm-midnight-transparent/sponsor:${IMAGE_TAG:-local}
+    env_file:
+      # Every sponsor setting (deploy/.env.example; sponsor/README.md has the full list).
+      - path: ${SPONSOR_ENV_FILE:-.env}
+        required: true
+    environment:
+      HOME: /tmp
+      SPONSOR_NETWORK: ${SPONSOR_NETWORK:-stagenet}
+      SPONSOR_ENABLED: 'true'
+      SPONSOR_TRUST_PROXY: ${SPONSOR_TRUST_PROXY:-true}
+      MIDNIGHT_PROOF_SERVER_URL: http://proof-server:6300
+      VAULT_MANAGED_DIR: /app/vault-managed
+      SPONSOR_DATA_DIR: /data
+      SPONSOR_SEED_FILE: /run/secrets/sponsor_seed
+      SEPOLIA_RPC_URL_FILE: /run/secrets/sepolia_rpc_url
+    secrets:
+      - sponsor_seed
+      - sepolia_rpc_url
+    volumes:
+      - vault-keys:/app/vault-managed:ro
+      - sponsor-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    init: true
+    ports:
+      # Operators only (health checks from the host). The public reaches the sponsor through web.
+      - 127.0.0.1:${SPONSOR_HOST_PORT:-18091}:8080
+    depends_on:
+      vault-keys:
+        condition: service_completed_successfully
+      proof-server:
+        condition: service_started
+    mem_limit: ${SPONSOR_MEM_LIMIT:-4g}
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  web:
+    <<: [*hardening, *logging]
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+    image: evm-midnight-transparent/web:${IMAGE_TAG:-local}
+    environment:
+      WEB_NETWORK: ${SPONSOR_NETWORK:-stagenet}
+      WEB_SPONSOR_URL: ${WEB_SPONSOR_URL:-/sponsor}
+      WEB_SPONSOR_UPSTREAM: sponsor:8080
+      WEB_TRUSTED_PROXIES: ${WEB_TRUSTED_PROXIES:-127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      # Empty: the tested default policy (deploy/web/csp.sh); "off": none; else that policy.
+      WEB_CONTENT_SECURITY_POLICY: ${WEB_CONTENT_SECURITY_POLICY:-}
+      WEB_CSP_CONNECT_EXTRA: ${WEB_CSP_CONNECT_EXTRA:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    ports:
+      - ${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_HOST_PORT:-18090}:8080
+    depends_on:
+      sponsor:
+        condition: service_started
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    mem_limit: ${WEB_MEM_LIMIT:-256m}
+    restart: unless-stopped
+
+volumes:
+  # The compiled vault and singleton with their prover and verifier keys (about 1 GB), written by
+  # vault-keys.
+  vault-keys: {}
+  # The proof server's parameters and zswap keys, fetched at its first start.
+  proof-params: {}
+  # The sponsor's swaps (public values only; the bearer tokens as SHA-256).
+  sponsor-data: {}
+
+secrets:
+  sponsor_seed:
+    file: ${SPONSOR_SEED_HOST_FILE:?set SPONSOR_SEED_HOST_FILE to the sponsor seed file on the host (deploy/.env.example)}
+  sepolia_rpc_url:
+    file: ${SEPOLIA_RPC_URL_HOST_FILE:?set SEPOLIA_RPC_URL_HOST_FILE to the file holding the Sepolia RPC URL (deploy/.env.example)}

@@ -1,0 +1,517 @@
+// The sponsor's swap API: paths, request and response shapes, shared by the web app, the temporary
+// wallet and the sponsor (plan 00048, "Lane contracts": the sponsor API, and L-SPONSOR's answer to
+// L-WEB's reading of it). A change here is a change of the wire contract for every side.
+//
+//   GET  /v1/config                          public configuration (network, vault, tokens, EIP-712 domains)
+//   GET  /v1/health                          health (also served at /health for monitors)
+//   GET  /v1/auth/nonce                      a single-use nonce for the open-swap signature
+//   POST /v1/swaps                           open (or re-open) a swap: ONE EIP-712 SponsorAction signature
+//   GET  /v1/swaps/:id                       the swap's state machine                         (bearer)
+//   GET  /v1/swaps/:id/withdraw-params       what startWithdraw needs, except the coin         (bearer)
+//   POST /v1/swaps/:id/prove                 prove a take or a startWithdraw on the sponsor    (bearer)
+//   POST /v1/swaps/:id/withdraw              the proven, bound startWithdraw: DUST, lane, relay (bearer)
+//   POST /v1/swaps/:id/take                  the page reports the take's outcome               (bearer)
+//
+// "bearer" = `Authorization: Bearer <swapToken>`, the random token `POST /v1/swaps` returns. The
+// token is a credential: keep it in memory only. Re-opening the swap (same swap id, owner, terms
+// and temporary keys, a fresh signature) returns a new token and revokes the old one.
+//
+// Hex values are lowercase without `0x` (colours, keys, offer ids, request ids, Midnight hashes)
+// unless they are EVM values (addresses and Sepolia hashes, `0x…`). Amounts are decimal strings of
+// base units. Errors are `{error: {code, message, detail?}}` (./api.ts `ApiError`).
+
+import { z } from 'zod';
+
+import { SignedSponsorActionSchema } from './auth.js';
+
+export const SWAP_PATHS = {
+  config: '/v1/config',
+  health: '/v1/health',
+  nonce: '/v1/auth/nonce',
+  swaps: '/v1/swaps',
+  swap: (swapId: string) => `/v1/swaps/${swapId}`,
+  withdrawParams: (swapId: string) => `/v1/swaps/${swapId}/withdraw-params`,
+  prove: (swapId: string) => `/v1/swaps/${swapId}/prove`,
+  withdraw: (swapId: string) => `/v1/swaps/${swapId}/withdraw`,
+  take: (swapId: string) => `/v1/swaps/${swapId}/take`,
+} as const;
+
+/** The action name the open-swap signature carries. */
+export const OPEN_SWAP_ACTION = 'open-swap' as const;
+
+const hex64 = z.string().regex(/^[0-9a-f]{64}$/, 'expected 64 lowercase hex characters (no 0x)');
+const decimal = z.string().regex(/^[1-9][0-9]{0,38}$/, 'expected a positive decimal integer string');
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'expected a 0x-prefixed 20-byte address');
+/** A swap id in a path or body: the swap's PUBLIC id, `publicSwapId(salt)` (./swap-key.ts), 32 bytes,
+ *  with or without 0x. Never the "start swap" salt itself: the salt stays in the browser's record
+ *  (plan 00048 P4.2-fix, audit C14). */
+export const SwapIdSchema = z
+  .string()
+  .regex(/^(0x)?[0-9a-fA-F]{64}$/, 'expected a 32-byte swap id')
+  .transform((s) => s.replace(/^0x/i, '').toLowerCase());
+
+// ── Open ───────────────────────────────────────────────────────────────────────
+
+export const SwapLegSchema = z.object({ colour: hex64, amount: decimal }).strict();
+export type SwapLegWire = z.infer<typeof SwapLegSchema>;
+
+/** What the open-swap signature covers (its `payloadHash` is keccak256 of this object's canonical JSON). */
+export const OpenSwapPayloadSchema = z
+  .object({
+    /** The kernel's offer id. */
+    offerId: hex64,
+    /** The user's EVM address: it must be the signature's `owner`. */
+    evmAddress,
+    /** What the user pays: the offer's WANTED leg, bridged in. */
+    pay: SwapLegSchema,
+    /** What the user receives: the offer's GIVEN leg, bridged out. */
+    receive: SwapLegSchema,
+    /** The temporary wallet's shielded coin public key (the deposit's recipient). */
+    tempCoinPk: hex64,
+    /** The temporary wallet's shielded encryption public key (seals the minted coins to it). */
+    tempEncPk: hex64,
+  })
+  .strict();
+export type OpenSwapPayload = z.infer<typeof OpenSwapPayloadSchema>;
+
+export const OpenSwapRequestSchema = z
+  .object({
+    /** The swap's public id (`publicSwapId(salt)`, never the salt). It must be the signature's `swap`. */
+    swap: SwapIdSchema,
+    payload: OpenSwapPayloadSchema,
+    auth: SignedSponsorActionSchema,
+  })
+  .strict();
+export type OpenSwapRequest = z.input<typeof OpenSwapRequestSchema>;
+
+/** The sweep's EIP-1559 fields, sized when the swap opens (spec Q5 A): the user sends `ethWei`
+ *  (= gasLimit × maxFeePerGas) to the deposit address with the token. Decimal strings.
+ *  While the swap is `awaiting_funds` the sponsor may RAISE them (never lower them) when the live
+ *  base fee outgrows them, in the swap view and in a re-open's answer: the page then tops the
+ *  deposit address up to the new `ethWei`. `startDeposit` signs the largest fee the ETH actually
+ *  at the address covers (plan 00048 P4.2-fix, audit C2). */
+export const SweepGasSchema = z.object({
+  gasLimit: decimal,
+  maxFeePerGas: decimal,
+  maxPriorityFeePerGas: decimal,
+  ethWei: decimal,
+});
+export type SweepGas = z.infer<typeof SweepGasSchema>;
+
+// ── The state machine ──────────────────────────────────────────────────────────
+
+/**
+ *   awaiting_funds → depositing → minted → taking → taken → withdrawing → done
+ *                                    └──────────────────→ bridging_back → done   ("Swap is not available")
+ *   a refund (the vault's transfer did not happen) → back to minted; any → failed
+ *   awaiting_funds → partial: a completed deposit request minted LESS than the pay amount (e.g. anyone's
+ *   small `startDeposit` that won the deposit address's nonce race); partial → depositing (the sponsor
+ *   deposits the remainder once it is at the address) → minted, or partial → bridging_back (the page
+ *   returns what arrived) (plan 00048 P4.2-fix3, audit S2).
+ */
+export const SWAP_STATES = [
+  'awaiting_funds',
+  'depositing',
+  'partial',
+  'minted',
+  'taking',
+  'taken',
+  'withdrawing',
+  'bridging_back',
+  'done',
+  'failed',
+] as const;
+export type SwapState = (typeof SWAP_STATES)[number];
+
+export const TERMINAL_SWAP_STATES: readonly SwapState[] = ['done', 'failed'];
+
+export const StageSchema = z.object({
+  stage: z.string(),
+  /** Unix seconds. */
+  at: z.number().int(),
+  /** Public details only: hashes, ids, heights, amounts. */
+  detail: z.record(z.string(), z.string()).optional(),
+});
+export type StageEntry = z.infer<typeof StageSchema>;
+
+/** The attested outcome of an MPC-signed Sepolia transaction. */
+export const ATTESTED_KINDS = ['success', 'returned-false', 'never-executed'] as const;
+
+export const DepositViewSchema = z.object({
+  /** waiting-for-funds, funds-seen, starting, started, mpc-signed, evm-broadcast, evm-final,
+   *  attested, completing, completed, abandoned (a never-executed sweep; the funds wait for a retry). */
+  stage: z.string(),
+  stages: z.array(StageSchema),
+  requestId: z.string().optional(),
+  /** `startDeposit`'s Midnight transaction hash, and midnight-js's identifier. */
+  startTx: z.string().optional(),
+  startTxId: z.string().optional(),
+  /** The MPC-signed sweep on Sepolia. */
+  sweepTx: z.string().optional(),
+  completeTx: z.string().optional(),
+  completeTxId: z.string().optional(),
+  attested: z.enum(ATTESTED_KINDS).optional(),
+  attempts: z.number().int(),
+});
+export type DepositView = z.infer<typeof DepositViewSchema>;
+
+export const WITHDRAW_KINDS = ['swap', 'bridge-back'] as const;
+export type WithdrawKind = (typeof WITHDRAW_KINDS)[number];
+
+export const WithdrawViewSchema = z.object({
+  /** `swap`: the received token to the user; `bridge-back`: the paid token back to the user. */
+  kind: z.enum(WITHDRAW_KINDS),
+  colour: z.string(),
+  amount: z.string(),
+  /** queued, starting, started, mpc-signed, evm-broadcast, evm-not-broadcast, evm-final, attested,
+   *  completing, completed, refunded, failed. */
+  stage: z.string(),
+  stages: z.array(StageSchema),
+  requestId: z.string().optional(),
+  startTx: z.string().optional(),
+  startTxId: z.string().optional(),
+  /** The vault's MPC-signed ERC20 transfer on Sepolia. */
+  sepoliaTx: z.string().optional(),
+  completeTx: z.string().optional(),
+  completeTxId: z.string().optional(),
+  attested: z.enum(ATTESTED_KINDS).optional(),
+  /** How many withdrawals of this swap were refunded, this one included (a refunded withdrawal
+   *  counts itself; plan 00048 P4.2-fix, audit C1). */
+  refunds: z.number().int(),
+  error: z.object({ code: z.string(), message: z.string() }).optional(),
+});
+export type WithdrawView = z.infer<typeof WithdrawViewSchema>;
+
+/** Why the latest withdrawal ended without moving the funds (null: none yet, running, or completed).
+ *  - `refunded`: the vault's transfer did not happen (or the token returned false); the coin is back
+ *    in the temporary wallet;
+ *  - `start-failed`: the start never landed (a preflight, a restart, a stale EVM nonce or gas, a
+ *    submission failure): nothing moved;
+ *  - `stale-vault`: the vault moved between the proof and the head of the lane: nothing moved. */
+export const WITHDRAWAL_LAST = ['refunded', 'start-failed', 'stale-vault'] as const;
+export type WithdrawalLast = (typeof WITHDRAWAL_LAST)[number];
+
+/** The retry signal (plan 00048 P4.2-fix, shared contract change 1; audit C1). */
+export const WithdrawalStatusSchema = z.object({
+  /** Withdrawal attempts so far (every `/withdraw` the sponsor accepted). */
+  attempts: z.number().int(),
+  last: z.enum(WITHDRAWAL_LAST).nullable(),
+  /** True when the temporary wallet holds the funds again and the page should rebuild the
+   *  withdrawal (withdraw-params → build → /prove → /withdraw) and submit it again (plan Q9 A). */
+  retry: z.boolean(),
+});
+export type WithdrawalStatus = z.infer<typeof WithdrawalStatusSchema>;
+
+/** What a `partial` swap lets the page do (plan 00048 P4.2-fix3, audit S2):
+ *  - `wait`: the sponsor deposits the remainder BY ITSELF once the deposit address holds `remaining` of
+ *    the pay token and the sweep's ETH (`sweepGas.ethWei`, which may rise); the page tops the address up
+ *    with what is missing (usually only ETH: a foreign sweep paid its gas from the address);
+ *  - `bridge-back`: `withdraw-params?kind=bridge-back` answers `amount = minted`, and the usual
+ *    build → /prove → /withdraw returns what the temporary wallet received. */
+export const PARTIAL_OPTIONS = ['wait', 'bridge-back'] as const;
+export type PartialOption = (typeof PARTIAL_OPTIONS)[number];
+
+const baseUnits = z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units');
+
+/** The `partial` state's amounts (present iff `state === 'partial'`), pay-token base units. */
+export const PartialDepositSchema = z.object({
+  /** What the temporary wallet holds from completed deposits (every completed request for its recipient,
+   *  whoever started it), minus what a Bridge back from `partial` already returned. */
+  minted: baseUnits,
+  /** What is still to be deposited for the wallet to hold the whole pay amount. After a loss to another
+   *  party's settle (`SwapView.settledElsewhere`, audit T1) the rest can no longer arrive in full: it is
+   *  then what the sponsor will still deposit, i.e. what waits at the deposit address. */
+  remaining: baseUnits,
+  /** The pay token the sponsor last read at the deposit address (informative). */
+  atAddress: baseUnits,
+  /** `wait` iff `remaining > 0`; `bridge-back` iff `minted > 0`. */
+  options: z.array(z.enum(PARTIAL_OPTIONS)),
+});
+export type PartialDeposit = z.infer<typeof PartialDepositSchema>;
+
+/**
+ * A vault request for this swap's recipient that ANOTHER party settled (plan 00048 P4.2-fix4, audit
+ * T1 / F-A41). The vault's `completeDeposit`, `completeWithdraw`, `refundWithdraw` and `abandonDeposit`
+ * are permissionless, and the submitter of a settle chooses the minted coin's nonce and the key its
+ * ciphertext is sealed to; the nonce is never public (only the coin's commitment is). A coin minted
+ * by another party's settle is owned by the temporary coin key but described only to that party: the
+ * temporary wallet can neither see nor spend it, and nobody else can spend it (`lost`). Settles that
+ * mint nothing (a successful withdrawal, an abandon, a token that returned false) lose nothing.
+ */
+export const SETTLED_ELSEWHERE_KINDS = ['deposit', 'withdraw'] as const;
+export const SettledElsewhereSchema = z.object({
+  kind: z.enum(SETTLED_ELSEWHERE_KINDS),
+  /** The vault request (absent for a foreign sweep the sponsor only saw on Sepolia). */
+  requestId: hex64.optional(),
+  attested: z.enum(ATTESTED_KINDS),
+  /** The colour and amount the settle minted (or would have minted) to the temporary coin key. */
+  colour: hex64,
+  amount: z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units'),
+  /** True when that settle minted `amount` of `colour` that the temporary wallet cannot use. */
+  lost: z.boolean(),
+  /** The Sepolia transaction (the sweep, or the withdrawal's transfer), when known. */
+  evmTx: z.string().optional(),
+  /** Unix seconds: when the sponsor found it. */
+  at: z.number().int(),
+});
+export type SettledElsewhere = z.infer<typeof SettledElsewhereSchema>;
+
+/** The `failed` reason of a swap whose funds were all lost to settles by other parties (audit T1):
+ *  never recoverable. */
+export const SETTLED_ELSEWHERE_REASON = 'settled-elsewhere' as const;
+
+export const SwapLegViewSchema = z.object({
+  colour: z.string(),
+  amount: z.string(),
+  symbol: z.string(),
+  erc20Address: z.string(),
+  decimals: z.number().int(),
+});
+
+export const SwapViewSchema = z.object({
+  swapId: z.string(),
+  state: z.enum(SWAP_STATES),
+  evmAddress: z.string(),
+  offerId: z.string(),
+  pay: SwapLegViewSchema,
+  receive: SwapLegViewSchema,
+  tempCoinPk: z.string(),
+  depositAddress: z.string(),
+  /** The pay token's ERC20 and the exact amount to send to the deposit address. */
+  erc20Address: z.string(),
+  amount: z.string(),
+  sweepGas: SweepGasSchema,
+  deposit: DepositViewSchema.nullable(),
+  takeTx: z.string().nullable(),
+  /** The current (latest) withdrawal. */
+  withdraw: WithdrawViewSchema.nullable(),
+  /** Every withdrawal attempt, oldest first (refunded ones included). */
+  withdrawals: z.array(WithdrawViewSchema),
+  /** Whether the page should rebuild and retry the withdrawal now (audit C1). This sponsor always
+   *  sends it; optional in the schema only so views recorded before the field still parse. */
+  withdrawal: WithdrawalStatusSchema.optional(),
+  /** On `partial` (always present then): what arrived, what is missing, and what the page may do
+   *  (audit S2). */
+  partial: PartialDepositSchema.optional(),
+  /** Vault requests of this swap that another party settled, oldest first; present only when there
+   *  is one (audit T1). A `lost` entry's amount is gone for the user. */
+  settledElsewhere: z.array(SettledElsewhereSchema).optional(),
+  /** On `done`. */
+  outcome: z.enum(['swapped', 'bridged-back']).optional(),
+  /** On `failed`: a stable code, and a sentence for the page. */
+  reason: z.string().optional(),
+  message: z.string().optional(),
+  /** On `failed` (always present then): true when the same open-swap (a resume: same swap id,
+   *  owner, terms and temporary keys) revives the swap, e.g. the funds reached the deposit address
+   *  late or the sponsor could not start the deposit; the page offers Resume for it (audit C5). */
+  recoverable: z.boolean().optional(),
+  /** On a recoverable `failed` swap the sponsor will not revive yet (a deposit re-arm paced by its
+   *  cooldown or its daily count): unix seconds from which a re-open revives it (audit R3). */
+  retryAt: z.number().int().optional(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+});
+export type SwapView = z.infer<typeof SwapViewSchema>;
+
+export const OpenSwapResponseSchema = z.object({
+  swapToken: z.string().min(32),
+  depositAddress: z.string(),
+  sweepGas: SweepGasSchema,
+  erc20Address: z.string(),
+  amount: z.string(),
+  /** True when this swap id was already open (a resume). */
+  resumed: z.boolean(),
+  swap: SwapViewSchema,
+});
+export type OpenSwapResponse = z.infer<typeof OpenSwapResponseSchema>;
+
+// ── Withdrawals ────────────────────────────────────────────────────────────────
+
+/** Everything `startWithdraw` needs except the coin (the browser picks a fresh random coin nonce). */
+export const WithdrawParamsSchema = z.object({
+  kind: z.enum(WITHDRAW_KINDS),
+  colour: hex64,
+  amount: decimal,
+  erc20Address: evmAddress,
+  /** The user's EVM address. */
+  dest: evmAddress,
+  /** `left(tempCoinPk)`: a refund is minted back to the temporary wallet. */
+  refundRecipient: hex64,
+  /** The sponsor's gas policy for the vault account's transfer; nothing else is accepted. */
+  gas: z.object({ gasLimit: decimal, maxFeePerGas: decimal, maxPriorityFeePerGas: decimal, keyVersion: decimal }),
+  /** The vault EVM account's nonce to sign (decimal, may be "0"). */
+  evmNonce: z.string().regex(/^[0-9]{1,20}$/),
+  vaultAddress: hex64,
+});
+export type WithdrawParams = z.infer<typeof WithdrawParamsSchema>;
+
+export const PROVE_PURPOSES = ['take', 'withdraw'] as const;
+export type ProvePurpose = (typeof PROVE_PURPOSES)[number];
+
+/** Upper bound for a transaction's hex (the sponsor's body limit also applies). */
+const txHex = z
+  .string()
+  .regex(/^(0x)?[0-9a-fA-F]+$/, 'expected hex')
+  .max(1_500_000)
+  .refine((s) => s.replace(/^0x/i, '').length % 2 === 0, 'odd-length hex');
+
+/** A coin the transaction pays to the temporary wallet, disclosed so the sponsor can recompute its
+ *  commitment with the temporary coin public key (plan 00048 P4.2-fix2, audit R1 / F-B21). */
+export const WalletOutputSchema = z
+  .object({ nonce: hex64, colour: hex64, value: z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units') })
+  .strict();
+export type WalletOutput = z.infer<typeof WalletOutputSchema>;
+
+/** At most this many disclosed wallet outputs (a transaction has at most 4 coins in and out). */
+export const MAX_WALLET_OUTPUTS = 4;
+
+/** EVERY coin the transaction pays to the temporary wallet: a take's received coin and its change, a
+ *  withdrawal's change (none when its coin was exact). Every guaranteed output that is neither the
+ *  vault's coin (a withdrawal) nor one of these is refused (`invalid-tx` / `undisclosed-output`). */
+const walletOutputs = z.array(WalletOutputSchema).max(MAX_WALLET_OUTPUTS).optional();
+
+export const ProveRequestSchema = z.discriminatedUnion('purpose', [
+  z.object({ purpose: z.literal('take'), tx: txHex, walletOutputs }).strict(),
+  z
+    .object({
+      purpose: z.literal('withdraw'),
+      tx: txHex,
+      walletOutputs,
+      /** The nonce of the coin the call hands to the vault (public: it is in the call's arguments). */
+      coinNonce: hex64,
+      /** The vault account's EVM nonce the call signs (from withdraw-params). */
+      evmNonce: z.string().regex(/^[0-9]{1,20}$/),
+      /** Which withdrawal this is (from withdraw-params); inferred when absent. */
+      kind: z.enum(WITHDRAW_KINDS).optional(),
+    })
+    .strict(),
+]);
+export type ProveRequest = z.input<typeof ProveRequestSchema>;
+
+/** `tx`: `Transaction<signature, proof, pre-binding>` hex; the browser binds it. */
+export const ProveResponseSchema = z.object({ tx: z.string() });
+export type ProveResponse = z.infer<typeof ProveResponseSchema>;
+
+/** `tx`: the bound `Transaction<signature, proof, binding>` hex whose calls this swap's latest
+ *  `/prove withdraw` validated. */
+export const WithdrawRequestSchema = z.object({ tx: txHex }).strict();
+export type WithdrawRequest = z.input<typeof WithdrawRequestSchema>;
+
+export const TakeReportSchema = z.discriminatedUnion('outcome', [
+  z.object({ outcome: z.literal('taken'), takeTx: hex64 }).strict(),
+  z.object({ outcome: z.literal('not-available') }).strict(),
+]);
+export type TakeReport = z.input<typeof TakeReportSchema>;
+
+export const SwapResponseSchema = z.object({ swap: SwapViewSchema });
+export type SwapResponse = z.infer<typeof SwapResponseSchema>;
+
+// ── Error codes ────────────────────────────────────────────────────────────────
+
+/** The `error.code` values the swap routes answer with, beyond the generic ones (bad-request,
+ *  rate-limited, not-found, unauthorised, internal-error). */
+export const SWAP_ERRORS = {
+  /** 409: the swap is not in a state that allows this call. */
+  wrongState: 'wrong-state',
+  /** 409: a known swap id with other terms, keys or owner. */
+  conflict: 'swap-conflict',
+  /** 409: the offer is gone (consumed, expired, cancelled) or not in the book. */
+  offerNotAvailable: 'offer-not-available',
+  /** 422: the offer's legs are not the request's pay/receive, or not swappable. */
+  offerMismatch: 'offer-mismatch',
+  /** 422: the transaction is not the one this swap may have proven or paid for (detail says why). */
+  invalidTx: 'invalid-tx',
+  /** 409: the vault moved since the transaction was built: rebuild and prove again. Also (detail
+   *  `approval-outdated`) at `/withdraw`, for a proof approved by an older sponsor (audit S8). */
+  staleVaultState: 'stale-vault-state',
+  /** 409: the EVM nonce is not the one the sponsor's withdrawal lane expects next (the vault
+   *  account's pending nonce past this sponsor's live reservations), or the gas it signs no longer
+   *  covers the live base fee: rebuild and prove again. */
+  staleEvmNonce: 'stale-evm-nonce',
+  /** 409: `/withdraw` without a matching `/prove withdraw`. */
+  notProven: 'not-proven',
+  /** 409: a withdrawal of this swap is already running. */
+  withdrawalInProgress: 'withdrawal-in-progress',
+  /** 429: the swap's proof budget is spent. */
+  proofBudget: 'proof-budget',
+  /** 429: too many open swaps for this EVM address, or its daily swap allowance is used, or (detail
+   *  `client`) too many swaps waiting for funds from this client (its IPv4 address or IPv6 /48). A
+   *  swap waits for funds until its WHOLE pay amount reached the deposit address (audit S5). */
+  tooManySwaps: 'too-many-swaps',
+  /** 422: a new swap (or the revival of one that received nothing) needs the EVM address to hold the
+   *  pay amount of the pay token (detail `token`) and the sweep's ETH (detail `eth`) (audit R4). */
+  insufficientFunds: 'insufficient-funds',
+  /** 503: too many swaps are waiting for funds right now (all addresses together); try later. */
+  sponsorBusy: 'sponsor-busy',
+  /** 503: the sponsor's daily DUST budget is spent; new swaps wait for tomorrow's. */
+  sponsorBudget: 'sponsor-budget',
+  /** 503: the sponsor cannot pay right now, or the bridge / prover is unavailable. */
+  sponsorUnavailable: 'sponsor-unavailable',
+  sponsorLow: 'sponsor-low',
+  bridgeUnavailable: 'bridge-unavailable',
+  proverUnavailable: 'prover-unavailable',
+} as const;
+
+/** `invalid-tx` details. */
+export const INVALID_TX_DETAILS = [
+  'not-a-transaction',
+  'unshielded',
+  'dust',
+  'fallible',
+  'contract-calls',
+  'no-shielded',
+  'too-many-coins',
+  'wrong-offer',
+  'not-balanced',
+  'another-colour',
+  'wrong-colour',
+  'wrong-amount',
+  'extra-calls',
+  'missing-call',
+  'wrong-contract',
+  'wrong-entry-point',
+  'wrong-call',
+  'deploy-or-maintenance',
+  /** The coin a withdrawal hands to the vault is not the one this withdrawal names (audit C4). */
+  'missing-output',
+  /** More shielded coins than the take or withdrawal needs: an extra transfer (audit C4). */
+  'extra-coins',
+  /** A contract-owned coin spent, or a coin paid to a contract other than through the call. */
+  'contract-coin',
+  /** An output that is neither the vault's coin nor one of the disclosed `walletOutputs` (audit R1). */
+  'undisclosed-output',
+] as const;
+export type InvalidTxDetail = (typeof INVALID_TX_DETAILS)[number];
+
+// ── Public configuration ───────────────────────────────────────────────────────
+
+export const SwapConfigSchema = z.object({
+  network: z.string(),
+  chainId: z.number().int(),
+  sponsorVersion: z.string(),
+  appName: z.string(),
+  eip712: z.object({
+    sponsorDomain: z.object({ name: z.string(), version: z.string(), chainId: z.number().int() }),
+    swapKeyDomain: z.object({ name: z.string(), version: z.string(), chainId: z.number().int() }),
+  }),
+  bridge: z.object({ vaultAddress: z.string(), vaultEvmAddress: z.string(), signetSingleton: z.string() }),
+  tokens: z.array(
+    z.object({
+      symbol: z.string(),
+      name: z.string(),
+      midnightName: z.string(),
+      decimals: z.number().int(),
+      sepoliaAddress: z.string(),
+      midnightColour: z.string(),
+    }),
+  ),
+  kernelUrl: z.string(),
+  batcher: z.object({ url: z.string(), target: z.string() }),
+  limits: z.object({
+    authMaxTtlSeconds: z.number().int(),
+    /** A new swap's offer must expire at least this far ahead. */
+    minOfferTtlSeconds: z.number().int(),
+    proofsPerSwap: z.number().int(),
+  }),
+});
+export type SwapConfig = z.infer<typeof SwapConfigSchema>;

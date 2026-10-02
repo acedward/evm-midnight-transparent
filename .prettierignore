@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+bun.lock
+# Vendored byte-for-byte from acedward/passport; never reformat
+packages/core/src/tokens/deployments/*.json
+packages/core/src/vendor/
+# Vendored byte-for-byte from the vault (acedward/passport PR #4); a test checks its sha256
+sponsor/src/bridge/vendor/relayer.ts
+# The vault's generated contract modules (compactc 0.34.0 output); a test checks their sha256
+packages/wallet/src/vendor/
+# Prose and tables are formatted by hand
+*.md
+# Kernel responses captured verbatim from the staging exchange; never reformat
+packages/core/test/fixtures/kernel/staging-*/
