@@ -2,7 +2,7 @@
 // only when `config.json` has a `mock` block (a separate chunk; the live build never runs it).
 //
 // The specs steer it through `window.__emtMock` (see `MockControls`): consume an offer (someone else
-// took it), change the scenario, the step time, or take the exchange down.
+// took it), change the scenario, the step time, or take the exchange or the sponsor down.
 
 import type { NetworkProfile, TokenRegistry } from '@evm-midnight-transparent/core';
 
@@ -28,6 +28,9 @@ export interface MockSettings {
 }
 
 export const MOCK_WORLD_KEY = 'emt-mock/world';
+
+/** How the sponsor answers while it is down (P4.5, `MockControls.setSponsorDown`). */
+export type SponsorDownAnswer = number | 'network' | { status: number; code: string; message: string };
 
 interface World {
   v: 1;
@@ -61,6 +64,14 @@ export interface MockControls {
   setStepMs(ms: number): void;
   /** Answer every exchange request with this HTTP status (null: back up). */
   setKernelDown(status: number | null): void;
+  /** Take the sponsor down (P4.5), as a paused or restarting sponsor behind its gateway looks: every
+   *  request (or, with `only`, those whose path ends with it, e.g. `/prove`) is answered with this
+   *  HTTP status and a gateway's HTML page, with the sponsor's own error body (`{status, code,
+   *  message}`: a coded "try again"), or fails as a network error (`'network'`). While the WHOLE
+   *  sponsor is down its clock stops too: nothing it drives moves on. Null: back up. */
+  setSponsorDown(answer: SponsorDownAnswer | null, only?: string): void;
+  /** How many requests the sponsor refused while it was down. */
+  sponsorDownHits(): number;
   /** Forget the persisted mock world (the next load starts a fresh one). */
   resetWorld(): void;
   views(): unknown[];
@@ -99,6 +110,8 @@ export function createMockEnvironment(input: {
   const settings = { ...input.settings, scenario: { ...input.settings.scenario } };
   const chain = new MockChain(registry);
   let kernelDown: number | null = null;
+  let sponsorDown: { answer: SponsorDownAnswer; only?: string } | null = null;
+  let sponsorDownHits = 0;
   const wallet = mockWalletModule(chain, {
     profile: network,
     syncMs: () => Math.min(settings.stepMs, 1_000),
@@ -142,7 +155,11 @@ export function createMockEnvironment(input: {
   let timer: ReturnType<typeof setInterval> | undefined;
   const clock = () => {
     clearInterval(timer);
-    timer = setInterval(() => void sponsor.tick().then(persist), settings.stepMs);
+    timer = setInterval(() => {
+      // A sponsor that is down drives nothing (P4.5).
+      if (sponsorDown && !sponsorDown.only) return;
+      void sponsor.tick().then(persist);
+    }, settings.stepMs);
   };
   clock();
 
@@ -184,6 +201,10 @@ export function createMockEnvironment(input: {
     setKernelDown: (status) => {
       kernelDown = status;
     },
+    setSponsorDown: (answer, only) => {
+      sponsorDown = answer === null ? null : { answer, ...(only ? { only } : {}) };
+    },
+    sponsorDownHits: () => sponsorDownHits,
     resetWorld: () => storage?.removeItem(MOCK_WORLD_KEY),
     views: () => sponsor.views(),
     requests: () => [...sponsor.requests],
@@ -197,6 +218,21 @@ export function createMockEnvironment(input: {
     chain,
     sponsor,
     sponsorFetch: async (url, init) => {
+      const down = sponsorDown;
+      if (down && (!down.only || new URL(url).pathname.replace(/\/+$/, '').endsWith(down.only))) {
+        sponsorDownHits++;
+        const a = down.answer;
+        if (a === 'network') throw new TypeError('Failed to fetch');
+        return typeof a === 'number'
+          ? new Response(`<html><body><h1>${a}</h1><hr>nginx</body></html>`, {
+              status: a,
+              headers: { 'content-type': 'text/html' },
+            })
+          : new Response(JSON.stringify({ error: { code: a.code, message: a.message } }), {
+              status: a.status,
+              headers: { 'content-type': 'application/json' },
+            });
+      }
       const res = await sponsor.fetch(url, init);
       persist();
       return res;
