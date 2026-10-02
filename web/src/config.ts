@@ -31,7 +31,7 @@ export const MockSettingsSchema = z
         staleWithdrawOnce: z.boolean().optional(),
         failFirstStart: z.boolean().optional(),
         // P4.2-fix4: the first withdrawal's Sepolia transfer, and holding the bridge's closing.
-        transferReceipt: z.enum(['ok', 'reverted', 'wrong-token', 'wrong-amount', 'older']).optional(),
+        transferReceipt: z.enum(['ok', 'reverted', 'wrong-token', 'wrong-amount', 'older', 'foreign']).optional(),
         holdAfterTransfer: z.boolean().optional(),
       })
       .strict()

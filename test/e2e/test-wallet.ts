@@ -18,7 +18,9 @@
 // their number, with no logs; the mock bridge's transfers to the user (the withdrawals, mined by the
 // mock world in the page) are answered in the page from `__emtMock.sepoliaReceipt`, with their ERC20
 // `Transfer` logs, so the page's Done-on-arrival check reads them as it reads a real receipt. A hash
-// neither knows has no receipt (null).
+// neither knows has no receipt (null). Their transactions (`eth_getTransactionByHash`: the sender's
+// nonce, which binds a payout to the swap's own withdrawal, P4.2-fix5 U4) come from
+// `__emtMock.sepoliaTransaction` the same way.
 
 import type { Page } from '@playwright/test';
 import { secp256k1 } from '@noble/curves/secp256k1';
@@ -100,6 +102,7 @@ export async function installTestWallet(
         'eth_getBalance',
         'eth_call',
         'eth_getTransactionReceipt',
+        'eth_getTransactionByHash',
         'eth_getTransactionCount',
         'eth_blockNumber',
         'eth_estimateGas',
@@ -165,6 +168,12 @@ export async function installTestWallet(
         if (own < 0) return null;
         return { status: '0x1', transactionHash: hash, blockNumber: hexq(5_000_001n + BigInt(own)), logs: [] };
       }
+      case 'eth_getTransactionByHash': {
+        const hash = String(params[0]).toLowerCase();
+        const own = [...(opts.alsoMined ?? []), ...sent].findIndex((t) => t.hash.toLowerCase() === hash);
+        if (own < 0) return null;
+        return { hash, from: me, nonce: hexq(BigInt(own)), blockNumber: hexq(5_000_001n + BigInt(own)) };
+      }
       case 'eth_signTypedData_v4': {
         const td = JSON.parse(String(params[1])) as {
           domain: Record<string, unknown>;
@@ -197,11 +206,22 @@ export async function installTestWallet(
     };
     // The mock bridge's transfers live in the page's mock world (mock mode only; LIVE mode has none).
     const mockWorld = () =>
-      (window as unknown as { __emtMock?: { sepoliaReceipt?(h: string): Record<string, unknown> | null } }).__emtMock;
+      (
+        window as unknown as {
+          __emtMock?: {
+            sepoliaReceipt?(h: string): Record<string, unknown> | null;
+            sepoliaTransaction?(h: string): Record<string, unknown> | null;
+          };
+        }
+      ).__emtMock;
     const provider = {
       async request({ method, params }: { method: string; params?: unknown[] }) {
         if (method === 'eth_getTransactionReceipt') {
           const bridged = mockWorld()?.sepoliaReceipt?.(String(params?.[0] ?? ''));
+          if (bridged) return bridged;
+        }
+        if (method === 'eth_getTransactionByHash') {
+          const bridged = mockWorld()?.sepoliaTransaction?.(String(params?.[0] ?? ''));
           if (bridged) return bridged;
         }
         const result = await bridge(method, params ?? []);

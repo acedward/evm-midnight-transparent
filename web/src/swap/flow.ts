@@ -161,6 +161,8 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
       sepoliaTx: hashOr(w.sepoliaTx, keep.sepoliaTx),
       completeTx: hashOr(w.completeTx, keep.completeTx),
       attempts: prev.attempts,
+      // The page's own (P4.2-fix5 U4): the nonces its withdrawals signed, never the sponsor's word.
+      evmNonces: prev.evmNonces,
       // Withdrawals that ended without a transfer (refunded or not started), from the sponsor's signal.
       refunds: Math.min(100, Math.max(withdrawalStatus(view).ended, prev.refunds ?? 0)) || undefined,
       earlier,

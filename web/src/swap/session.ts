@@ -60,6 +60,7 @@ import { getAddress } from 'ethers';
 import {
   AGREES_WITH_ARRIVAL,
   arrivalCandidates,
+  boundToWithdrawal,
   checkTransfer,
   expectedArrival,
   type TransferCheck,
@@ -209,6 +210,11 @@ function describe(e: unknown): string {
   return typeof m === 'string' && m ? m.slice(0, 300) : 'Something went wrong.';
 }
 
+/** Why a reported Sepolia transfer was not counted as this swap's payout (P4.2-fix4; P4.2-fix5 U4:
+ *  `not-this-withdrawal`, its transaction is not one of this swap's withdrawals; `unbound`, the record
+ *  keeps no withdrawal nonce to tie it to: a record written before). */
+type NotCounted = Exclude<TransferCheck['kind'], 'arrived'> | 'claimed' | 'not-this-withdrawal' | 'unbound';
+
 export class SwapSession {
   private snap: SessionSnapshot;
   private readonly listeners = new Set<() => void>();
@@ -233,8 +239,9 @@ export class SwapSession {
   /** One more automatic withdrawal after MAX_AUTO_RETRIES refunds, approved by the user. */
   private retryApproved = false;
   /** P4.2-fix4: the Sepolia transfers whose mined receipt did NOT verify as this swap's payout, and
-   *  why (read once: a mined receipt does not change). */
-  private readonly verdicts = new Map<string, Exclude<TransferCheck['kind'], 'arrived'> | 'claimed'>();
+   *  why (read once: a mined receipt does not change, nor do the nonces this swap's withdrawals signed,
+   *  which are on the record before the sponsor can report their transfers). */
+  private readonly verdicts = new Map<string, NotCounted>();
   /** The block of the user's own funding transfer of this swap (the payout must be mined after it). */
   private fundedAt: number | null = null;
 
@@ -991,6 +998,18 @@ export class SwapSession {
         this.set({ notice: this.notCountedText(why, hash) });
         continue;
       }
+      // P4.2-fix5 U4: the transfer must be one of THIS swap's withdrawals: the vault account's nonce
+      // one of them signed (the record's, as the page gave it to `/prove`), never the sponsor's word.
+      const tx = await this.deps.evm.minedTransaction(hash).catch(() => null);
+      if (this.closed) return;
+      if (tx === null) continue; // not readable now: decided at a later poll
+      const nonces = this.record.bridgeOut.evmNonces;
+      if (!boundToWithdrawal(tx, exp, nonces)) {
+        const why = nonces && nonces.length > 0 ? 'not-this-withdrawal' : 'unbound';
+        this.verdicts.set(hash, why);
+        this.set({ notice: this.notCountedText(why, hash) });
+        continue;
+      }
       const r = this.record;
       this.saveRecord({
         ...r,
@@ -1003,7 +1022,7 @@ export class SwapSession {
     }
   }
 
-  private notCountedText(why: Exclude<TransferCheck['kind'], 'arrived'> | 'claimed', hash: string): string {
+  private notCountedText(why: NotCounted, hash: string): string {
     const tx = `${hash.slice(0, 10)}…${hash.slice(-6)}`;
     const leg = outLeg(this.record);
     switch (why) {
@@ -1015,6 +1034,10 @@ export class SwapSession {
         return `The Sepolia transfer the bridge reported (${tx}) was mined before you funded this swap, so it is not this swap's: the page does not count it, and keeps following the bridge.`;
       case 'claimed':
         return `The Sepolia transfer the bridge reported (${tx}) is already counted for another of your swaps in this browser, so the page does not count it for this one, and keeps following the bridge.`;
+      case 'not-this-withdrawal':
+        return `The Sepolia transfer the bridge reported (${tx}) is not this swap's own withdrawal (the bridge account's transaction number is not one this swap's withdrawal signed), so the page does not count it, and keeps following the bridge.`;
+      case 'unbound':
+        return `This page cannot tie the Sepolia transfer the bridge reported (${tx}) to this swap's withdrawal (the swap's record does not say which one it signed), so it shows Done once the bridge closes the swap.`;
     }
   }
 
@@ -1254,6 +1277,8 @@ export class SwapSession {
             ...this.record.bridgeOut,
             colour: l.colour,
             attempts: (this.record.bridgeOut.attempts ?? 0) + 1,
+            // P4.2-fix5 U4: the vault account's nonce this accepted withdrawal signed: its payout's.
+            evmNonces: [...(this.record.bridgeOut.evmNonces ?? []), draft.evmNonce.toString()].slice(-16),
           },
           phase: which === 'receive' ? 'bridging-out' : 'bridging-back',
         },
