@@ -43,8 +43,10 @@ describe('the state machine', () => {
         'depositing->partial',
         'depositing->awaiting_funds',
         'depositing->failed',
-        // A partial deposit (audit S2): the remainder, or a Bridge back of what arrived.
+        // A partial deposit (audit S2): the remainder, or a Bridge back of what arrived; failed when
+        // everything was lost to other parties' settles (audit T1).
         'partial->depositing',
+        'partial->failed',
         'partial->minted',
         'partial->bridging_back',
         'minted->taking',

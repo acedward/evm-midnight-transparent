@@ -17,6 +17,9 @@
 //   pays (anyone may start one for this recipient; audit S2). partial ─► depositing (the remainder, once
 //   it is at the address) ─► minted; partial ─► bridging_back (what arrived goes back) ─► done, or back
 //   to partial while the address still holds some of the pay token.
+//   A vault request settled by ANOTHER party that minted (a deposit, a refund) is lost to the swap (its
+//   coin's nonce is that party's; audit T1): depositing / partial / withdrawing / bridging_back ─►
+//   partial with what is left, or ─► failed (`settled-elsewhere`, never recoverable).
 //
 // `minted` means "the temporary wallet holds the funds and the app acts next": after the deposit,
 // after a lost take race ("Swap is not available"), and after a refunded withdrawal.
@@ -25,6 +28,7 @@ import {
   SWAP_ERRORS,
   type PartialDeposit,
   type PartialOption,
+  type SettledElsewhere,
   type StageEntry,
   type SwapState,
   type SwapView,
@@ -59,6 +63,19 @@ interface TransferProgress {
   minedAtMs?: number;
 }
 
+/** A settle (or abandon) the sponsor submitted, recorded BEFORE it reached the node (audit T1): when
+ *  the sponsor never hears back, its identifiers tell whether the request was settled by the sponsor
+ *  or by another party. */
+export interface OwnSettle {
+  circuit: string;
+  requestId: string;
+  identifiers: string[];
+  /** ms: after this it can no longer be included. */
+  expiresAtMs: number;
+  /** Unix seconds. */
+  at: number;
+}
+
 export interface DepositRecord extends TransferProgress {
   stage: string;
   stages: StageEntry[];
@@ -83,7 +100,24 @@ export interface DepositRecord extends TransferProgress {
   rearmTimes?: number[];
   /** Requests of another party that swept this recipient's deposit address with another token or
    *  amount, completed by the sponsor so the coin reaches the temporary wallet (audit R6). */
-  foreign?: { requestId: string; erc20: string; amount: string; at: number; completeTx?: string }[];
+  foreign?: {
+    requestId: string;
+    erc20: string;
+    amount: string;
+    at: number;
+    completeTx?: string;
+    /** `completing`: the sponsor's settle was sent and its outcome is not known yet; `lost`: another
+     *  party settled it first (audit T1). Absent: completed by the sponsor (records before P4.2-fix4). */
+    status?: 'completing' | 'lost';
+    /** The sponsor's own settles of it (audit T1). */
+    settles?: OwnSettle[];
+  }[];
+  /** The sponsor's own settles of the CURRENT request (`requestId`), recorded before each reached the
+   *  node (audit T1). */
+  settles?: OwnSettle[];
+  /** The Sepolia sweeps the sponsor saw for its own requests (0x…; audit T1, for telling them from
+   *  sweeps of requests other parties settled). */
+  ownSweeps?: string[];
   /** Base units of the PAY token every completed deposit request of this recipient minted into the
    *  temporary wallet (the sponsor's own and anyone else's; audit S2). Absent on records completed
    *  before P4.2-fix3: their one own deposit minted the pay amount. */
@@ -138,6 +172,8 @@ export interface WithdrawRecord extends TransferProgress {
   /** ms: an attempt judged `not-included` is re-checked by its request id until then, and adopted if
    *  it landed after all (audit S1). */
   recheckUntilMs?: number;
+  /** The sponsor's own settles of this attempt's request (audit T1). */
+  settles?: OwnSettle[];
 }
 
 /** What the latest `withdraw-params` handed out: `/prove withdraw` rebuilds with its gas, and tells a
@@ -218,6 +254,8 @@ export interface SwapRecord {
   recoverable?: boolean;
   /** On a recoverable `failed` swap whose re-arm is paced: unix seconds from which a re-open revives it. */
   retryAt?: number;
+  /** Vault requests of this swap that another party settled (audit T1), oldest first. */
+  settledElsewhere?: SettledElsewhere[];
   history: { state: SwapState; at: number }[];
   createdAt: number;
   updatedAt: number;
@@ -227,7 +265,7 @@ export interface SwapRecord {
 export const TRANSITIONS: Readonly<Record<SwapState, readonly SwapState[]>> = {
   awaiting_funds: ['depositing', 'partial', 'minted', 'failed'],
   depositing: ['minted', 'partial', 'awaiting_funds', 'failed'],
-  partial: ['depositing', 'minted', 'bridging_back'],
+  partial: ['depositing', 'minted', 'bridging_back', 'failed'],
   minted: ['taking', 'taken', 'withdrawing', 'bridging_back', 'failed'],
   taking: ['taken', 'minted', 'withdrawing', 'bridging_back', 'failed'],
   taken: ['withdrawing', 'bridging_back', 'minted', 'failed'],
@@ -316,13 +354,37 @@ export function mintedTotalOf(rec: SwapRecord): bigint {
   return ['awaiting_funds', 'depositing', 'failed'].includes(rec.state) ? 0n : BigInt(rec.pay.amount);
 }
 
-/** What the temporary wallet holds of the pay token by the sponsor's accounting (minted − returned). */
-export const heldOf = (rec: SwapRecord): bigint => mintedTotalOf(rec) - big(rec.deposit?.returned);
+/** Base units of `colour` that settles by other parties minted out of the temporary wallet's reach, by
+ *  side (audit T1). */
+export function lostOf(rec: SwapRecord, kind: 'deposit' | 'withdraw', colour: string = rec.pay.colour): bigint {
+  let total = 0n;
+  for (const e of rec.settledElsewhere ?? []) {
+    if (e.lost && e.kind === kind && e.colour === colour) total += BigInt(e.amount);
+  }
+  return total;
+}
+
+/** What the temporary wallet holds of the pay token by the sponsor's accounting: minted − returned −
+ *  what a Bridge back handed to the vault and another party's refund then lost (audit T1). */
+export const heldOf = (rec: SwapRecord): bigint =>
+  mintedTotalOf(rec) - big(rec.deposit?.returned) - lostOf(rec, 'withdraw');
 
 /** What is still to be deposited for the wallet to hold the whole pay amount (never negative). */
 export function remainingOf(rec: SwapRecord): bigint {
   const r = BigInt(rec.pay.amount) - mintedTotalOf(rec);
   return r > 0n ? r : 0n;
+}
+
+/**
+ * What the sponsor will still deposit (audit T1): the remainder, or, once part of the deposit was lost
+ * to another party's settle (the rest can then no longer arrive in full), what waits at the deposit
+ * address (`atAddress`, the latest read; the given read when passed), up to the remainder.
+ */
+export function toComeOf(rec: SwapRecord, atAddress?: bigint): bigint {
+  const remaining = remainingOf(rec);
+  if (lostOf(rec, 'deposit') === 0n) return remaining;
+  const there = atAddress ?? big(rec.deposit?.atAddress);
+  return there < remaining ? there : remaining;
 }
 
 /** The state a swap holding pay tokens rests in: `minted` with the whole pay amount, else `partial`. */
@@ -332,7 +394,8 @@ export const holdingState = (rec: SwapRecord): 'minted' | 'partial' =>
 /** The `partial` view (audit S2). */
 export function partialView(rec: SwapRecord): PartialDeposit {
   const held = heldOf(rec);
-  const remaining = remainingOf(rec);
+  // After a loss to another party's settle, what is still to come is what waits at the address (T1).
+  const remaining = toComeOf(rec);
   const options: PartialOption[] = [];
   if (remaining > 0n) options.push('wait');
   if (held > 0n) options.push('bridge-back');
@@ -446,6 +509,9 @@ export function swapView(rec: SwapRecord): SwapView {
     withdrawals,
     withdrawal: withdrawalStatus(rec),
     ...(rec.state === 'partial' ? { partial: partialView(rec) } : {}),
+    ...(rec.settledElsewhere && rec.settledElsewhere.length > 0
+      ? { settledElsewhere: rec.settledElsewhere.map((e) => ({ ...e })) }
+      : {}),
     ...(rec.outcome ? { outcome: rec.outcome } : {}),
     ...(rec.reason ? { reason: rec.reason } : {}),
     ...(rec.message ? { message: rec.message } : {}),

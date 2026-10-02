@@ -81,13 +81,30 @@
 //   S6 a foreign completion reserves its settle from the daily budget before it is queued;
 //   S7 (accepted) shielded inputs are not bound to the temporary wallet (../validate/rules.ts);
 //   S8 `/withdraw` honours only approvals of the current version (PROVEN_WITHDRAW_VERSION).
+//
+// THE ROUND-4 FIXES (plan 00048 P4.2-fix4, audit "Consolidation, round 4" T1 and T2):
+//   T1 anyone may settle a vault request first, choosing the minted coin's nonce and the key its
+//      ciphertext is sealed to; the nonce is never public (plan questions Q16), so such a coin is out
+//      of the temporary wallet's reach for good. The sponsor never retries a settle whose request is
+//      gone: each own settle records its transaction identifiers before it reaches the node, and a
+//      gone request is the sponsor's own (found on the indexer: the flow continues) or another
+//      party's (nothing minted: the same outcome; minted: LOST, recorded in `settledElsewhere`, and the
+//      swap goes on with what is left: what waits at the deposit address is deposited for a Bridge
+//      back, or the swap ends `failed` / `settled-elsewhere`). Sweeps another party started AND
+//      settled are counted from the pay token's Sepolia Transfer logs out of the deposit address;
+//   T2 a deposit request competes for the deposit address's nonce (or is adopted) only if it can
+//      execute: a gas limit that covers its transfer (Sepolia's estimate, else SWEEP_MIN_EXEC_GAS) and
+//      fits a transaction (EIP-7825).
 
 import {
   BRIDGE_ERRORS,
+  SETTLED_ELSEWHERE_REASON,
   SWAP_ERRORS,
   depositPreflight,
+  formatUnits,
   withdrawPreflight,
   type EvmGasPolicy,
+  type SettledElsewhere,
   type OpenSwapPayload,
   type ProveRequest,
   type TakeReport,
@@ -107,14 +124,18 @@ import type { SponsorStatus } from '../sponsor/session.js';
 import { InvalidTxError, validateTake, validateWithdraw, type WalletCommitments } from '../validate/rules.js';
 import type { TxSummary } from '../validate/summary.js';
 import {
+  MAX_TX_GAS,
   NotSubmittedError,
   WITHDRAW_TX_TTL_MS,
   type Attestation,
   type MidnightTxFacts,
   type OfferReader,
   type OpenRequests,
+  type ReadWatermark,
   type RelayOutcome,
   type RelayProgress,
+  type RequestDetail,
+  type SubmissionInfo,
   type SwapBackend,
   type SwapProver,
 } from './backend.js';
@@ -129,13 +150,17 @@ import {
   isRecheck,
   isTerminal,
   isUnresolved,
+  lostOf,
   mintedTotalOf,
   pushStage,
   remainingOf,
+  toComeOf,
   transition,
+  type AttestedKind,
   type DepositRecord,
   type GasRecord,
   type LegRecord,
+  type OwnSettle,
   type ProofEntry,
   type SwapRecord,
   type WithdrawRecord,
@@ -166,6 +191,8 @@ export interface SwapServiceConfig {
   sweepGasLimits: Readonly<Record<string, bigint>>;
   /** Refuse to open a swap whose sweep would need more ETH than this (a gas spike). */
   maxSweepWei: bigint;
+  /** The gas a deposit request's transfer is taken to need when Sepolia cannot estimate it (audit T2). */
+  sweepMinExecGas: bigint;
   minOfferTtlSeconds: number;
   maxActiveSwapsPerOwner: number;
   /** New swaps per EVM address in any 24 hours (audit C7). */
@@ -235,6 +262,7 @@ export function swapServiceConfig(c: SponsorConfig): SwapServiceConfig {
     unsignedStaleMs: c.withdrawUnsignedStaleSeconds * 1000,
     sweepGasLimits: c.swaps.sweepGasLimits,
     maxSweepWei: c.swaps.maxSweepWei,
+    sweepMinExecGas: c.swaps.sweepMinExecGas,
     minOfferTtlSeconds: c.swaps.minOfferTtlSeconds,
     maxActiveSwapsPerOwner: c.swaps.maxActivePerOwner,
     maxSwapsPerOwnerPerDay: c.swaps.maxPerOwnerPerDay,
@@ -2121,6 +2149,18 @@ export class SwapService {
       return recheck ? 'not-included' : 'uncertain';
     }
     if (att) {
+      // Settled, but by whom? A refund minted by another party is out of the temporary wallet's reach
+      // (its nonce is known only to that party; audit T1); only the sponsor's own refund comes back.
+      let who: { by: 'sponsor' | 'other' | 'unknown'; tx?: string } = { by: 'other' };
+      if (att.kind !== 'success') {
+        if (!reqs.asOf) return recheck ? 'not-included' : 'uncertain';
+        try {
+          who = await this.whoSettled(be, w.settles, reqs.asOf);
+        } catch {
+          return recheck ? 'not-included' : 'uncertain';
+        }
+        if (who.by === 'unknown') return recheck ? 'not-included' : 'uncertain';
+      }
       delete w.error;
       delete w.unresolved;
       delete w.uncertainSinceMs;
@@ -2135,11 +2175,27 @@ export class SwapService {
           rec.outcome = w.kind === 'swap' ? 'swapped' : 'bridged-back';
           transition(rec, 'done', now);
         }
-      } else {
-        // Refunded by whoever settled it: the coin is back in the temporary wallet.
-        pushStage(w, 'refunded', now, { settledElsewhere: 'true' });
+      } else if (who.by === 'sponsor') {
+        // The sponsor's own refund: the coin is back in the temporary wallet.
+        pushStage(w, 'refunded', now, { settledElsewhere: 'true', by: 'sponsor', ...(who.tx ? { tx: who.tx } : {}) });
         if (running && current) transition(rec, this.backAfter(rec, w), now);
         this.newWithdrawAttempt(rec);
+      } else {
+        pushStage(w, 'settled-elsewhere', now, { requestId: id, attested: att.kind, lost: 'true', by: 'other' });
+        this.recordElsewhere(rec, {
+          kind: 'withdraw',
+          requestId: id,
+          attested: att.kind,
+          colour: w.colour,
+          amount: w.amount,
+          lost: true,
+          ...(w.sepoliaTx ? { evmTx: w.sepoliaTx } : {}),
+        });
+        if (current && (running || WALLET_HOLDS_FUNDS.includes(rec.state))) {
+          // The coin this attempt handed to the vault is gone: the swap goes on with what is left.
+          if (!running) transition(rec, w.kind === 'swap' ? 'withdrawing' : 'bridging_back', now);
+          await this.afterWithdrawLoss(rec, w, be);
+        }
       }
       this.persist(rec);
       return 'settled';
@@ -2228,7 +2284,13 @@ export class SwapService {
         return;
       case 'broadcast':
         if ('kind' in target) target.sepoliaTx = p.evmTxHash;
-        else target.sweepTx = p.evmTxHash;
+        else {
+          target.sweepTx = p.evmTxHash;
+          // The sponsor's own sweeps, told apart from sweeps other parties settled (audit T1).
+          const own = (target.ownSweeps ??= []);
+          if (!own.includes(p.evmTxHash.toLowerCase())) own.push(p.evmTxHash.toLowerCase());
+          if (own.length > 16) own.splice(0, own.length - 16);
+        }
         target.minedAtMs ??= this.now();
         this.stage(rec, target, 'evm-broadcast', {
           evmTx: p.evmTxHash,
@@ -2254,6 +2316,8 @@ export class SwapService {
     const rec = this.get(swapId);
     const w = currentWithdrawal(rec)!;
     const requestId = w.requestId!;
+    // A resumed request that is gone was settled while the sponsor was not looking (audit T1).
+    if (resumed && (await this.withdrawRequestGone(rec, w, be, null))) return;
     const budget = resumed
       ? MPC_SIGNATURE_BUDGET_MS
       : Math.max(60_000, MPC_SIGNATURE_BUDGET_MS - Math.max(0, this.now() - (w.startedAtMs ?? this.now())));
@@ -2269,27 +2333,50 @@ export class SwapService {
     this.stage(rec, w, 'attested', { kind: relay.kind, ...(relay.evmTxHash ? { evmTx: relay.evmTxHash } : {}) });
     const circuit = relay.kind === 'never-executed' ? 'refundWithdraw' : 'completeWithdraw';
     this.stage(rec, w, 'completing', { circuit });
-    const settled = await this.withProver(() =>
-      be.settle({
-        circuit,
-        requestId,
-        attestation: relay,
-        recipientCoinPk: rec.tempCoinPk,
-        recipientEncPk: rec.tempEncPk,
-      }),
-    );
-    if (settled.txHash) w.completeTx = settled.txHash;
+    const settles = (w.settles ??= []);
+    let settled: MidnightTxFacts & { minted: boolean };
+    try {
+      settled = await this.withProver(() =>
+        be.settle({
+          circuit,
+          requestId,
+          attestation: relay,
+          recipientCoinPk: rec.tempCoinPk,
+          recipientEncPk: rec.tempEncPk,
+          onSubmit: this.recordSettle(rec, settles, circuit, requestId),
+        }),
+      );
+    } catch (e) {
+      // Settled already, by the sponsor's own earlier settle or by another party: resolved, never
+      // retried (audit T1). Still open: the stale closer drives it again.
+      if (await this.withdrawRequestGone(rec, w, be, relay)) return;
+      throw e;
+    }
     if (settled.txId) w.completeTxId = settled.txId;
+    await this.afterWithdrawSettle(rec, w, be, settled.minted, circuit, settled.txHash);
+  }
+
+  /** A withdrawal's request was settled (by the sponsor, or found to be the sponsor's own). */
+  private async afterWithdrawSettle(
+    rec: SwapRecord,
+    w: WithdrawRecord,
+    be: SwapBackend,
+    minted: boolean,
+    circuit: string,
+    txHash?: string | null,
+  ): Promise<void> {
+    const swapId = rec.swapId;
+    if (txHash) w.completeTx = txHash;
     delete w.error;
     const now = this.nowS();
-    if (settled.minted) {
+    if (minted) {
       // The transfer did not happen: the coin is back in the temporary wallet (plan Q9 A).
-      pushStage(w, 'refunded', now, { circuit, ...(settled.txHash ? { tx: settled.txHash } : {}) });
+      pushStage(w, 'refunded', now, { circuit, ...(txHash ? { tx: txHash } : {}) });
       transition(rec, this.backAfter(rec, w), now);
       this.newWithdrawAttempt(rec); // the retry gets a fresh budget (audit C11)
-      this.deps.log.info('withdrawal refunded', { swapId, requestId, attested: relay.kind });
+      this.deps.log.info('withdrawal refunded', { swapId, requestId: w.requestId, attested: w.attested });
     } else {
-      pushStage(w, 'completed', now, { circuit, ...(settled.txHash ? { tx: settled.txHash } : {}) });
+      pushStage(w, 'completed', now, { circuit, ...(txHash ? { tx: txHash } : {}) });
       const d = rec.deposit;
       if (w.kind === 'bridge-back' && d?.mintedTotal !== undefined) {
         // A Bridge back of a partial deposit (audit S2): what it returned is counted, and the swap
@@ -2297,7 +2384,7 @@ export class SwapService {
         d.returned = (BigInt(d.returned ?? '0') + BigInt(w.amount)).toString();
         if (await this.leftToRecover(rec, be)) {
           transition(rec, 'partial', now);
-          pushStage(d, 'partial', now, { minted: heldOf(rec).toString(), remaining: remainingOf(rec).toString() });
+          pushStage(d, 'partial', now, { minted: heldOf(rec).toString(), remaining: toComeOf(rec).toString() });
           this.persist(rec);
           this.deps.log.info('partial deposit: part returned, the rest waits', { swapId });
           return;
@@ -2306,6 +2393,89 @@ export class SwapService {
       rec.outcome = w.kind === 'swap' ? 'swapped' : 'bridged-back';
       transition(rec, 'done', now);
       this.deps.log.info('swap done', { swapId, outcome: rec.outcome });
+    }
+    this.persist(rec);
+  }
+
+  /**
+   * The current withdrawal's request could not be settled by the sponsor, or a resumed one is no longer
+   * open (audit T1). False when nothing is decided (still open, no attestation, or the sponsor's own
+   * settle might still land). Otherwise it is resolved, never settled again:
+   *  - the sponsor's own earlier settle landed: exactly as if it had answered;
+   *  - another party's successful `completeWithdraw` minted nothing: the transfer happened, the
+   *    withdrawal is complete (`done`, or `partial` for part of a partial deposit);
+   *  - another party's refund (`completeWithdraw` of a returned-false transfer, `refundWithdraw`) minted
+   *    the coin back with a nonce only that party knows: LOST to the swap (`afterWithdrawLoss`).
+   */
+  private async withdrawRequestGone(
+    rec: SwapRecord,
+    w: WithdrawRecord,
+    be: SwapBackend,
+    att: Attestation | null,
+  ): Promise<boolean> {
+    const requestId = w.requestId;
+    if (!requestId) return false;
+    try {
+      const open = await be.openRequests('withdraw');
+      if (open.ids.includes(requestId) || open.asOf === undefined) return false;
+      const kind = att?.kind ?? w.attested ?? (await be.attestation('withdraw', requestId))?.kind ?? null;
+      if (!kind) return false;
+      const who = await this.whoSettled(be, w.settles, open.asOf);
+      if (who.by === 'unknown') return false;
+      w.attested = kind;
+      const minted = kind !== 'success';
+      const circuit = kind === 'never-executed' ? 'refundWithdraw' : 'completeWithdraw';
+      const lost = who.by === 'other' && minted;
+      pushStage(w, 'settled-elsewhere', this.nowS(), {
+        requestId,
+        attested: kind,
+        lost: String(lost),
+        by: who.by,
+        ...(who.tx ? { tx: who.tx } : {}),
+      });
+      if (who.by === 'other') {
+        this.recordElsewhere(rec, {
+          kind: 'withdraw',
+          requestId,
+          attested: kind,
+          colour: w.colour,
+          amount: w.amount,
+          lost,
+          ...(w.sepoliaTx ? { evmTx: w.sepoliaTx } : {}),
+        });
+      }
+      if (!lost) await this.afterWithdrawSettle(rec, w, be, minted, circuit, who.tx);
+      else await this.afterWithdrawLoss(rec, w, be);
+      return true;
+    } catch (e) {
+      this.deps.log.warn('a gone withdrawal request could not be resolved yet', {
+        swapId: rec.swapId,
+        requestId,
+        error: e,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * A withdrawal's coin came back through another party's refund, out of the temporary wallet's reach
+   * (audit T1). A swap's own withdrawal (the received token) leaves nothing; a Bridge back of part of
+   * a partial deposit leaves what else the wallet holds or the address still has (`partial`).
+   * Otherwise `failed` / `settled-elsewhere`. The attempt does not count as one to retry.
+   */
+  private async afterWithdrawLoss(rec: SwapRecord, w: WithdrawRecord, be: SwapBackend): Promise<void> {
+    delete w.error;
+    const running = rec.state === 'withdrawing' || rec.state === 'bridging_back';
+    if (running && w === currentWithdrawal(rec)) {
+      const d = rec.deposit;
+      if (w.kind === 'bridge-back' && d?.mintedTotal !== undefined && (await this.leftToRecover(rec, be))) {
+        const now = this.nowS();
+        transition(rec, 'partial', now);
+        pushStage(d, 'partial', now, { minted: heldOf(rec).toString(), remaining: toComeOf(rec).toString() });
+      } else {
+        this.failSettledElsewhere(rec);
+      }
+      this.newWithdrawAttempt(rec);
     }
     this.persist(rec);
   }
@@ -2384,14 +2554,23 @@ export class SwapService {
       // The reconciliation may have moved it meanwhile.
       if (!SwapService.waitsForDeposit(rec) || this.driving.has(rec.swapId)) continue;
       const d = rec.deposit!;
-      const amount = remainingOf(rec);
+      // Sweeps another party started AND settled leave only the drop at the address: when it is not
+      // explained, the pay token's Sepolia logs are read, at most every 10 minutes (audit T1).
+      if (SwapService.dropUnexplained(rec) && (this.sweepCounts.get(rec.swapId) ?? -Infinity) + 600_000 <= nowMs) {
+        this.sweepCounts.set(rec.swapId, nowMs);
+        this.spawn(rec.swapId, () => this.countForeignSweepsLogged(rec.swapId));
+        continue;
+      }
+      let amount: bigint;
       // The token first; the sweep ETH only once the token is there (audit C6).
       let erc20: bigint;
       let eth = 0n;
       try {
         reads++;
         erc20 = await be.evm.erc20Balance(rec.pay.erc20Address, rec.depositAddress);
-        if (erc20 >= amount) {
+        // After a loss to another party's settle, what waits at the address is what comes (audit T1).
+        amount = toComeOf(rec, erc20);
+        if (amount > 0n && erc20 >= amount) {
           reads++;
           eth = await be.evm.ethBalance(rec.depositAddress);
         }
@@ -2408,7 +2587,14 @@ export class SwapService {
         d.atAddress = erc20.toString();
         this.persist(rec);
       }
-      const tokenThere = erc20 >= amount;
+      const tokenThere = amount > 0n && erc20 >= amount;
+      // Lost to another party's settle, and nothing left in the wallet or at the address (audit T1).
+      if (rec.state === 'partial' && amount === 0n && heldOf(rec) <= 0n && lostOf(rec, 'deposit') > 0n) {
+        this.failSettledElsewhere(rec);
+        this.nextPoll.delete(rec.swapId);
+        this.persist(rec);
+        continue;
+      }
       // The balance first, the age second: a swap whose token reached the address is never failed for
       // its age, whatever kept the sponsor from starting it (audit C5). A swap that received nothing
       // gets the short window, one with part of the token the long one (audit C6). A `partial` swap
@@ -2437,7 +2623,13 @@ export class SwapService {
       // The token LEFT the address since the last read: a request swept it into the vault for this
       // recipient (the sponsor's own after a crash, or anyone's); complete it (audit R6).
       if (erc20 < previous) {
-        if (this.sweptCheckDue(rec.swapId, nowMs)) this.spawn(rec.swapId, () => this.completeSweptDeposits(rec.swapId));
+        if (this.sweptCheckDue(rec.swapId, nowMs)) {
+          this.sweepCounts.set(rec.swapId, nowMs);
+          this.spawn(rec.swapId, async () => {
+            await this.completeSweptDeposits(rec.swapId);
+            await this.countForeignSweepsLogged(rec.swapId);
+          });
+        }
         continue;
       }
       if (!tokenThere || eth < BigInt(rec.sweepGas.ethWei)) continue;
@@ -2487,6 +2679,7 @@ export class SwapService {
       'signedAtMs',
       'signedTxHash',
       'minedAtMs',
+      'settles',
     ] as const) {
       delete d[k];
     }
@@ -2561,8 +2754,14 @@ export class SwapService {
     if (!be || !SwapService.waitsForDeposit(rec)) return;
     const open = pre ?? (await be.openRequests('deposit'));
     const path = be.depositPathHex(rec.tempCoinPk);
+    const settled = (id: string) => (d.foreign ?? []).some((f) => f.requestId === id && f.status !== 'completing');
+    // A completion the sponsor sent earlier whose request is gone now: whose settle was it (audit T1)?
+    for (const f of (d.foreign ?? []).filter((x) => x.status === 'completing' && !open.ids.includes(x.requestId))) {
+      if (!(await this.resolveForeignCompletion(rec, be, f, open))) return;
+      if (!SwapService.waitsForDeposit(rec)) return;
+    }
     for (const id of open.ids.filter((x) => open.pathOf(x) === path && x !== d.requestId)) {
-      if ((d.foreign ?? []).some((f) => f.requestId === id) || this.notSwept.has(id)) continue;
+      if (settled(id) || this.notSwept.has(id)) continue;
       const att = await be.attestation('deposit', id).catch(() => null);
       if (!att) continue; // not attested (yet): nothing moved so far
       if (att.kind !== 'success') {
@@ -2575,7 +2774,7 @@ export class SwapService {
       const dt = open.detailOf(id);
       const now = this.nowS();
       const payToken = dt !== undefined && dt.erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase();
-      if (payToken && dt.amount === remainingOf(rec)) {
+      if (payToken && dt.amount === toComeOf(rec) && !(d.foreign ?? []).some((f) => f.requestId === id)) {
         if (this.overBudget(1)) {
           if (d.stage !== 'budget-wait') this.stage(rec, d, 'budget-wait');
           return;
@@ -2595,53 +2794,211 @@ export class SwapService {
         if (d.stage !== 'budget-wait') this.stage(rec, d, 'budget-wait');
         return;
       }
+      // Recorded before it is sent: if the answer is lost, its identifiers tell whose settle landed.
+      let entry = (d.foreign ?? []).find((f) => f.requestId === id);
+      if (!entry) {
+        entry = { requestId: id, erc20: dt?.erc20 ?? '', amount: (dt?.amount ?? 0n).toString(), at: now };
+        (d.foreign ??= []).push(entry);
+      }
+      entry.status = 'completing';
+      const settles = (entry.settles ??= []);
+      this.persist(rec);
       try {
-        const out = await this.withProver(() =>
-          be.settle({
-            circuit: 'completeDeposit',
-            requestId: id,
-            attestation: att,
-            recipientCoinPk: rec.tempCoinPk,
-            recipientEncPk: rec.tempEncPk,
-          }),
-        );
-        (d.foreign ??= []).push({
-          requestId: id,
-          erc20: dt?.erc20 ?? '',
-          amount: (dt?.amount ?? 0n).toString(),
-          at: now,
-          ...(out.txHash ? { completeTx: out.txHash } : {}),
-        });
-        pushStage(d, 'completed-foreign', this.nowS(), {
-          requestId: id,
-          ...(dt ? { erc20: dt.erc20, amount: dt.amount.toString() } : {}),
-        });
-        if (payToken && out.minted && dt.amount > 0n) {
-          // The temporary wallet received this much of the pay token (audit S2).
-          d.mintedTotal = (mintedTotalOf(rec) + dt.amount).toString();
-          const target = holdingState(rec);
-          if (rec.state !== target) transition(rec, target, this.nowS());
-          if (target === 'partial') {
-            d.attempts = 0; // the remainder's own attempts
-            pushStage(d, 'partial', this.nowS(), {
+        let out: MidnightTxFacts & { minted: boolean };
+        try {
+          out = await this.withProver(() =>
+            be.settle({
+              circuit: 'completeDeposit',
               requestId: id,
-              minted: heldOf(rec).toString(),
-              remaining: remainingOf(rec).toString(),
-            });
-          }
-          this.deps.log.warn('a foreign deposit request for this recipient was completed', {
-            swapId,
-            requestId: id,
-            amount: dt.amount.toString(),
-            state: rec.state,
-          });
+              attestation: att,
+              recipientCoinPk: rec.tempCoinPk,
+              recipientEncPk: rec.tempEncPk,
+              onSubmit: this.recordSettle(rec, settles, 'completeDeposit', id),
+            }),
+          );
+        } catch (e) {
+          // Gone (settled first by another party, or the sponsor's answer was lost): resolved now or
+          // on a later pass, never settled twice (audit T1).
+          this.deps.log.warn('a foreign deposit request could not be completed', { swapId, requestId: id, error: e });
+          const now2 = await be.openRequests('deposit').catch(() => null);
+          if (now2 && !now2.ids.includes(id)) await this.resolveForeignCompletion(rec, be, entry, now2);
+          return;
         }
-        this.persist(rec);
+        delete entry.status;
+        if (out.txHash) entry.completeTx = out.txHash;
+        await this.foreignCompleted(rec, entry, out.minted);
       } finally {
         release(); // recorded as spent by its stage now
       }
       if (!SwapService.waitsForDeposit(rec)) return;
     }
+  }
+
+  /** A foreign request the sponsor completed (or found completed by its own settle): it minted to the
+   *  temporary wallet, and when it moved the pay token it is counted (audit R6, S2). */
+  private async foreignCompleted(
+    rec: SwapRecord,
+    entry: NonNullable<DepositRecord['foreign']>[number],
+    minted: boolean,
+  ): Promise<void> {
+    const d = rec.deposit!;
+    const payToken = entry.erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase();
+    const amount = BigInt(entry.amount);
+    pushStage(d, 'completed-foreign', this.nowS(), {
+      requestId: entry.requestId,
+      ...(entry.erc20 ? { erc20: entry.erc20, amount: entry.amount } : {}),
+    });
+    if (payToken && minted && amount > 0n) {
+      // The temporary wallet received this much of the pay token (audit S2).
+      d.mintedTotal = (mintedTotalOf(rec) + amount).toString();
+      const target = holdingState(rec);
+      if (rec.state !== target) transition(rec, target, this.nowS());
+      if (target === 'partial') {
+        d.attempts = 0; // the remainder's own attempts
+        pushStage(d, 'partial', this.nowS(), {
+          requestId: entry.requestId,
+          minted: heldOf(rec).toString(),
+          remaining: toComeOf(rec).toString(),
+        });
+      }
+      this.deps.log.warn('a foreign deposit request for this recipient was completed', {
+        swapId: rec.swapId,
+        requestId: entry.requestId,
+        amount: entry.amount,
+        state: rec.state,
+      });
+    }
+    this.persist(rec);
+  }
+
+  /**
+   * A foreign request the sponsor sent a completion for is gone (audit T1): its own settle landed (the
+   * answer was lost) → counted as completed; another party's → lost to the swap when it minted the pay
+   * token. False while that cannot be told yet (it is looked at again on a later pass).
+   */
+  private async resolveForeignCompletion(
+    rec: SwapRecord,
+    be: SwapBackend,
+    entry: NonNullable<DepositRecord['foreign']>[number],
+    open: OpenRequests,
+  ): Promise<boolean> {
+    if (!open.asOf) return false;
+    let who: { by: 'sponsor' | 'other' | 'unknown'; tx?: string };
+    try {
+      who = await this.whoSettled(be, entry.settles, open.asOf);
+    } catch {
+      return false;
+    }
+    if (who.by === 'unknown') return false;
+    if (who.by === 'sponsor') {
+      delete entry.status;
+      if (who.tx) entry.completeTx = who.tx;
+      await this.foreignCompleted(rec, entry, true);
+      return true;
+    }
+    entry.status = 'lost';
+    const token = entry.erc20 ? (this.cfg.tokens.bySepoliaAddress(entry.erc20) ?? null) : null;
+    const payToken = entry.erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase();
+    const colour = payToken ? rec.pay.colour : (token?.midnightColour ?? null);
+    const d = rec.deposit!;
+    pushStage(d, 'settled-elsewhere', this.nowS(), {
+      requestId: entry.requestId,
+      attested: 'success',
+      amount: entry.amount,
+      lost: 'true',
+      by: 'other',
+    });
+    if (colour) {
+      this.recordElsewhere(rec, {
+        kind: 'deposit',
+        requestId: entry.requestId,
+        attested: 'success',
+        colour,
+        amount: entry.amount,
+        lost: true,
+      });
+    }
+    if (payToken && BigInt(entry.amount) > 0n) await this.afterDepositLoss(rec, be);
+    else this.persist(rec);
+    return true;
+  }
+
+  /**
+   * Sweeps of this swap's deposit address that ANOTHER party both started and settled, so the sponsor
+   * never saw their requests open (audit T1, F-A41 point 3): every token transfer out of a deposit
+   * address is a vault sweep for its recipient, so the pay token's Sepolia `Transfer` logs out of it,
+   * less what completed requests minted to the temporary wallet, what open (or being completed)
+   * requests still move, and what is already recorded lost, is what such settles minted out of the
+   * wallet's reach. Read on a balance drop and while the address's drop is not explained.
+   */
+  private async countForeignSweeps(rec: SwapRecord, be: SwapBackend): Promise<void> {
+    const d = rec.deposit;
+    if (!d || !SwapService.waitsForDeposit(rec)) return;
+    const vaultEvm = be.vaultEvmAddress.toLowerCase();
+    const latest = await be.evm.blockNumber();
+    // Sepolia makes a block every 12 s at most: from (a little before) the swap's opening.
+    const back = BigInt(Math.ceil(Math.max(0, this.nowS() - rec.createdAt) / 12)) + 600n;
+    const transfers = (await be.evm.transfersFrom(rec.pay.erc20Address, rec.depositAddress, latest - back)).filter(
+      (t) => t.to === vaultEvm,
+    );
+    const swept = transfers.reduce((a, t) => a + t.amount, 0n);
+    if (swept === 0n) return;
+    const open = await be.openRequests('deposit');
+    const path = be.depositPathHex(rec.tempCoinPk);
+    const isPay = (erc20: string) => erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase();
+    let pending = 0n;
+    for (const id of open.ids) {
+      if (open.pathOf(id) !== path) continue;
+      const dt = open.detailOf(id);
+      if (dt && isPay(dt.erc20)) pending += dt.amount;
+    }
+    for (const f of d.foreign ?? []) {
+      if (f.status === 'completing' && !open.ids.includes(f.requestId) && isPay(f.erc20)) pending += BigInt(f.amount);
+    }
+    const unexplained = swept - mintedTotalOf(rec) - lostOf(rec, 'deposit') - pending;
+    if (unexplained <= 0n) return;
+    const own = new Set((d.ownSweeps ?? []).map((h) => h.toLowerCase()));
+    const match = transfers.filter((t) => !own.has(t.txHash) && t.amount === unexplained).at(-1);
+    const now = this.nowS();
+    pushStage(d, 'settled-elsewhere', now, {
+      attested: 'success',
+      amount: unexplained.toString(),
+      lost: 'true',
+      by: 'other',
+      ...(match ? { evmTx: match.txHash } : {}),
+    });
+    this.recordElsewhere(rec, {
+      kind: 'deposit',
+      attested: 'success',
+      colour: rec.pay.colour,
+      amount: unexplained.toString(),
+      lost: true,
+      ...(match ? { evmTx: match.txHash } : {}),
+    });
+    await this.afterDepositLoss(rec, be);
+  }
+
+  /** `countForeignSweeps` for a background drive: a failed read is logged and tried again later. */
+  private async countForeignSweepsLogged(swapId: string): Promise<void> {
+    const be = this.deps.backend();
+    if (!be) return;
+    try {
+      await this.countForeignSweeps(this.get(swapId), be);
+    } catch (e) {
+      this.deps.log.warn('the deposit address’s sweeps could not be counted', { swapId, error: e });
+    }
+  }
+
+  /** At most one foreign-sweep count per swap every 10 minutes, unless its address just dropped. */
+  private readonly sweepCounts = new Map<string, number>();
+
+  /** Whether the pay token that left the deposit address is not yet explained by what completed
+   *  requests minted to the wallet or by recorded losses (audit T1): then the Sepolia logs are read. */
+  private static dropUnexplained(r: SwapRecord): boolean {
+    const d = r.deposit;
+    if (!d) return false;
+    const left = BigInt(d.maxSeen ?? '0') - BigInt(d.atAddress ?? d.maxSeen ?? '0');
+    return left > mintedTotalOf(r) + lostOf(r, 'deposit');
   }
 
   /** Start (or resume) a swap's deposit (the whole amount, or a partial deposit's remainder) and
@@ -2659,7 +3016,6 @@ export class SwapService {
     };
     let resumed = d.requestId !== undefined;
     if (!d.requestId) {
-      const amount = remainingOf(rec);
       try {
         const path = be.depositPathHex(rec.tempCoinPk);
         const [open, erc20, eth, nextNonce, evmNonce, baseFee] = await Promise.all([
@@ -2670,6 +3026,11 @@ export class SwapService {
           be.evm.nonce(rec.depositAddress, 'pending'),
           be.evm.baseFeePerGas(),
         ]);
+        // What this start deposits: the remainder, or after a loss to another party's settle what
+        // waits at the address (audit T1).
+        const amount = toComeOf(rec, erc20);
+        if (amount <= 0n)
+          throw new DriveError(BRIDGE_ERRORS.preflight, 'nothing of the pay token waits at the address');
         // An earlier start of this swap may be open already (a crash after it landed): adopt it, but
         // only a request with the sponsor's OWN parameters: this swap's token and the amount it still
         // needs, the deposit address's next nonce, this swap's sweep gas limit, and BOTH fee fields
@@ -2680,10 +3041,21 @@ export class SwapService {
         const gasLimit = BigInt(rec.sweepGas.gasLimit);
         const tipPolicy = BigInt(rec.sweepGas.maxPriorityFeePerGas);
         const feeFloor = ceilTenthGwei((5n * baseFee) / 4n + tipPolicy);
+        const done = new Set((d.foreign ?? []).filter((f) => f.status !== 'completing').map((f) => f.requestId));
+        const forPath = open.ids.filter((id) => open.pathOf(id) === path && !done.has(id) && !this.notSwept.has(id));
+        // Only a request that can ever sweep is adopted or competed with: its gas limit covers what its
+        // transfer needs and fits a block (audit T2). Anything else (a gas limit of 1 with a huge fee
+        // cap, say) never takes the nonce, and outbidding it would only stop the sponsor's own start.
+        const executable = new Set<string>();
+        for (const id of forPath) {
+          const dt = open.detailOf(id);
+          if (dt !== undefined && dt.evmNonce === nextNonce && (await this.canExecute(be, rec, dt))) executable.add(id);
+        }
         const own = (id: string) => {
           const dt = open.detailOf(id);
           return (
             dt !== undefined &&
+            executable.has(id) &&
             dt.erc20.toLowerCase() === rec.pay.erc20Address.toLowerCase() &&
             dt.amount === amount &&
             dt.evmNonce === nextNonce &&
@@ -2696,8 +3068,6 @@ export class SwapService {
             dt.gasLimit * dt.maxFeePerGas <= this.cfg.maxSweepWei
           );
         };
-        const done = new Set((d.foreign ?? []).map((f) => f.requestId));
-        const forPath = open.ids.filter((id) => open.pathOf(id) === path && !done.has(id) && !this.notSwept.has(id));
         const mine = forPath.filter(own);
         const others = forPath.filter((id) => !own(id));
         if (others.length > 0) {
@@ -2729,6 +3099,7 @@ export class SwapService {
           // else), since a pool refuses a replacement that does not (audit S3, the R2 rule). Too
           // little ETH for that: ask for more (the swap's sweepGas rises) and wait.
           const competing = others
+            .filter((id) => executable.has(id))
             .map((id) => open.detailOf(id))
             .filter(
               (dt): dt is NonNullable<typeof dt> =>
@@ -2791,6 +3162,28 @@ export class SwapService {
   }
 
   /**
+   * Whether a deposit request could ever sweep (audit T2): its gas limit fits a transaction
+   * (EIP-7825) and covers what its ERC20 transfer from the deposit address to the vault needs now
+   * (Sepolia's estimate; a transfer that reverts cannot sweep; without an estimate, the configured
+   * floor).
+   */
+  private async canExecute(be: SwapBackend, rec: SwapRecord, dt: RequestDetail): Promise<boolean> {
+    if (dt.gasLimit > MAX_TX_GAS) return false;
+    let need = this.cfg.sweepMinExecGas;
+    try {
+      const est = await be.evm.estimateTransferGas(dt.erc20, rec.depositAddress, be.vaultEvmAddress, dt.amount);
+      if (est === 'reverts') return false;
+      need = est;
+    } catch (e) {
+      this.deps.log.warn('a deposit request’s transfer cannot be estimated: the floor applies', {
+        swapId: rec.swapId,
+        error: e,
+      });
+    }
+    return dt.gasLimit >= need;
+  }
+
+  /**
    * The sweep's gas at start: the largest 0.1-gwei cap the ETH at the address covers (within
    * SWEEP_MAX_WEI), which must reach 1.25 × the live base fee + tip AND outbid every competing request
    * of the same nonce on both fee fields (audit S3). `gas` is null when the ETH does not cover
@@ -2844,6 +3237,8 @@ export class SwapService {
   private async relayAndSettleDeposit(rec: SwapRecord, be: SwapBackend, resumed: boolean): Promise<void> {
     const d = rec.deposit!;
     const requestId = d.requestId!;
+    // A resumed request that is gone was settled while the sponsor was not looking (audit T1).
+    if (resumed && (await this.depositRequestGone(rec, be, null))) return;
     let relay: RelayOutcome;
     try {
       const budget = resumed
@@ -2868,56 +3263,109 @@ export class SwapService {
     await this.settleDeposit(rec, be, relay);
   }
 
+  /** Records each settle the sponsor submits for `target` before it reaches the node (audit T1). */
+  private recordSettle(rec: SwapRecord, list: OwnSettle[], circuit: string, requestId: string) {
+    return (sub: SubmissionInfo) => {
+      list.push({ circuit, requestId, identifiers: sub.identifiers, expiresAtMs: sub.expiresAtMs, at: this.nowS() });
+      if (list.length > 8) list.splice(0, list.length - 8);
+      this.persist(rec);
+    };
+  }
+
   private async settleDeposit(rec: SwapRecord, be: SwapBackend, att: Attestation): Promise<void> {
     const d = rec.deposit!;
     const requestId = d.requestId!;
+    const settles = (d.settles ??= []);
     if (att.kind === 'never-executed') {
       // The sweep never ran (the tokens are still at the deposit address): close the request with
       // the vault's abandonDeposit, and let the poll start again while the funds are there.
       this.stage(rec, d, 'abandoning');
-      const out = await this.withProver(() => be.abandonDeposit({ requestId, attestation: att }));
-      pushStage(d, 'abandoned', this.nowS(), { requestId, ...(out.txHash ? { tx: out.txHash } : {}) });
-      delete d.requestId;
-      delete d.requestAmount;
-      delete d.startedAtMs;
-      const back = this.depositWaitState(rec);
-      transition(rec, back, this.nowS());
-      pushStage(d, back === 'partial' ? 'partial' : 'waiting-for-funds', this.nowS(), {
-        retry: String(d.attempts + 1),
-      });
-      this.persist(rec);
+      let out: MidnightTxFacts;
+      try {
+        out = await this.withProver(() =>
+          be.abandonDeposit({
+            requestId,
+            attestation: att,
+            onSubmit: this.recordSettle(rec, settles, 'abandonDeposit', requestId),
+          }),
+        );
+      } catch (e) {
+        // Gone already (anyone may abandon it): resolved, never retried (audit T1).
+        if (await this.depositRequestGone(rec, be, att)) return;
+        throw e;
+      }
+      this.afterAbandon(rec, out.txHash);
       return;
     }
     this.stage(rec, d, 'completing');
-    const out = await this.withProver(() =>
-      be.settle({
-        circuit: 'completeDeposit',
-        requestId,
-        attestation: att,
-        recipientCoinPk: rec.tempCoinPk,
-        recipientEncPk: rec.tempEncPk,
-      }),
-    );
-    if (out.txHash) d.completeTx = out.txHash;
+    let out: MidnightTxFacts & { minted: boolean };
+    try {
+      out = await this.withProver(() =>
+        be.settle({
+          circuit: 'completeDeposit',
+          requestId,
+          attestation: att,
+          recipientCoinPk: rec.tempCoinPk,
+          recipientEncPk: rec.tempEncPk,
+          onSubmit: this.recordSettle(rec, settles, 'completeDeposit', requestId),
+        }),
+      );
+    } catch (e) {
+      // Settled already, by the sponsor's own earlier settle or by another party: resolved, never
+      // retried (audit T1). Still open: the stale closer drives it again.
+      if (await this.depositRequestGone(rec, be, att)) return;
+      throw e;
+    }
     if (out.txId) d.completeTxId = out.txId;
+    this.afterCompleteDeposit(rec, att.kind, out.minted, out.txHash);
+  }
+
+  /** The deposit request was abandoned (a never-executed sweep): the funds wait at the address. */
+  private afterAbandon(rec: SwapRecord, txHash?: string | null): void {
+    const d = rec.deposit!;
+    const requestId = d.requestId;
+    pushStage(d, 'abandoned', this.nowS(), { ...(requestId ? { requestId } : {}), ...(txHash ? { tx: txHash } : {}) });
+    delete d.requestId;
+    delete d.requestAmount;
+    delete d.startedAtMs;
+    delete d.settles;
+    const back = this.depositWaitState(rec);
+    transition(rec, back, this.nowS());
+    pushStage(d, back === 'partial' ? 'partial' : 'waiting-for-funds', this.nowS(), {
+      retry: String(d.attempts + 1),
+    });
+    this.persist(rec);
+  }
+
+  /** The deposit request was completed (by the sponsor, or found to be the sponsor's own). */
+  private afterCompleteDeposit(rec: SwapRecord, kind: AttestedKind, minted: boolean, txHash?: string | null): void {
+    const d = rec.deposit!;
+    const requestId = d.requestId!;
+    if (txHash) d.completeTx = txHash;
     const now = this.nowS();
-    if (out.minted) {
-      pushStage(d, 'completed', now, { ...(out.txHash ? { tx: out.txHash } : {}) });
+    if (minted) {
+      pushStage(d, 'completed', now, { ...(txHash ? { tx: txHash } : {}) });
       // What it minted counts toward the pay amount: the whole amount (or the rest of a partial
       // deposit) → `minted`; less → `partial` (audit S2).
-      d.mintedTotal = (mintedTotalOf(rec) + BigInt(d.requestAmount ?? rec.pay.amount)).toString();
+      const moved = BigInt(d.requestAmount ?? rec.pay.amount);
+      d.mintedTotal = (mintedTotalOf(rec) + moved).toString();
+      // Its sweep took that much from the deposit address (the next read confirms it).
+      if (d.atAddress !== undefined) {
+        const left = BigInt(d.atAddress) - moved;
+        d.atAddress = (left > 0n ? left : 0n).toString();
+      }
       const target = holdingState(rec);
       transition(rec, target, now);
       if (target === 'partial') {
         pushStage(d, 'partial', now, {
           requestId,
           minted: heldOf(rec).toString(),
-          remaining: remainingOf(rec).toString(),
+          remaining: toComeOf(rec).toString(),
         });
       }
       this.deps.log.info('deposit minted', { swapId: rec.swapId, requestId, state: target });
     } else {
-      pushStage(d, 'closed', now, { attested: att.kind });
+      pushStage(d, 'closed', now, { attested: kind });
       transition(rec, 'failed', now, {
         reason: 'deposit-returned-false',
         message: 'the token refused the vault’s transfer: nothing was minted (the funds stay at the deposit address)',
@@ -2925,6 +3373,155 @@ export class SwapService {
       });
     }
     this.persist(rec);
+  }
+
+  // ── Requests settled by someone else (audit T1) ───────────────────────────
+
+  /**
+   * Who settled a request that is no longer open: the sponsor itself (one of its recorded settles is
+   * on chain: its answer was lost, e.g. a crash after submitting), or another party (none of them is,
+   * and every one of them expired as of the indexer's head plus the S1 margin, so none can land
+   * later; or the sponsor never submitted one). `unknown` while that cannot be told yet.
+   */
+  private async whoSettled(
+    be: SwapBackend,
+    settles: readonly OwnSettle[] | undefined,
+    asOf: ReadWatermark,
+  ): Promise<{ by: 'sponsor' | 'other' | 'unknown'; tx?: string }> {
+    let conclusive = true;
+    for (const st of settles ?? []) {
+      const id = st.identifiers[0];
+      let head = asOf;
+      if (id !== undefined) {
+        const t = await be.findTransaction(id);
+        if (t.found?.success) return { by: 'sponsor', tx: t.found.hash };
+        if (t.found) continue; // it landed and failed: it settled nothing
+        if (t.asOf.timeMs > head.timeMs) head = t.asOf;
+      }
+      if (head.timeMs < st.expiresAtMs + this.cfg.expiryMarginMs) conclusive = false;
+    }
+    return { by: conclusive ? 'other' : 'unknown' };
+  }
+
+  /** Record a request of this swap that another party settled (shown in the view; audit T1). */
+  private recordElsewhere(rec: SwapRecord, e: Omit<SettledElsewhere, 'at'>): void {
+    const list = (rec.settledElsewhere ??= []);
+    if (e.requestId && list.some((x) => x.requestId === e.requestId)) return;
+    list.push({ ...e, at: this.nowS() });
+    if (e.lost) {
+      this.deps.log.warn('another party settled a request of this swap: its coin is lost to the swap', {
+        swapId: rec.swapId,
+        kind: e.kind,
+        requestId: e.requestId ?? null,
+        amount: e.amount,
+      });
+    }
+  }
+
+  /**
+   * The swap's own deposit request could not be settled by the sponsor (audit T1). Returns false when
+   * nothing is decided: it is still open (or the read cannot tell), it carries no attestation, or the
+   * sponsor's own settle might still land. Otherwise it is resolved and never settled again:
+   *  - the sponsor's own earlier settle landed: exactly as if it had answered;
+   *  - another party's: nothing minted (abandoned, returned false) → as the sponsor's own; minted →
+   *    the amount is LOST to the swap (its nonce is known only to that party), and the swap goes on
+   *    with what is left (`afterDepositLoss`).
+   */
+  private async depositRequestGone(rec: SwapRecord, be: SwapBackend, att: Attestation | null): Promise<boolean> {
+    const d = rec.deposit!;
+    const requestId = d.requestId;
+    if (!requestId) return false;
+    try {
+      const open = await be.openRequests('deposit');
+      if (open.ids.includes(requestId) || open.asOf === undefined) return false;
+      const kind = att?.kind ?? d.attested ?? (await be.attestation('deposit', requestId))?.kind ?? null;
+      if (!kind) return false; // a settle needs an attestation: not settled yet as far as can be told
+      const who = await this.whoSettled(be, d.settles, open.asOf);
+      if (who.by === 'unknown') return false;
+      const now = this.nowS();
+      const amount = d.requestAmount ?? remainingOf(rec).toString();
+      d.attested = kind;
+      const lost = who.by === 'other' && kind === 'success';
+      pushStage(d, 'settled-elsewhere', now, {
+        requestId,
+        attested: kind,
+        amount,
+        lost: String(lost),
+        by: who.by,
+        ...(who.tx ? { tx: who.tx } : {}),
+      });
+      if (who.by === 'other') {
+        this.recordElsewhere(rec, {
+          kind: 'deposit',
+          requestId,
+          attested: kind,
+          colour: rec.pay.colour,
+          amount,
+          lost,
+          ...(d.sweepTx ? { evmTx: d.sweepTx } : {}),
+        });
+      }
+      if (kind === 'never-executed') this.afterAbandon(rec, who.tx);
+      else if (!lost) this.afterCompleteDeposit(rec, kind, kind === 'success', who.tx);
+      else await this.afterDepositLoss(rec, be);
+      return true;
+    } catch (e) {
+      this.deps.log.warn('a gone deposit request could not be resolved yet', {
+        swapId: rec.swapId,
+        requestId,
+        error: e,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * After part (or all) of the deposit was lost to another party's settle (audit T1): the swap goes on
+   * with what is left. What the temporary wallet holds can be bridged back, and what waits at the
+   * deposit address is deposited by the sponsor (`partial`); with nothing held and nothing at the
+   * address the swap ends `failed` / `settled-elsewhere` (never recoverable).
+   */
+  private async afterDepositLoss(rec: SwapRecord, be: SwapBackend): Promise<void> {
+    const d = rec.deposit!;
+    // Pinned while the state still says what was minted (a `partial` record without it reads as the
+    // whole pay amount: the pre-P4.2-fix3 fallback).
+    d.mintedTotal ??= mintedTotalOf(rec).toString();
+    SwapService.clearRequest(d);
+    const there = await be.evm.erc20Balance(rec.pay.erc20Address, rec.depositAddress).catch(() => null);
+    if (there !== null) d.atAddress = there.toString();
+    const now = this.nowS();
+    const held = heldOf(rec);
+    const toCome = toComeOf(rec, there ?? undefined);
+    // An unreadable address is not taken as empty: the poll decides once it reads it.
+    if (held > 0n || toCome > 0n || there === null) {
+      if (rec.state !== 'partial') transition(rec, 'partial', now);
+      d.attempts = 0;
+      pushStage(d, 'partial', now, {
+        minted: held.toString(),
+        remaining: toCome.toString(),
+        lost: lostOf(rec, 'deposit').toString(),
+      });
+    } else {
+      this.failSettledElsewhere(rec);
+    }
+    this.persist(rec);
+  }
+
+  /** The swap's funds are all lost to settles by other parties (audit T1): final. */
+  private failSettledElsewhere(rec: SwapRecord): void {
+    const lost = [...(rec.settledElsewhere ?? [])].filter((e) => e.lost);
+    const parts = lost.map((e) => {
+      const t = this.cfg.tokens.byColour(e.colour);
+      return t ? `${formatUnits(BigInt(e.amount), t.decimals)} ${t.symbol}` : `${e.amount} base units`;
+    });
+    transition(rec, 'failed', this.nowS(), {
+      reason: SETTLED_ELSEWHERE_REASON,
+      message:
+        `Another party completed this swap's bridge request before the sponsor and kept the minted coin's ` +
+        `details to itself: ${parts.join(' and ') || 'the funds'} can no longer be used by this swap's ` +
+        `temporary wallet (nobody can spend them). Nothing else is left to recover for this swap.`,
+      recoverable: false,
+    });
   }
 
   // ── The stale closer's hooks ──────────────────────────────────────────────

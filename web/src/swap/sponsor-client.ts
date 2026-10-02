@@ -118,6 +118,30 @@ const SwapViewShape = z.object({
     })
     .optional(),
   takeTx: optText,
+  /** P4.2-fix4 T1 (FS4): vault requests of this swap that ANOTHER party settled; a `lost` entry's
+   *  amount was minted with a nonce only that party knows, so the temporary wallet can never use it.
+   *  Read only through ./settled-elsewhere.ts. */
+  settledElsewhere: z
+    .array(
+      z.object({
+        kind: z.enum(['deposit', 'withdraw']),
+        requestId: z
+          .string()
+          .regex(/^[0-9a-f]{64}$/)
+          .optional(),
+        attested: z.string().max(32),
+        colour: z.string().regex(/^[0-9a-f]{64}$/),
+        amount: decimal,
+        lost: z.boolean(),
+        evmTx: z
+          .string()
+          .regex(/^0x[0-9a-fA-F]{64}$/)
+          .optional(),
+        at: z.number().optional(),
+      }),
+    )
+    .max(16)
+    .optional(),
   withdraw: LegProgressSchema.optional(),
   /** Every withdrawal attempt, oldest first: the page counts the ones that ended without a transfer
    *  (refunded, or not started) from their stages (P4.2-fix3 S2: a completed Bridge back of a partial

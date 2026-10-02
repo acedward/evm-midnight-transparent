@@ -28,6 +28,7 @@ import { clockText } from './display.js';
 import { bridgeBackAmount, partialOf, partialRecord } from './partial.js';
 
 import { type SwapPhase, type SwapRecord, isDoneForUser } from './record-shape.js';
+import { lostRecord } from './settled-elsewhere.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
 
 /** Refunded withdrawals are rebuilt automatically this many times, then the page asks. */
@@ -178,6 +179,10 @@ export function applyView(record: SwapRecord, view: SwapView, now: number): Swap
   const base: SwapRecord = { ...record, bridgeIn, bridgeOut, take };
   if (partial) base.partial = partial;
   else delete base.partial;
+  // T1 (FS4): what another party's vault settle minted out of the temporary wallet's reach.
+  const lost = lostRecord(record, view);
+  if (lost) base.lost = lost;
+  else delete base.lost;
   const phase = phaseFor(base, view);
   const next: SwapRecord = { ...base, phase, updatedAt: now };
   if (view.state === 'done')

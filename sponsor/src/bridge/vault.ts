@@ -23,7 +23,7 @@ import { pathToFileURL } from 'node:url';
 import { depositPathOf, hexToBytes, walletRecipient } from '@evm-midnight-transparent/core';
 
 import type { OpenedWallet } from '../sponsor/facade.js';
-import { NotSubmittedError, WITHDRAW_TX_TTL_MS } from '../swaps/backend.js';
+import { NotSubmittedError, WITHDRAW_TX_TTL_MS, type SubmissionInfo } from '../swaps/backend.js';
 
 // ── Types kept loose on purpose: the SDK's types are deep generics; the gate proves the shapes ──
 
@@ -179,20 +179,34 @@ export async function proofProviderFor(rt: VaultRuntime, proofServerUrl: string)
   return httpClientProofProvider(proofServerUrl, rt.zkConfigRegistry);
 }
 
+/** What a caller of the sponsor's providers may observe (audit T1). */
+export interface ProviderHooks {
+  /** Told a transaction's identifiers and expiry right BEFORE it is handed to the node. A hook that
+   *  throws stops the submission (nothing reaches the node). */
+  onSubmit?: (s: SubmissionInfo) => void;
+}
+
+/** A finalized transaction's identifiers (64 lowercase hex each, as the indexer looks them up). */
+export const identifiersOf = (tx: Any): string[] => ((tx.identifiers?.() ?? []) as unknown[]).map((i) => normHex(i));
+
 /** The sponsor wallet as midnight-js's wallet and midnight providers: it balances (shielded and
- *  DUST) and submits. `ttlMs` bounds the balancing transaction's time to live. */
+ *  DUST) and submits. `ttlMs` bounds the balancing transaction's time to live; `hooks.onSubmit` is
+ *  told what identifies each transaction before it reaches the node, and until when it can land. */
 export function sponsorWalletProvider(
   opened: OpenedWallet,
   coinPublicKeyHex: string,
   encryptionPublicKeyHex: string,
   ttlMs = 60_000,
+  hooks: ProviderHooks = {},
 ) {
   const h = opened.handle as Any;
+  let lastTtlMs: number | null = null;
   return {
     getCoinPublicKey: () => coinPublicKeyHex,
     getEncryptionPublicKey: () => encryptionPublicKeyHex,
     async balanceTx(tx: Any, ttl?: Date) {
       const t = ttl ?? new Date(Date.now() + ttlMs);
+      lastTtlMs = t.getTime();
       const recipe = await h.wallet.balanceUnboundTransaction(
         tx,
         { shieldedSecretKeys: h.shieldedSecretKeys, dustSecretKey: h.dustSecretKey },
@@ -203,7 +217,10 @@ export function sponsorWalletProvider(
       );
       return h.wallet.finalizeRecipe(signed);
     },
-    submitTx: (tx: Any) => h.wallet.submitTransaction(tx),
+    submitTx: (tx: Any) => {
+      hooks.onSubmit?.({ identifiers: identifiersOf(tx), expiresAtMs: lastTtlMs ?? Date.now() + ttlMs });
+      return h.wallet.submitTransaction(tx);
+    },
   };
 }
 

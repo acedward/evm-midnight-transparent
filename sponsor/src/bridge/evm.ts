@@ -3,12 +3,36 @@
 // The URL usually carries an API key: it is never logged, and errors say only which method failed
 // (the logger also redacts the URL).
 
-import type { EvmReader } from '../swaps/backend.js';
+import type { EvmReader, EvmTransfer } from '../swaps/backend.js';
 
 const quantity = (v: unknown): bigint => {
   if (typeof v !== 'string' || !/^0x[0-9a-fA-F]*$/.test(v)) throw new Error('not a hex quantity');
   return v === '0x' ? 0n : BigInt(v);
 };
+
+/** keccak256("Transfer(address,address,uint256)"). */
+export const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+/** Blocks per `eth_getLogs` call (well inside every public provider's range limit). */
+export const LOG_CHUNK_BLOCKS = 5_000n;
+
+const word = (address: string) => `0x${address.toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
+const hexQ = (n: bigint) => `0x${n.toString(16)}`;
+
+/** A JSON-RPC error the node answered (as opposed to an unreachable or failing endpoint). */
+export class EvmRpcError extends Error {
+  override name = 'EvmRpcError';
+  constructor(
+    readonly method: string,
+    readonly rpcMessage: string,
+    readonly code: number | undefined,
+  ) {
+    super(`Sepolia ${method}: ${rpcMessage}`);
+  }
+}
+
+/** An estimate the node refused because the call cannot execute (a revert, out of gas, no funds). */
+const cannotExecute = (e: unknown) =>
+  e instanceof EvmRpcError && (e.code === 3 || /revert|exceeds|insufficient|out of gas/i.test(e.rpcMessage));
 
 export function jsonRpcEvmReader(
   url: string,
@@ -27,8 +51,12 @@ export function jsonRpcEvmReader(
     } catch {
       throw new Error(`Sepolia ${method}: unreachable`);
     }
-    const body = (await res.json().catch(() => null)) as { result?: unknown; error?: { message?: string } } | null;
-    if (!res.ok || !body || body.error) throw new Error(`Sepolia ${method}: ${body?.error?.message ?? res.status}`);
+    const body = (await res.json().catch(() => null)) as {
+      result?: unknown;
+      error?: { message?: string; code?: number };
+    } | null;
+    if (body?.error) throw new EvmRpcError(method, String(body.error.message ?? 'error'), body.error.code);
+    if (!res.ok || !body) throw new Error(`Sepolia ${method}: ${res.status}`);
     return body.result;
   };
   return {
@@ -44,6 +72,50 @@ export function jsonRpcEvmReader(
     baseFeePerGas: async () => {
       const block = (await call('eth_getBlockByNumber', ['latest', false])) as { baseFeePerGas?: unknown } | null;
       return quantity(block?.baseFeePerGas);
+    },
+    async estimateTransferGas(token, from, to, amount) {
+      const data = `0xa9059cbb${word(to).slice(2)}${amount.toString(16).padStart(64, '0')}`;
+      try {
+        return quantity(await call('eth_estimateGas', [{ from, to: token, data }, 'latest']));
+      } catch (e) {
+        if (cannotExecute(e)) return 'reverts';
+        throw e;
+      }
+    },
+    blockNumber: async () => quantity(await call('eth_blockNumber', [])),
+    async transfersFrom(token, from, fromBlock) {
+      const latest = quantity(await call('eth_blockNumber', []));
+      const out: EvmTransfer[] = [];
+      for (let start = fromBlock < 0n ? 0n : fromBlock; start <= latest; start += LOG_CHUNK_BLOCKS) {
+        const end = start + LOG_CHUNK_BLOCKS - 1n < latest ? start + LOG_CHUNK_BLOCKS - 1n : latest;
+        const logs = (await call('eth_getLogs', [
+          {
+            address: token,
+            fromBlock: hexQ(start),
+            toBlock: hexQ(end),
+            topics: [ERC20_TRANSFER_TOPIC, word(from)],
+          },
+        ])) as {
+          transactionHash?: unknown;
+          topics?: unknown;
+          data?: unknown;
+          blockNumber?: unknown;
+          removed?: unknown;
+        }[];
+        if (!Array.isArray(logs)) throw new Error('Sepolia eth_getLogs: not a list');
+        for (const l of logs) {
+          const topics = Array.isArray(l.topics) ? (l.topics as string[]) : [];
+          if (l.removed === true || topics.length < 3 || String(topics[0]).toLowerCase() !== ERC20_TRANSFER_TOPIC)
+            continue;
+          out.push({
+            txHash: String(l.transactionHash).toLowerCase(),
+            to: `0x${String(topics[2]).slice(-40).toLowerCase()}`,
+            amount: quantity(l.data),
+            block: quantity(l.blockNumber),
+          });
+        }
+      }
+      return out;
     },
   };
 }
