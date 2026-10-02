@@ -3059,6 +3059,9 @@ export class SwapService {
    * fee fields, and its `Transfer` moves the request's amount; each sweep and each request is matched
    * once. An open request's amount alone explains nothing: anyone may leave a request open that never
    * sweeps (a gas limit of 1), and it must not cancel a real loss.
+   *
+   * A candidate sweep whose transaction cannot be read (a null answer or a failed read) defers the
+   * whole judgment to a later count: nothing is recorded lost on that pass (audit V1, F-B61).
    */
   private async countForeignSweeps(rec: SwapRecord, be: SwapBackend): Promise<void> {
     const d = rec.deposit;
@@ -3092,12 +3095,20 @@ export class SwapService {
     const from = rec.depositAddress.toLowerCase();
     const matched = new Set<string>();
     const explainedBy = new Set<string>();
+    const unresolved: string[] = [];
     let pending = 0n;
     for (const t of transfers) {
       const candidates = inProgress.filter((r) => !matched.has(r.id) && r.amount === t.amount);
       if (candidates.length === 0) continue;
-      const tx = await be.evm.transaction(t.txHash);
-      if (!tx || tx.from !== from) continue;
+      // A candidate's sweep whose transaction the RPC cannot return (null: a load-balanced node behind
+      // the one that served the logs) or whose read fails is UNRESOLVED, not "nobody's": it may be a
+      // request's sweep still waiting for its attestation (audit V1, F-B61 / F-A61).
+      const tx = await be.evm.transaction(t.txHash).catch(() => null);
+      if (!tx) {
+        unresolved.push(t.txHash);
+        continue;
+      }
+      if (tx.from !== from) continue;
       // A completion recorded before P4.2-fix5 has no signed fields: its amount and the sender decide.
       const r = candidates.find((c) => (c.signed ? isSignedSweep(c.signed, tx) : true));
       if (!r) continue;
@@ -3107,6 +3118,15 @@ export class SwapService {
     }
     const unexplained = swept - mintedTotalOf(rec) - lostOf(rec, 'deposit') - pending;
     if (unexplained <= 0n) return;
+    // No loss is judged while any candidate sweep is unresolved: the swap keeps waiting, and the next
+    // count (at most every 10 minutes while the drop is unexplained) reads it again (audit V1).
+    if (unresolved.length > 0) {
+      this.deps.log.warn('a sweep transaction cannot be read yet: the loss judgment waits', {
+        swapId: rec.swapId,
+        txHashes: unresolved,
+      });
+      return;
+    }
     const own = new Set((d.ownSweeps ?? []).map((h) => h.toLowerCase()));
     const match = transfers
       .filter((t) => !own.has(t.txHash) && !explainedBy.has(t.txHash) && t.amount === unexplained)
