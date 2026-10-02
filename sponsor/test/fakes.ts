@@ -17,6 +17,7 @@ import {
   type Attestation,
   type BridgeKind,
   type EvmReader,
+  type EvmTransfer,
   type MidnightTxFacts,
   type OfferReader,
   type OpenRequests,
@@ -24,8 +25,10 @@ import {
   type RelayOutcome,
   type RelayProgress,
   type SettleCircuit,
+  type SubmissionInfo,
   type SwapBackend,
   type SwapProver,
+  type TxLookup,
   type WithdrawCallArgs,
 } from '../src/swaps/backend.js';
 import type { AttestedKind } from '../src/swaps/model.js';
@@ -161,6 +164,14 @@ export class FakeEvm implements EvmReader {
   nonces = new Map<string, { latest: bigint; pending: bigint }>();
   baseFee = 952_000_000n;
   failing = false;
+  /** What an ERC20 transfer needs (`eth_estimateGas`), by token (default: the measured stk sweep). */
+  transferGas = new Map<string, bigint>();
+  /** `eth_estimateGas` cannot be read (the floor applies). */
+  estimateFails = false;
+  readonly estimates: { token: string; from: string; amount: bigint }[] = [];
+  block = 11_810_000n;
+  /** Every token transfer out of an address (the `Transfer` logs), by token. */
+  readonly transfers: (EvmTransfer & { token: string; from: string })[] = [];
 
   private k = (a: string) => a.toLowerCase();
   setEth(a: string, v: bigint) {
@@ -187,6 +198,49 @@ export class FakeEvm implements EvmReader {
   }
   async baseFeePerGas() {
     return this.baseFee;
+  }
+  async estimateTransferGas(token: string, from: string, _to: string, amount: bigint): Promise<bigint | 'reverts'> {
+    this.estimates.push({ token: this.k(token), from: this.k(from), amount });
+    if (this.estimateFails) throw new Error('Sepolia eth_estimateGas: unreachable');
+    // A transfer of more than the sender holds reverts (an OpenZeppelin ERC20).
+    if ((this.erc20.get(`${this.k(token)}/${this.k(from)}`) ?? 0n) < amount) return 'reverts';
+    return this.transferGas.get(this.k(token)) ?? 29_677n;
+  }
+  async blockNumber() {
+    if (this.failing) throw new Error('Sepolia eth_blockNumber: unreachable');
+    return this.block;
+  }
+  async transfersFrom(token: string, from: string, fromBlock: bigint): Promise<EvmTransfer[]> {
+    if (this.failing) throw new Error('Sepolia eth_getLogs: unreachable');
+    return this.transfers
+      .filter((t) => t.token === this.k(token) && t.from === this.k(from) && t.block >= fromBlock)
+      .map(({ txHash, to, amount, block }) => ({ txHash, to, amount, block }));
+  }
+  /** A transfer out of `from` (a sweep): the balance moves and the log is recorded. */
+  transfer(
+    token: string,
+    from: string,
+    to: string,
+    amount: bigint,
+    opts: { move?: boolean; txHash?: string } = {},
+  ): string {
+    const txHash = opts.txHash ?? `0x${sha(`transfer:${token}:${from}:${to}:${amount}:${this.transfers.length}`)}`;
+    if (opts.move !== false) {
+      const key = `${this.k(token)}/${this.k(from)}`;
+      this.erc20.set(key, (this.erc20.get(key) ?? 0n) - amount);
+      const dest = `${this.k(token)}/${this.k(to)}`;
+      this.erc20.set(dest, (this.erc20.get(dest) ?? 0n) + amount);
+    }
+    this.block += 1n;
+    this.transfers.push({
+      token: this.k(token),
+      from: this.k(from),
+      to: this.k(to),
+      amount,
+      block: this.block,
+      txHash,
+    });
+    return txHash;
   }
 }
 
@@ -240,6 +294,21 @@ export class FakeVault implements SwapBackend {
   indexerLagMs = 0;
   /** An attestation lookup that fails (audit S1: it never settles anything). */
   attestationFails = false;
+  /** The Midnight transactions on chain, by identifier (audit T1: `findTransaction`). */
+  readonly txs = new Map<string, { hash: string; height: number; success: boolean }>();
+  /** Whether an executed deposit sweep moves the tokens out of the deposit address (default: the
+   *  balances are left to the tests). */
+  sweepsMove = false;
+  /** How the next sponsor settle (or abandon) ends: its answer lost after it landed (`lost-landed`),
+   *  or lost and it did not land (`lost`) (audit T1). */
+  settleFailure: 'lost-landed' | 'lost' | null = null;
+  /** Settles of other parties (audit T1): the coin's nonce and the key it is sealed to are theirs. */
+  readonly foreignSettles: {
+    circuit: SettleCircuit | 'abandonDeposit';
+    requestId: string;
+    mintNonce: string;
+    encPk: string;
+  }[] = [];
   private seq = 0;
 
   depositAddress(coinPk: string) {
@@ -332,8 +401,12 @@ export class FakeVault implements SwapBackend {
     if (kind === 'never-executed') {
       i.onProgress({ stage: 'not-broadcast', reason: 'nonce already consumed', afterMs: 40_000 });
     } else {
-      // The MPC-signed transaction consumes the payer's nonce.
+      // The MPC-signed transaction consumes the payer's nonce; a deposit's sweep is a Transfer log out
+      // of the deposit address (the balances are left to the tests).
       this.evm.bumpNonce(req.signer);
+      if (i.kind === 'deposit' && kind === 'success') {
+        this.evm.transfer(req.erc20, req.signer, VAULT_EVM, req.amount, { move: this.sweepsMove, txHash: evmTxHash });
+      }
       this.log.push(`broadcast ${i.kind} ${i.requestId.slice(0, 8)} nonce=${req.evmNonce}`);
       i.onProgress({
         stage: 'broadcast',
@@ -363,12 +436,36 @@ export class FakeVault implements SwapBackend {
     return kind ? { kind, event: { requestId }, serializedOutput: new Uint8Array([kind === 'success' ? 1 : 0]) } : null;
   }
   readonly settles: { circuit: SettleCircuit; requestId: string; coinPk: string; encPk: string }[] = [];
+  /**
+   * A transaction the sponsor submits: like the vault's circuits, it fails BEFORE reaching the node
+   * when the request is gone (the circuit's assertion: "Deposit not found" / "Withdrawal not found").
+   * Otherwise `onSubmit` is told its identifier, it lands (recorded in `txs`), and its answer may be
+   * lost (`settleFailure`).
+   */
+  private submitSettle(label: string, requestId: string, onSubmit?: (s: SubmissionInfo) => void): MidnightTxFacts {
+    const req = this.requests.get(requestId);
+    if (!req) {
+      throw new Error(
+        `failed assert: ${label === 'completeWithdraw' || label === 'refundWithdraw' ? 'Withdrawal' : 'Deposit'} not found`,
+      );
+    }
+    const f = this.facts(label);
+    onSubmit?.({ identifiers: [f.txId], expiresAtMs: this.clock() + 60_000 });
+    const failure = this.settleFailure;
+    this.settleFailure = null;
+    if (failure === 'lost') throw new Error('the node did not answer (the settle was not included)');
+    this.requests.delete(requestId);
+    this.txs.set(f.txId, { hash: f.txHash!, height: Math.floor(this.clock() / 6000), success: true });
+    if (failure === 'lost-landed') throw new Error('the indexer timed out (the settle landed)');
+    return f;
+  }
   async settle(i: {
     circuit: SettleCircuit;
     requestId: string;
     attestation: Attestation;
     recipientCoinPk: string;
     recipientEncPk: string;
+    onSubmit?: (s: SubmissionInfo) => void;
   }) {
     this.log.push(`settle ${i.circuit} ${i.requestId.slice(0, 8)}`);
     this.settles.push({
@@ -377,17 +474,50 @@ export class FakeVault implements SwapBackend {
       coinPk: i.recipientCoinPk,
       encPk: i.recipientEncPk,
     });
-    this.requests.delete(i.requestId);
+    const f = this.submitSettle(i.circuit, i.requestId, i.onSubmit);
     const minted =
       i.circuit === 'completeDeposit'
         ? i.attestation.kind === 'success'
         : i.circuit === 'refundWithdraw' || i.attestation.kind === 'returned-false';
-    return { ...this.facts(i.circuit), minted };
+    return { ...f, minted };
   }
-  async abandonDeposit(i: { requestId: string; attestation: Attestation }) {
+  async abandonDeposit(i: { requestId: string; attestation: Attestation; onSubmit?: (s: SubmissionInfo) => void }) {
     this.log.push(`abandonDeposit ${i.requestId.slice(0, 8)}`);
-    this.requests.delete(i.requestId);
-    return this.facts('abandonDeposit');
+    return this.submitSettle('abandonDeposit', i.requestId, i.onSubmit);
+  }
+  async findTransaction(identifier: string): Promise<TxLookup> {
+    const timeMs = this.clock() - this.indexerLagMs;
+    return { found: this.txs.get(identifier) ?? null, asOf: { height: Math.floor(timeMs / 6000), timeMs } };
+  }
+  /**
+   * ANOTHER party settles a request first (audit T1, F-A41): the vault's settles are permissionless;
+   * it picks its own mint nonce and seals the coin to its own encryption key. The request is gone and
+   * its attestation is the given one. Returns the settle's transaction hash.
+   */
+  griefSettle(requestId: string, kind: AttestedKind = 'success'): string {
+    const req = this.requests.get(requestId);
+    if (!req) throw new Error(`no request ${requestId}`);
+    const circuit: SettleCircuit | 'abandonDeposit' =
+      req.kind === 'deposit'
+        ? kind === 'never-executed'
+          ? 'abandonDeposit'
+          : 'completeDeposit'
+        : kind === 'never-executed'
+          ? 'refundWithdraw'
+          : 'completeWithdraw';
+    this.attestations.set(requestId, kind);
+    this.requests.delete(requestId);
+    this.version++;
+    this.foreignSettles.push({
+      circuit,
+      requestId,
+      mintNonce: sha(`griefer-nonce:${requestId}`),
+      encPk: sha('griefer-enc-key'),
+    });
+    const f = this.facts(`grief:${circuit}`);
+    this.txs.set(f.txId, { hash: f.txHash!, height: Math.floor(this.clock() / 6000), success: true });
+    this.log.push(`grief ${circuit} ${requestId.slice(0, 8)}`);
+    return f.txHash!;
   }
   async vaultStateMark(): Promise<string> {
     return `v${this.version}`;

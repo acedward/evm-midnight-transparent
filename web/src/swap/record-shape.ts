@@ -134,6 +134,25 @@ const SwapRecordV2 = z
       .object({ minted: decimal, remaining: decimal, wait: z.literal(true).optional() })
       .strict()
       .optional(),
+    /** P4.2-fix4 T1 (./settled-elsewhere.ts): amounts another party's vault settle minted out of the
+     *  temporary wallet's reach (lost for the user), as the sponsor reported them. */
+    lost: z
+      .array(
+        z
+          .object({
+            kind: z.enum(['deposit', 'withdraw']),
+            colour: hex64,
+            amount: decimal,
+            requestId: hex64.optional(),
+            evmTx: z
+              .string()
+              .regex(/^0x[0-9a-fA-F]{64}$/)
+              .optional(),
+          })
+          .strict(),
+      )
+      .max(8)
+      .optional(),
     /** 'swap' until the user presses Bridge back. */
     choice: z.enum(['swap', 'bridge-back']),
     bridgeOut: z

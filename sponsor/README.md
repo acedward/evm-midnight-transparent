@@ -15,6 +15,7 @@ public keys and the transactions it is asked to prove or pay for.
 | Take | the browser (the batcher pays its fee) | proves the take's balancing transaction if and only if it balances THIS swap's offer and every coin it pays is the temporary wallet's (its coins in: any the caller can spend, up to 4, `src/validate/rules.ts` "INPUTS — ACCEPTED POLICY") |
 | Withdraw / Bridge back | the browser builds and binds `startWithdraw`; the sponsor pays | proves it if and only if its calls are exactly the `startWithdraw` the sponsor rebuilds from the swap's own values and its coins are the wallet's coins in and exactly the vault's coin out (at most one change coin, the wallet's); `/withdraw` must carry that exact transaction, approved by this sponsor version; then, in the ONE withdrawal lane (the vault account's EVM nonce), adds DUST, submits, and releases the lane (the start's record now holds the nonce); the relayer (re-broadcasting until mined, every wait bounded) and `completeWithdraw` (or `refundWithdraw`) follow; a refund or a failed start sets `withdrawal.retry` |
 | Stale requests | the sponsor | resumes its own swaps' requests after a restart, and drives again any that stalled (capped per day, never below a DUST reserve); a transfer signed but stuck unmined is replaced by the next withdrawal's (`deploy/RUNBOOK.md` 13.7) |
+| Requests settled by others | anyone (the vault's settles are permissionless) | never retries a settle whose request is gone: its own settles record their transaction identifiers before reaching the node, so a lost answer is recognised (the swap goes on); another party's settle that minted (a deposit, a refund) is LOST to the swap, because its coin's nonce is that party's (plan question Q16): recorded in the view's `settledElsewhere`, what waits at the deposit address is deposited for a Bridge back, else `failed` / `settled-elsewhere`; sweeps another party both started and settled are counted from Sepolia `Transfer` logs (`deploy/RUNBOOK.md` 12 and 13.1) |
 | Spending controls | the sponsor | new swaps per address per day, swaps waiting for funds overall, a daily DUST budget over paid and in-flight legs; recoverable failures (`failed.recoverable`) revive on a re-open |
 
 The API (paths, bodies, the state machine, error codes) is `packages/core/src/swap-api.ts`, with a
@@ -99,6 +100,7 @@ Secrets are never plain environment values in production: pass the PATH of a fil
 | `DEPOSIT_REARM_COOLDOWN_SECONDS` | `1800` | ... and not sooner than this after the previous re-arm |
 | `SWEEP_GAS_LIMITS` | 65,000 for each token | per-token overrides, `USDC:70000,stkA:60000` (`src/swaps/sweep-gas.ts`) |
 | `SWEEP_MAX_WEI` | `5·10^15` | refuse new swaps while the sweep would cost more ETH (a gas spike); also caps the fee a sweep signs |
+| `SWEEP_MIN_EXEC_GAS` | `30000` | a deposit request competes for the deposit address's nonce (or is adopted) only if its gas limit covers what its ERC20 transfer needs (Sepolia's `eth_estimateGas`) and fits a transaction (EIP-7825); when the estimate cannot be read, this floor applies (the measured stk sweep used 29,677) |
 | `BRIDGE_EVM_GAS_LIMIT`, `BRIDGE_EVM_MAX_FEE_PER_GAS`, `BRIDGE_EVM_MAX_PRIORITY_FEE_PER_GAS` | 100,000, 10 gwei, 1 gwei | the withdrawal's gas (paid by the vault's EVM account); the max fee here is a floor: each withdrawal signs max(it, 2 × the live base fee + tip), sized at withdraw-params |
 | `BRIDGE_EVM_MAX_FEE_CAP_WEI` | `10^11` (100 gwei) | above it, withdrawals are refused until gas is cheaper |
 | `WITHDRAW_STUCK_AFTER_SECONDS`, `WITHDRAW_UNSIGNED_STALE_SECONDS` | `1800`, `7200` | a transfer signed but unmined this long (with the base fee above its cap), or a start unsigned this long, is stuck: the next withdrawal takes its nonce |
@@ -124,7 +126,9 @@ the open-swap signature and the bearer token, every take and withdraw refusal ru
 through the routes, and over real ledger-v9 transactions), the state machine, the server-driven
 deposit, the withdrawal lane (no two starts share a nonce), refunds, Bridge back, restarts, the
 stale closer and the sweep sizing, and the security fix passes (`test/fix-pass.test.ts`,
-`test/fix2-pass.test.ts` and `test/fix3-pass.test.ts`, one block per audit row;
+`test/fix2-pass.test.ts`, `test/fix3-pass.test.ts` and `test/fix4-pass.test.ts`, one block per audit
+row; `test/fix4-live-pieces.test.ts`, the settle hook on G-BRIDGE's real transaction and the new
+indexer and Sepolia reads;
 `test/relay-loop.test.ts`, the bounded relayer on a virtual clock; `test/indexer-head.test.ts`, the
 read watermark). Nothing in them touches a network. One more needs a node:
 `test/replacement-pool.test.ts` checks a stuck transfer's replacement against a real transaction

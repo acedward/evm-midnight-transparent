@@ -611,13 +611,40 @@ Accepted for this version (the plan's questions):
   spend. A coin needs its owner's key to be spent, and every coin out goes to the temporary wallet or
   to the vault for this swap's own leg, so a third party's coin can only donate to the swap; the
   sponsor's cost is the same;
-- a deposit request of anyone else that a THIRD party completed itself (`completeDeposit` is
-  permissionless) is no longer in the vault's open requests, so the sponsor cannot see what it minted:
-  the swap waits for funds (its address shows less) and fails after its window (recoverable). The coin
-  is in the temporary wallet only if that party sealed it to the wallet's key;
-- a partial deposit leaves the pay amount in several coins; a take or a withdrawal spends at most 4 of
-  the wallet's coins (four sweeps won against the sponsor's, which are paced to 3 a day, would leave a
-  fifth: then raise it with the maintainers);
+- **anyone may settle a vault request first, and the coin it mints is then lost to the swap** (audit
+  T1, plan question Q16). `completeDeposit`, `completeWithdraw` and `refundWithdraw` are
+  permissionless (the vault fork removed the depositor check so a sponsor can complete for a wallet);
+  whoever submits a settle chooses the minted coin's nonce and the key its ciphertext is sealed to, and
+  the nonce is never public (only the coin's commitment is). A griefer that settles a swap's deposit
+  or refund first therefore burns that amount: the coin is owned by the temporary wallet's key, but
+  neither that wallet nor anyone else can ever spend it. It costs the griefer one Midnight
+  transaction and gains it nothing. The sponsor CONTAINS it (section 13.1, stage `settled-elsewhere`):
+  it never retries a settle whose request is gone, recognises its own lost-answer settle by its
+  recorded transaction identifiers (the swap then goes on as usual), records another party's in the
+  swap's `settledElsewhere`, deposits what still waits at the deposit address so the user can bridge
+  it back, and otherwise ends the swap `failed` / `settled-elsewhere` with an honest message. Another
+  party completing a SUCCESSFUL withdrawal loses nothing (the swap is `done`). Closing T1 for good
+  needs a vault change (a mint nonce the recipient can predict, or depositor authentication): the
+  vault follow-up project;
+- **a Bridge back of a partial deposit can end the swap `done` while a remainder is still
+  recoverable** (audit T3, F-B42, accepted under Q14 B): when another request sweeps the remainder
+  into the vault while the Bridge back runs, or a settle reconciled elsewhere skips the partial
+  accounting. Procedure: for a `done` / `bridged-back` swap whose `deposit.mintedTotal` plus its
+  `settledElsewhere` losses is less than the pay amount, read the deposit address's balance and the
+  vault's open deposit requests for its recipient (the sponsor's log lines name them). Tokens still
+  at the address, or an open request, can only end in the temporary wallet: keep `swaps.json` and
+  raise it with the maintainers (the record must go back to `partial`; never edit it by hand);
+- **a partial deposit can leave the pay amount in more coins than a take or a withdrawal can spend**
+  (audit T4, F-A42 / F-B43, accepted under Q14 B): each spends at most 4 of the wallet's coins, so
+  five or more sweeps won against the sponsor's (paced to 3 a day) leave a fifth. Procedure: keep
+  `swaps.json` and raise it with the maintainers (a Bridge back in parts or a consolidation is the
+  code change);
+- **a same-nonce deposit request that can execute but is never broadcast** (audit F-A43, MINOR): the
+  sponsor outbids every request that could take the deposit address's nonce; one priced so that
+  outbidding it passes `SWEEP_MAX_WEI` stops the (re)start until the fee cap is lifted. Requests that
+  can never execute (a gas limit below what their transfer needs, or above EIP-7825's cap) are
+  ignored since P4.2-fix4 (audit T2). Procedure: raise `SWEEP_MAX_WEI` for the restart, or raise it
+  with the maintainers;
 - the sponsor keeps its swaps in one JSON file, rewritten on every change (bounded by the caps above
   and the pruning of never-funded swaps).
 
@@ -647,12 +674,21 @@ details), the request ids and every hash.
 | stages `abandoning`, `abandoned`, then `waiting-for-funds` | The MPC attested the sweep "never executed" (for example the sweep gas was too low for a Sepolia gas spike). The sponsor ran `abandonDeposit`; the tokens are still at the deposit address, and it starts again. | Nothing, unless it repeats: after 3 starts (`DEPOSIT_MAX_ATTEMPTS`) the swap fails with `deposit-attempts`. |
 | `failed`, `deposit-attempts` or `deposit-returned-false` (`recoverable: true`) | Three starts never executed, or the token refused the vault's transfer. The tokens are at the deposit address; nothing was minted. | The user's Resume (the page offers it) re-arms the deposit: a new `startDeposit` to the same recipient, with fresh attempts, within the daily budget. Re-arms are paced: `DEPOSIT_REARM_COOLDOWN_SECONDS` (30 minutes) apart and at most `DEPOSIT_REARMS_PER_DAY` (3) in 24 hours; a Resume that comes too soon answers the swap still `failed`, `recoverable: true`, with `retryAt` (when it can). The failure stays recoverable (no lifetime cap). If it keeps failing the same way (a token that refuses the vault), keep `swaps.json` and raise it with the maintainers. Records written before this version are migrated at start-up. |
 | `awaiting_funds`, stage `budget-wait` | The funds are all there, but the daily DUST budget is spent (section 4.4). | Nothing: the deposit starts as soon as the budget allows. Raise `SPONSOR_DAILY_DUST_BUDGET` if the NIGHT allows it. |
-| `awaiting_funds` and the token LEFT the deposit address (or never showed there) | A request for this recipient swept it into the vault: the sponsor's own after a crash, or anyone's (`startDeposit` is permissionless). The vault's open deposit requests are read every 2 minutes for every waiting swap, whatever its address shows. | Nothing: once the MPC attests that sweep, the sponsor completes it (`completeDeposit`, permissionless too): this swap's token and remaining amount → stage `adopted`, then `minted`; less of the pay token → stage `completed-foreign`, then `partial` (below); another token → `completed-foreign` (the coin reaches the temporary wallet, not counted). A request is adopted as the swap's own only with both fee fields within the sweep policy; otherwise the sponsor posts its own sweep, outbidding it. |
+| `awaiting_funds` and the token LEFT the deposit address (or never showed there) | A request for this recipient swept it into the vault: the sponsor's own after a crash, or anyone's (`startDeposit` is permissionless). The vault's open deposit requests are read every 2 minutes for every waiting swap, whatever its address shows. | Nothing: once the MPC attests that sweep, the sponsor completes it (`completeDeposit`, permissionless too): this swap's token and remaining amount → stage `adopted`, then `minted`; less of the pay token → stage `completed-foreign`, then `partial` (below); another token → `completed-foreign` (the coin reaches the temporary wallet, not counted). A request is adopted as the swap's own only when it can execute (its gas limit covers its transfer, Sepolia's estimate; audit T2) and with both fee fields within the sweep policy; otherwise the sponsor posts its own sweep, outbidding every other request that could execute. When the drop is not explained by what was minted, the pay token's Sepolia `Transfer` logs out of the address are read (at most every 10 minutes): a sweep that another party started AND settled before the sponsor saw it is recorded as lost (next row). |
+| stage `settled-elsewhere` (detail `by: other`, `lost: true`); the swap's `settledElsewhere` lists it | Another party settled a request of this swap first (audit T1): it minted the coin with its own nonce and key, so the temporary wallet can never use that amount (plan Q16; section 12). | Nothing can recover that amount. The swap goes on with what is left: what waits at the deposit address is deposited by the sponsor (`partial`, the page tops up the sweep ETH), then the user bridges it back; with nothing left the swap ends `failed`, reason `settled-elsewhere`, `recoverable: false`. Keep the swap's record if the user asks. |
+| stage `settled-elsewhere` with `by: sponsor` | The sponsor's own settle landed but its answer was lost (a crash, an indexer timeout): its recorded transaction identifier was found on the indexer. | Nothing: the swap continued as if the settle had answered (`completed`, `minted`). |
+| `depositing`, stage `completing` for long after a failed settle | The settle's request is gone, but the sponsor's own earlier attempt could still land (its time to live has not passed as of the indexer's head), or the indexer could not be read. | Nothing: the stale closer drives it again and it resolves within minutes, never settling twice. |
 | `partial` (deposit stage `partial`, view `partial: {minted, remaining, atAddress, options}`) | A completed request minted LESS of the pay token than the swap pays: part is in the temporary wallet, the rest at the deposit address (usually a small foreign sweep that won the race, and whose gas the address's ETH paid). | Nothing for you: the user's page offers **Wait for the rest** or **Bridge back** what arrived. The sponsor deposits exactly `remaining` by itself once the address holds it and the sweep ETH (the page tops up the ETH); later remainder starts are paced like re-arms (stage `rearm-wait`, with `retryAt`). Never failed by age. |
 | stages `mpc-signed`, `evm-pending` and no `evm-broadcast` for long | The MPC signed the sweep, but it is not mined (the base fee rose above its cap, or the node dropped it). | Section 13.7. |
 
 ### 13.2 A withdrawal was refunded, or is slow
 
+- **Settled by another party** (stage `settled-elsewhere`; audit T1): someone completed the
+  withdrawal's request before the sponsor. After a transfer that happened (`attested: success`) the
+  swap is `done` as usual (nothing was minted, nothing lost). After one that did not, that party's
+  refund minted the coin back with its own nonce: it is lost to the swap (`lost: true` in
+  `settledElsewhere`), and the swap ends `failed` / `settled-elsewhere` (a Bridge back of part of a
+  partial deposit goes back to `partial` for what is left). The page shows no retry for it.
 - **Refunded** (stage `refunded`, state back to `minted`, `withdraw.refunds` counted): the transfer
   did not happen. The usual cause is a nonce collision with MN Bank (section 9); others are the vault
   account running out of gas between the start and the broadcast, or a reverted transfer. The coin
@@ -894,4 +930,5 @@ settings are in `deploy/.env.example`.
 | The native layout next to MN Bank | `deploy/SYSTEMD.md` | **Not run on a host** (see its last section) |
 | The security fix pass (plan 00048 P4.2-fix, lane FS: audit rows C1–C7, C11–C16) | Unit and route tests against fakes and the recorded stagenet state (`sponsor/test/fix-pass.test.ts`, `relay-loop.test.ts`, `rebuild-wallet.test.ts`, `packages/core/test/deploy-csp.test.ts`), each failing before its fix; the web image's default CSP in Chromium (`deploy/web/csp-browser-check.sh`) | PASS offline. **Not tested live**: the relay loop now broadcasts itself (the vendored loop's receipt wait had no deadline), the live fee sizing, the lane released at the start and the replacement of a stuck transfer |
 | The third fix pass (plan 00048 P4.2-fix3, lane FS3: audit rows S1–S8) | `sponsor/test/fix3-pass.test.ts` and `indexer-head.test.ts`, each failing before its fix on the previous sources (a lagging indexer and a failed attestation lookup keep a withdrawal uncertain; re-adoption after `not-included`; a foreign partial sweep → `partial` → the remainder deposited, or Bridge back; a sweep between polls; the fee policy at adoption; retention; /48 clients and the unfunded rule; the budget reservation; versioned approvals) | PASS offline. **Not tested live**: the indexer head read, the `partial` path and the reconciliation read on stagenet / Sepolia |
+| The fourth fix pass (plan 00048 P4.2-fix4, lane FS4: audit rows T1 and T2) | `sponsor/test/fix4-pass.test.ts` (a griefer completes the swap's deposit or refunds its withdrawal first with its own nonce and key; another party completes a successful withdrawal or abandons a sweep; the sponsor's own lost-answer settle found by identifier; a crash before relaying again; a sweep another party started and settled, counted from Transfer logs; requests that cannot execute ignored), `fix4-live-pieces.test.ts` (the settle hook on the real G-BRIDGE transaction, the indexer lookup and the Sepolia reads), `packages/wallet/test/settled-elsewhere-ledger.test.ts` (the real ledger: a settle discloses the coin's commitment, never its nonce; a coin sealed to another key is found only with its nonce), each failing before its fix on the previous sources (except the ledger facts) | PASS offline. **Not tested live**: the identifier lookup, `eth_estimateGas` and `eth_getLogs` on the deployed providers, and a griefed swap (plan P4.2-live E.5) |
 | The second fix pass (plan 00048 P4.2-fix2, lane FS2: audit rows R1–R6) | `sponsor/test/fix2-pass.test.ts`, `client-key.test.ts`, the real-ledger R1 checks in `rebuild-wallet.test.ts` (the wallet's own take and withdrawal with change), each failing before its fix; the replacement of a stuck transfer against a real transaction pool: a geth 1.17.6 dev node in Docker (`scripts/replacement-pool-check.sh`) | PASS offline and on the dev node's pool (the sponsor's replacement accepted and mined; a cap-only bump refused). **Not tested live**: the owner-balance check at open, the swept-deposit completion and the uncertain-submission reconciliation on stagenet / Sepolia |

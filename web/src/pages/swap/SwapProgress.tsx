@@ -28,6 +28,7 @@ import { partialOf } from '../../swap/partial.js';
 import { type SwapRecord, isFinished, isResumable } from '../../swap/record-shape.js';
 import type { SessionSnapshot, SessionStatus, SwapSession } from '../../swap/session.js';
 import { useSession, useSwap } from '../../swap/SwapContext.js';
+import { LostNotice } from './LostNotice.js';
 
 type TxKind = 'sepolia' | 'midnight' | 'request';
 
@@ -690,6 +691,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
           )}
         </Notice>
       )}
+      {record && <LostNotice record={record} network={network} />}
 
       <Panel
         title="Progress"
