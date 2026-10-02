@@ -177,6 +177,13 @@ const SwapRecordV2 = z
          *  attempts > refunds, one is in flight and the page must not build another. */
         attempts: z.number().int().min(0).max(100).optional(),
         refunds: z.number().int().min(0).max(100).optional(),
+        /** The vault account's EVM nonce of every withdrawal this page built and the sponsor accepted
+         *  (the `evmNonce` it gave `/prove`), oldest first (P4.2-fix5 U4): a payout counts as arrived
+         *  only when its transaction carries one of them. */
+        evmNonces: z
+          .array(z.string().regex(/^\d{1,20}$/))
+          .max(16)
+          .optional(),
         /** Refunded withdrawals' ids and hashes, oldest first (every hash stays on the record). */
         earlier: z
           .array(

@@ -5,8 +5,9 @@
 // The Playwright specs use their own test wallet (test/e2e/test-wallet.ts) instead.
 //
 // Receipts (P4.2-fix4): its own transactions are mined at block 5,000,000 + their number; the mock
-// bridge's transfers to the user (the withdrawals) come from the mock world (`bridgeReceipt`), so the
-// page can check their `Transfer` logs and show Done on arrival in the mock-mode demo too.
+// bridge's transfers to the user (the withdrawals) come from the mock world (`bridgeReceipt`, and
+// `bridgeTransaction` for their sender's nonce, P4.2-fix5 U4), so the page can check them and show Done
+// on arrival in the mock-mode demo too.
 
 import type { TokenRegistry } from '@evm-midnight-transparent/core';
 import { Wallet } from 'ethers';
@@ -17,6 +18,7 @@ export function announceMockEvmWallet(
   registry: TokenRegistry,
   win: Window = window,
   bridgeReceipt: (hash: string) => Record<string, unknown> | null = () => null,
+  bridgeTransaction: (hash: string) => Record<string, unknown> | null = () => null,
 ): { address: string } {
   const wallet = Wallet.createRandom();
   const me = wallet.address.toLowerCase();
@@ -81,6 +83,15 @@ export function announceMockEvmWallet(
             blockNumber: hexq(5_000_000n + BigInt(n ? Number.parseInt(n, 16) : 0)),
             logs: [],
           };
+        }
+        case 'eth_getTransactionByHash': {
+          const hash = String(params[0]).toLowerCase();
+          const bridged = bridgeTransaction(hash);
+          if (bridged) return bridged;
+          const n = /^0xd*([0-9a-f]{1,8})$/.exec(hash)?.[1];
+          if (!n) return null;
+          const k = BigInt(Number.parseInt(n, 16));
+          return { hash, from: me, nonce: hexq(k - 1n), blockNumber: hexq(5_000_000n + k) };
         }
         case 'eth_signTypedData_v4': {
           const td = JSON.parse(String(params[1])) as {

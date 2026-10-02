@@ -137,6 +137,8 @@ test('not Done for a failed (reverted) transfer: the page says so; the refund is
 for (const [kind, text] of [
   ['wrong-token', 'does not carry the transfer of stkA'],
   ['older', 'was mined before you funded this swap'],
+  // P4.2-fix5 U4 (F-B53): another withdrawal's payout of the same token and amount to the same user.
+  ['foreign', "is not this swap's own withdrawal"],
 ] as const) {
   test(`not Done for a transfer the page does not count (${kind})`, async ({ page }) => {
     await withWallet(page);

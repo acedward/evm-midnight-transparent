@@ -19,7 +19,10 @@
 //   to partial while the address still holds some of the pay token.
 //   A vault request settled by ANOTHER party that minted (a deposit, a refund) is lost to the swap (its
 //   coin's nonce is that party's; audit T1): depositing / partial / withdrawing / bridging_back ─►
-//   partial with what is left, or ─► failed (`settled-elsewhere`, never recoverable).
+//   partial with what is left, or ─► failed (`settled-elsewhere`, never recoverable). When the sponsor
+//   had submitted a settle of its own for that request, the judgment is re-checked by those settles'
+//   identifiers for a day (audit U3): meanwhile the failure is recoverable, and if one is found the
+//   judgment is reverted (failed ─► minted / partial).
 //
 // `minted` means "the temporary wallet holds the funds and the app acts next": after the deposit,
 // after a lost take race ("Swap is not available"), and after a refunded withdrawal.
@@ -76,6 +79,35 @@ export interface OwnSettle {
   at: number;
 }
 
+/** The fields of a deposit request's signed Sepolia sweep (decimal strings; audit U2). */
+export interface SignedSweep {
+  evmNonce: string;
+  gasLimit: string;
+  maxFeePerGas: string;
+  maxPriorityFeePerGas?: string;
+}
+
+/**
+ * A "settled by another party" LOSS judged while the sponsor had submitted a settle of its own for
+ * that request (audit U3, F-A51): a transaction index behind its head may have missed the sponsor's
+ * own settle, so its identifiers are looked up again until `untilMs`. One found reverts the judgment.
+ */
+export interface OwnRecheck {
+  /** The swap's own deposit request, a foreign deposit request the sponsor was completing, or a
+   *  withdrawal attempt's request (a refund). */
+  kind: 'deposit' | 'foreign' | 'withdraw';
+  requestId: string;
+  /** One identifier per own settle of it. */
+  identifiers: string[];
+  /** What the judgment recorded as lost. */
+  colour: string;
+  amount: string;
+  /** ms: re-checked until then. */
+  untilMs: number;
+  /** ms: when it was last looked up. */
+  lastMs?: number;
+}
+
 export interface DepositRecord extends TransferProgress {
   stage: string;
   stages: StageEntry[];
@@ -111,6 +143,9 @@ export interface DepositRecord extends TransferProgress {
     status?: 'completing' | 'lost';
     /** The sponsor's own settles of it (audit T1). */
     settles?: OwnSettle[];
+    /** The Sepolia transaction the request asks the MPC to sign (decimal strings): its sweep is the
+     *  `Transfer` whose transaction carries exactly these (audit U2). */
+    signed?: SignedSweep;
   }[];
   /** The sponsor's own settles of the CURRENT request (`requestId`), recorded before each reached the
    *  node (audit T1). */
@@ -254,8 +289,11 @@ export interface SwapRecord {
   recoverable?: boolean;
   /** On a recoverable `failed` swap whose re-arm is paced: unix seconds from which a re-open revives it. */
   retryAt?: number;
-  /** Vault requests of this swap that another party settled (audit T1), oldest first. */
+  /** Vault requests of this swap that another party settled (audit T1), oldest first. Kept (possibly
+   *  empty) once set: an empty list tells the page that nothing is lost any more (audit U3). */
   settledElsewhere?: SettledElsewhere[];
+  /** Loss judgments re-checked by the sponsor's own settle identifiers (audit U3). */
+  ownRechecks?: OwnRecheck[];
   history: { state: SwapState; at: number }[];
   createdAt: number;
   updatedAt: number;
@@ -272,7 +310,8 @@ export const TRANSITIONS: Readonly<Record<SwapState, readonly SwapState[]>> = {
   withdrawing: ['done', 'minted', 'failed'],
   bridging_back: ['done', 'minted', 'partial', 'failed'],
   done: [],
-  failed: ['awaiting_funds', 'partial'],
+  // `minted`: a `settled-elsewhere` judgment reverted when the sponsor's own settle is found (audit U3).
+  failed: ['awaiting_funds', 'partial', 'minted'],
 };
 
 export class TransitionError extends Error {
@@ -419,6 +458,7 @@ export function retentionMayDrop(r: SwapRecord, nowMs: number): boolean {
   // and a failure no re-open can revive.
   if (r.state !== 'done' && !(r.state === 'failed' && r.recoverable !== true)) return false;
   if (r.withdrawals.some((w) => isUnresolved(w) || isRecheck(w, nowMs))) return false;
+  if ((r.ownRechecks ?? []).some((c) => c.untilMs > nowMs)) return false;
   const d = r.deposit;
   if (r.state === 'failed' && d) {
     if (d.requestId && !['completed', 'closed', 'abandoned'].includes(d.stage)) return false;
@@ -474,6 +514,48 @@ function withdrawView(w: WithdrawRecord, refunds: number) {
   };
 }
 
+/** At most this many `settledElsewhere` entries in a view (audit U5: the page reads at least 16). */
+export const SETTLED_ELSEWHERE_IN_VIEW = 16;
+
+/**
+ * The `settledElsewhere` entries a view carries (audit U5, F-A52): all of them when they fit; else
+ * the oldest entries that lost nothing are left out first (they are informative only), and when the
+ * lost ones alone do not fit, the oldest of the same side and colour are summed into one entry
+ * (without a request id), so the lost total the page shows stays exact. Oldest first.
+ */
+export function settledElsewhereView(list: readonly SettledElsewhere[]): SettledElsewhere[] {
+  const out = list.map((e) => ({ ...e }));
+  while (out.length > SETTLED_ELSEWHERE_IN_VIEW) {
+    const i = out.findIndex((e) => !e.lost);
+    if (i < 0) break;
+    out.splice(i, 1);
+  }
+  while (out.length > SETTLED_ELSEWHERE_IN_VIEW) {
+    let merged = false;
+    for (let i = 0; i < out.length && !merged; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i]!;
+        const b = out[j]!;
+        if (a.kind !== b.kind || a.colour !== b.colour) continue;
+        out[i] = {
+          kind: a.kind,
+          attested: a.attested,
+          colour: a.colour,
+          amount: (BigInt(a.amount) + BigInt(b.amount)).toString(),
+          lost: true,
+          at: a.at,
+        };
+        out.splice(j, 1);
+        merged = true;
+        break;
+      }
+    }
+    // Never more than 4 sides × colours: with more than 16 entries two always merge.
+    if (!merged) break;
+  }
+  return out;
+}
+
 export function swapView(rec: SwapRecord): SwapView {
   const d = rec.deposit;
   let refunded = 0;
@@ -509,9 +591,8 @@ export function swapView(rec: SwapRecord): SwapView {
     withdrawals,
     withdrawal: withdrawalStatus(rec),
     ...(rec.state === 'partial' ? { partial: partialView(rec) } : {}),
-    ...(rec.settledElsewhere && rec.settledElsewhere.length > 0
-      ? { settledElsewhere: rec.settledElsewhere.map((e) => ({ ...e })) }
-      : {}),
+    // Present once the sponsor recorded any (an empty list after a reverted judgment: audit U3).
+    ...(rec.settledElsewhere !== undefined ? { settledElsewhere: settledElsewhereView(rec.settledElsewhere) } : {}),
     ...(rec.outcome ? { outcome: rec.outcome } : {}),
     ...(rec.reason ? { reason: rec.reason } : {}),
     ...(rec.message ? { message: rec.message } : {}),

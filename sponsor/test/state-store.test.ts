@@ -72,6 +72,8 @@ describe('the state machine', () => {
         'bridging_back->failed',
         'failed->awaiting_funds',
         'failed->partial',
+        // A `settled-elsewhere` judgment reverted: the sponsor's own settle was found (audit U3).
+        'failed->minted',
       ].sort(),
     );
   });

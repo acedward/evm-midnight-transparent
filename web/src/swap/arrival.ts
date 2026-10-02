@@ -15,7 +15,14 @@
 //     registry names it, from the vault's EVM account (the network profile's `vaultEvmAddress`, the
 //     account the vault's `startWithdraw` transfers from) to the swap's own EVM address;
 //   - it was mined AFTER the user's own funding transfer of this swap (so an older transfer, such as
-//     another swap's, is never counted for this one), and it is not counted for another swap here.
+//     another swap's, is never counted for this one), and it is not counted for another swap here;
+//   - its TRANSACTION (`eth_getTransactionByHash`) is from the vault's EVM account with a nonce that
+//     one of THIS swap's own withdrawals signed (P4.2-fix5 U4, the audit's F-B53): the page supplied
+//     that nonce to `/prove` (`evmNonce`, a public argument of the vault's `startWithdraw`, which the
+//     MPC-signed transfer carries) and the record keeps it (`bridgeOut.evmNonces`). Every withdrawal of
+//     the vault shares its one account, so a nonce names one mined transfer: another swap's payout of
+//     the same token and amount to the same user (the sponsor naming the wrong hash) is never counted.
+//     A record written before kept no nonce: its payout is never counted (the sponsor's `done` ends it).
 //
 // What arrived is the log's value. The swap is done for the user when the verified arrivals add up to
 // EXACTLY the whole amount it pays out (record-shape.ts `arrivedInFull`): a failed transfer, another
@@ -25,7 +32,7 @@ import { getAddress } from 'ethers';
 
 import type { NetworkProfile, TokenRegistry } from '@evm-midnight-transparent/core';
 
-import type { MinedReceipt } from './evm.js';
+import type { MinedReceipt, MinedTransaction } from './evm.js';
 import { type SwapRecord, outLeg } from './record-shape.js';
 import type { SwapView } from './sponsor-client.js';
 
@@ -110,6 +117,17 @@ export function checkTransfer(
   if (amount === 0n) return { kind: 'no-transfer' };
   if (fundedAt === null || receipt.blockNumber <= fundedAt) return { kind: 'too-early' };
   return { kind: 'arrived', amount };
+}
+
+/** Whether a payout's transaction is one of this swap's own withdrawals (P4.2-fix5 U4): from the vault's
+ *  EVM account, with a nonce one of them signed (the record's `bridgeOut.evmNonces`; none: never). */
+export function boundToWithdrawal(
+  tx: Pick<MinedTransaction, 'from' | 'nonce'>,
+  expected: Pick<ExpectedArrival, 'from'>,
+  nonces: readonly string[] | undefined,
+): boolean {
+  if (tx.from.toLowerCase() !== expected.from.toLowerCase()) return false;
+  return (nonces ?? []).some((n) => /^\d{1,20}$/.test(n) && BigInt(n) === tx.nonce);
 }
 
 /** The Sepolia hashes the sponsor reported for this swap's withdrawals (every attempt), and the ones

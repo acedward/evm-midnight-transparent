@@ -17,6 +17,7 @@ import {
   type Attestation,
   type BridgeKind,
   type EvmReader,
+  type EvmTransaction,
   type EvmTransfer,
   type MidnightTxFacts,
   type OfferReader,
@@ -172,6 +173,11 @@ export class FakeEvm implements EvmReader {
   block = 11_810_000n;
   /** Every token transfer out of an address (the `Transfer` logs), by token. */
   readonly transfers: (EvmTransfer & { token: string; from: string })[] = [];
+  /** The mined transactions whose signed fields are known (`eth_getTransactionByHash`), by hash: a
+   *  sweep made by a vault request carries that request's nonce and fee fields (audit U2). */
+  readonly txs = new Map<string, EvmTransaction>();
+  /** Every `eth_getTransactionByHash` read, in order. */
+  readonly txReads: string[] = [];
 
   private k = (a: string) => a.toLowerCase();
   setEth(a: string, v: bigint) {
@@ -216,13 +222,23 @@ export class FakeEvm implements EvmReader {
       .filter((t) => t.token === this.k(token) && t.from === this.k(from) && t.block >= fromBlock)
       .map(({ txHash, to, amount, block }) => ({ txHash, to, amount, block }));
   }
-  /** A transfer out of `from` (a sweep): the balance moves and the log is recorded. */
+  async transaction(hash: string): Promise<EvmTransaction | null> {
+    if (this.failing) throw new Error('Sepolia eth_getTransactionByHash: unreachable');
+    this.txReads.push(hash.toLowerCase());
+    return this.txs.get(hash.toLowerCase()) ?? null;
+  }
+  /** A transfer out of `from` (a sweep): the balance moves and the log is recorded. With `signed`,
+   *  the transaction's own fields are known too (a vault request's signed sweep: its nonce and fees). */
   transfer(
     token: string,
     from: string,
     to: string,
     amount: bigint,
-    opts: { move?: boolean; txHash?: string } = {},
+    opts: {
+      move?: boolean;
+      txHash?: string;
+      signed?: { nonce: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas?: bigint };
+    } = {},
   ): string {
     const txHash = opts.txHash ?? `0x${sha(`transfer:${token}:${from}:${to}:${amount}:${this.transfers.length}`)}`;
     if (opts.move !== false) {
@@ -240,6 +256,18 @@ export class FakeEvm implements EvmReader {
       block: this.block,
       txHash,
     });
+    if (opts.signed) {
+      this.txs.set(txHash.toLowerCase(), {
+        hash: txHash.toLowerCase(),
+        from: this.k(from),
+        nonce: opts.signed.nonce,
+        gasLimit: opts.signed.gasLimit,
+        maxFeePerGas: opts.signed.maxFeePerGas,
+        ...(opts.signed.maxPriorityFeePerGas !== undefined
+          ? { maxPriorityFeePerGas: opts.signed.maxPriorityFeePerGas }
+          : {}),
+      });
+    }
     return txHash;
   }
 }
@@ -405,7 +433,11 @@ export class FakeVault implements SwapBackend {
       // of the deposit address (the balances are left to the tests).
       this.evm.bumpNonce(req.signer);
       if (i.kind === 'deposit' && kind === 'success') {
-        this.evm.transfer(req.erc20, req.signer, VAULT_EVM, req.amount, { move: this.sweepsMove, txHash: evmTxHash });
+        this.evm.transfer(req.erc20, req.signer, VAULT_EVM, req.amount, {
+          move: this.sweepsMove,
+          txHash: evmTxHash,
+          signed: this.signedOf(req),
+        });
       }
       this.log.push(`broadcast ${i.kind} ${i.requestId.slice(0, 8)} nonce=${req.evmNonce}`);
       i.onProgress({
@@ -429,6 +461,26 @@ export class FakeVault implements SwapBackend {
       attestationAfterMs: 1_100_000,
       ...(kind === 'never-executed' ? {} : { evmTxHash }),
     };
+  }
+  /** The fields of the Sepolia transaction a request asks the MPC to sign. */
+  private signedOf(req: FakeRequest) {
+    return {
+      nonce: req.evmNonce,
+      gasLimit: req.gasLimit,
+      maxFeePerGas: req.maxFeePerGas,
+      ...(req.maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas: req.maxPriorityFeePerGas } : {}),
+    };
+  }
+  /** The request's sweep executes on Sepolia (anyone's request: its signed transaction, mined): the
+   *  tokens leave the deposit address (unless `move` is false) and the `Transfer` log is recorded. */
+  sweep(requestId: string, opts: { move?: boolean } = {}): string {
+    const req = this.requests.get(requestId);
+    if (!req || req.kind !== 'deposit') throw new Error(`no deposit request ${requestId}`);
+    this.evm.bumpNonce(req.signer);
+    return this.evm.transfer(req.erc20, req.signer, VAULT_EVM, req.amount, {
+      ...(opts.move === false ? { move: false } : {}),
+      signed: this.signedOf(req),
+    });
   }
   async attestation(_kind: BridgeKind, requestId: string): Promise<Attestation | null> {
     if (this.attestationFails) throw new Error('the MPC output cache is unreachable');
