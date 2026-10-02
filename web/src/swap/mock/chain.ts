@@ -34,12 +34,39 @@ const hash = (label: string) => keccak256(toUtf8Bytes(label)).slice(2);
 
 type DumpLeg = Omit<MockLeg, 'amount'> & { amount: string };
 
+/** An ERC20 transfer the mock bridge made on its fake Sepolia (a withdrawal paying the user), as a
+ *  mined transaction: what `eth_getTransactionReceipt` answers for it (P4.2-fix4). */
+export interface MockSepoliaTransfer {
+  /** 0x + 64 hex. */
+  hash: string;
+  /** The ERC20 contract that emitted the `Transfer` log. */
+  token: string;
+  from: string;
+  to: string;
+  /** Base units (decimal). */
+  amount: string;
+  /** The receipt's status: 1 mined and executed, 0 reverted (then no log). */
+  status: 0 | 1;
+  blockNumber: number;
+}
+
+/** The `Transfer(address,address,uint256)` event's topic. */
+const TRANSFER_TOPIC = keccak256(toUtf8Bytes('Transfer(address,address,uint256)'));
+const word = (hex: string) => `0x${hex.toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
+
+/** The fake Sepolia's first block for the bridge's transfers: above every block the specs' and the
+ *  mock EVM wallets' own transactions are mined in (they count from 5,000,000), as the real
+ *  withdrawal comes long after the user funded the swap. */
+export const MOCK_SEPOLIA_BRIDGE_BLOCK = 6_000_000;
+
 export interface MockChainDump {
   offers: Array<Omit<MockOffer, 'gives' | 'wants'> & { gives: DumpLeg[]; wants: DumpLeg[] }>;
   coins: Array<[string, Array<[string, string]>]>;
   takes: Array<[string, string]>;
   counter: number;
   height: number;
+  /** Absent in a world saved before P4.2-fix4. */
+  sepolia?: { transfers: MockSepoliaTransfer[]; block: number };
 }
 
 export class MockChainError extends Error {
@@ -193,6 +220,45 @@ export class MockChain {
     return this.takes.get(coinPk) ?? null;
   }
 
+  // ── the fake Sepolia's bridge transfers (P4.2-fix4) ─────────────────────
+
+  private readonly transfers = new Map<string, MockSepoliaTransfer>();
+  private sepoliaBlock = MOCK_SEPOLIA_BRIDGE_BLOCK;
+
+  /** The bridge's ERC20 transfer, mined on the fake Sepolia (`blockNumber`: the next block unless
+   *  given). Returns its hash. */
+  mineSepoliaTransfer(t: Omit<MockSepoliaTransfer, 'hash' | 'blockNumber'> & { blockNumber?: number }): string {
+    const h = `0x${this.newHash('sepolia-transfer')}`;
+    this.transfers.set(h, { ...t, hash: h, blockNumber: t.blockNumber ?? ++this.sepoliaBlock });
+    return h;
+  }
+
+  /** The receipt of a bridge transfer, shaped as `eth_getTransactionReceipt` answers it (hex
+   *  quantities, the ERC20 `Transfer` log when it executed); null for a hash it did not mine. */
+  sepoliaReceipt(txHash: string): Record<string, unknown> | null {
+    const t = this.transfers.get(txHash.toLowerCase());
+    if (!t) return null;
+    return {
+      transactionHash: t.hash,
+      blockNumber: `0x${t.blockNumber.toString(16)}`,
+      status: t.status === 1 ? '0x1' : '0x0',
+      from: t.from.toLowerCase(),
+      to: t.token.toLowerCase(),
+      logs:
+        t.status === 1
+          ? [
+              {
+                address: t.token.toLowerCase(),
+                topics: [TRANSFER_TOPIC, word(t.from), word(t.to)],
+                data: word(BigInt(t.amount).toString(16)),
+                logIndex: '0x0',
+                transactionHash: t.hash,
+              },
+            ]
+          : [],
+    };
+  }
+
   // ── persistence (mock mode keeps its world across a reload or a new tab) ──
 
   dump(): MockChainDump {
@@ -203,6 +269,7 @@ export class MockChain {
       takes: [...this.takes],
       counter: this.counter,
       height: this.height,
+      sepolia: { transfers: [...this.transfers.values()], block: this.sepoliaBlock },
     };
   }
 
@@ -216,6 +283,9 @@ export class MockChain {
     for (const [pk, h] of d.takes) this.takes.set(pk, h);
     this.counter = d.counter;
     this.height = d.height;
+    this.transfers.clear();
+    for (const t of d.sepolia?.transfers ?? []) this.transfers.set(t.hash, { ...t });
+    this.sepoliaBlock = d.sepolia?.block ?? MOCK_SEPOLIA_BRIDGE_BLOCK;
   }
 
   // ── hashes ─────────────────────────────────────────────────────────────

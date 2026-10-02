@@ -56,6 +56,14 @@ export interface MockScenario {
   /** Each swap's first withdrawal is accepted, then its start fails in the lane (stale vault state or
    *  nonce at the head of the lane): back to `minted`, `withdrawal.retry` (P4.2-fix C1). */
   failFirstStart?: boolean;
+  /** What each swap's FIRST withdrawal's Sepolia transfer looks like on the fake Sepolia (P4.2-fix4;
+   *  later ones are always right): `reverted` (status 0, no log; the bridge then refunds it and the
+   *  page retries), `wrong-token` (another ERC20's log), `wrong-amount` (one base unit off), `older`
+   *  (mined before the user funded the swap). Default: the right transfer. */
+  transferReceipt?: 'ok' | 'reverted' | 'wrong-token' | 'wrong-amount' | 'older';
+  /** A withdrawal whose transfer is mined (and not reverted) waits there (the bridge's ~17 minutes of
+   *  closing, held) until this is cleared: the specs check the page's Done on arrival (P4.2-fix4). */
+  holdAfterTransfer?: boolean;
 }
 
 export interface EvmReader {
@@ -63,10 +71,14 @@ export interface EvmReader {
   erc20Balance(token: string, holder: string): Promise<bigint>;
 }
 
+// As the real sponsor's relay reports them: `evm-pending` while the MPC-signed transaction waits to be
+// mined, `evm-broadcast` once its receipt is seen (with its hash), then finality and the attestation.
 const SCRIPTS = {
-  deposit: ['starting', 'started', 'mpc-signed', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
-  withdraw: ['started', 'mpc-signed', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
+  deposit: ['starting', 'started', 'mpc-signed', 'evm-pending', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
+  withdraw: ['started', 'mpc-signed', 'evm-pending', 'evm-broadcast', 'evm-final', 'attested', 'settled'],
   refund: ['started', 'mpc-signed', 'evm-failed', 'attested', 'refunded'],
+  /** The transfer was mined but reverted (status 0): attested as failed, refunded (P4.2-fix4). */
+  reverted: ['started', 'mpc-signed', 'evm-pending', 'evm-broadcast', 'evm-final', 'attested', 'refunded'],
   /** Accepted, then refused at the head of the lane: the start never lands. */
   failStart: ['queued', 'failed'],
 } as const;
@@ -129,8 +141,13 @@ export interface MockSponsorOptions {
   chainId?: number;
   depositAddressFor(coinPk: string): string;
   scenario: MockScenario;
+  /** The vault's EVM account: the withdrawals' transfers come from it (network.bridge). */
+  vaultEvmAddress?: string;
   now?: () => number;
 }
+
+/** A stand-in vault EVM account for a profile that names none. */
+const MOCK_VAULT_EVM = '0x00000000000000000000000000000000000Fa017';
 
 export class MockSponsor {
   readonly swaps = new Map<string, MockSwap>();
@@ -510,10 +527,11 @@ export class MockSponsor {
       this.o.chain.burn(s.payload.tempCoinPk, tx.colour!, BigInt(tx.amount!));
       this.o.chain.markSpent(tx.draft);
     }
+    const reverted = this.o.scenario.transferReceipt === 'reverted' && s.withdrawals === 0;
     s.withdrawals++;
     s.lastEnding = null;
     if (s.view.withdraw) (s.earlier ??= []).push(structuredClone(s.view.withdraw));
-    s.script = failStart ? 'failStart' : refund ? 'refund' : 'withdraw';
+    s.script = failStart ? 'failStart' : refund ? 'refund' : reverted ? 'reverted' : 'withdraw';
     s.step = 0;
     s.view.state = back ? 'bridging_back' : 'withdrawing';
     s.view.withdraw = failStart
@@ -595,6 +613,27 @@ export class MockSponsor {
 
   private stage(stage: string): SponsorStage {
     return { stage, at: Math.floor(this.now() / 1000) };
+  }
+
+  /** The withdrawal's ERC20 transfer from the vault's EVM account to the swap's owner, mined on the
+   *  fake Sepolia (the receipt the page reads to show Done on arrival, P4.2-fix4); each swap's first
+   *  one as `transferReceipt` says. Returns its hash, the view's `sepoliaTx`. */
+  private mineTransfer(s: MockSwap, w: NonNullable<SwapView['withdraw']>): string {
+    const back = w.colour === s.payload.pay.colour;
+    const amount = BigInt(back ? (s.backAmount ?? s.payload.pay.amount) : s.payload.receive.amount);
+    const token = this.o.registry.byColour(back ? s.payload.pay.colour : s.payload.receive.colour)!.sepoliaAddress;
+    const kind = s.withdrawals === 1 ? (this.o.scenario.transferReceipt ?? 'ok') : 'ok';
+    const other = this.o.registry.tokens.find(
+      (t) => t.sepoliaAddress && t.sepoliaAddress.toLowerCase() !== token.toLowerCase(),
+    )!.sepoliaAddress;
+    return this.o.chain.mineSepoliaTransfer({
+      token: kind === 'wrong-token' ? other : token,
+      from: this.o.vaultEvmAddress || MOCK_VAULT_EVM,
+      to: s.owner,
+      amount: (kind === 'wrong-amount' ? (amount > 1n ? amount - 1n : amount + 1n) : amount).toString(),
+      status: kind === 'reverted' ? 0 : 1,
+      ...(kind === 'older' ? { blockNumber: 4_000_000 } : {}),
+    });
   }
 
   // ── persistence ───────────────────────────────────────────────────────
@@ -709,11 +748,12 @@ export class MockSponsor {
       const next = s.script ? SCRIPTS[s.script][++s.step] : undefined;
       const w = v.withdraw;
       if (next === undefined) {
-        if (s.script === 'refund' || s.script === 'failStart') {
-          // Refunded to the temporary wallet (a NEW coin), or the start never landed (the coin was
-          // never spent, nothing to mint): back to `minted` with `withdrawal.retry`; the app rebuilds
-          // and retries. A refund counts itself in `refunds`; a failed start is no refund.
-          if (s.script === 'refund')
+        if (s.script === 'refund' || s.script === 'reverted' || s.script === 'failStart') {
+          // Refunded to the temporary wallet (a NEW coin: the transfer never happened, or it was
+          // mined and reverted), or the start never landed (the coin was never spent, nothing to
+          // mint): back to `minted` with `withdrawal.retry`; the app rebuilds and retries. A refund
+          // counts itself in `refunds`; a failed start is no refund.
+          if (s.script !== 'failStart')
             chain.mint(
               s.payload.tempCoinPk,
               w.colour!,
@@ -721,11 +761,11 @@ export class MockSponsor {
                 w.colour === s.payload.pay.colour ? (s.backAmount ?? s.payload.pay.amount) : s.payload.receive.amount,
               ),
             );
-          if (s.script === 'refund') {
+          if (s.script !== 'failStart') {
             s.refunded = (s.refunded ?? 0) + 1;
             w.refunds = s.refunded;
           }
-          s.lastEnding = s.script === 'refund' ? 'refunded' : 'start-failed';
+          s.lastEnding = s.script === 'failStart' ? 'start-failed' : 'refunded';
           s.script = null;
           // A Bridge back of a partial deposit goes back to `partial` (FS3 item 4).
           v.state = s.partialBack ? 'partial' : 'minted';
@@ -746,9 +786,15 @@ export class MockSponsor {
         v.state = 'done';
         return;
       }
+      // P4.2-fix4: the transfer is mined; the bridge closes the request later. Held there while the
+      // scenario says so (the page shows Done on arrival meanwhile).
+      if (w.stage === 'evm-broadcast' && s.script === 'withdraw' && this.o.scenario.holdAfterTransfer) {
+        s.step--;
+        return;
+      }
       w.stage = next;
       w.stages = [...(w.stages ?? []), this.stage(next)];
-      if (next === 'evm-broadcast') w.sepoliaTx = `0x${chain.newHash('withdraw-transfer')}`;
+      if (next === 'evm-broadcast') w.sepoliaTx = this.mineTransfer(s, w);
       if (next === 'settled' || next === 'refunded') w.completeTx = `00${chain.newHash('complete-withdraw')}`;
     }
   }

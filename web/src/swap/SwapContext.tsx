@@ -188,6 +188,13 @@ export function SwapProvider({ config, children }: { config: SiteConfig; childre
       signer: walletSigner(connected.provider!, connected.address!),
       evm,
       save: (r) => saveSwapRecord(store, r),
+      // P4.2-fix4: a transfer counted as another swap's arrival is never counted for this one.
+      claimedArrivals: (swapId) =>
+        new Set(
+          readSwapRecords(store, { network: network.name, evmAddress: connected.address! })
+            .filter((r) => r.swapId !== swapId.toLowerCase())
+            .flatMap((r) => (r.arrivals ?? []).map((a) => a.tx)),
+        ),
       fundingRefusal: () =>
         backends.mock && !MOCK_FUNDING_WALLETS.includes(connected.walletRdns ?? '')
           ? 'Mock mode never sends real funds: connect the "Mock wallet (no real funds)" to try the swap here.'

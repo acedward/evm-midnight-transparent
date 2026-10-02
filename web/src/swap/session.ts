@@ -29,7 +29,14 @@
 //           asks the user: "Wait for the rest" (the sponsor deposits the remainder from the deposit
 //           address by itself; the page may top up the sweep ETH, NEVER the token) or "Bridge back"
 //           what arrived (the Bridge back path, for that amount; what waits at the deposit address is
-//           then deposited and bridged back too). Nothing is sent before the user chooses.
+//           then deposited and bridged back too). Nothing is sent before the user chooses;
+//   arrival every poll, the receipts of the Sepolia transfers the sponsor reports for the withdrawals
+//           are read through the user's wallet and checked (./arrival.ts: status 1, the ERC20
+//           `Transfer` of the paid-out token from the vault's EVM account to the user, after the
+//           user's funding). Once the verified arrivals add up to the whole amount, the swap is DONE
+//           for the user (P4.2-fix4: the owner's "stuck on done"), with a quiet note that the bridge
+//           closes the request in the background; the loop keeps reading the sponsor until it says
+//           `done`, and a state that contradicts the arrival is shown (nothing more is sent).
 //
 // The swap's PUBLIC id is keccak256(tag ‖ salt) (P4.2-fix C14): the sponsor, URLs and the snapshot
 // see it; the salt stays in this tab and the local record. Secrets stay in memory only: the sponsor's
@@ -50,7 +57,14 @@ import {
 } from '@evm-midnight-transparent/core';
 import { getAddress } from 'ethers';
 
-import { clockText, ethText } from './display.js';
+import {
+  AGREES_WITH_ARRIVAL,
+  arrivalCandidates,
+  checkTransfer,
+  expectedArrival,
+  type TransferCheck,
+} from './arrival.js';
+import { clockText, ethText, legText } from './display.js';
 import { EvmError, type EvmPort, transferData } from './evm.js';
 import { MAX_AUTO_RETRIES, afterMint, applyView, nextAction, revivalNote, withdrawalStatus } from './flow.js';
 import { lastsLongEnough } from './offers.js';
@@ -59,9 +73,11 @@ import type { SwapBackends, TakeDraft, TempWallet, TypedDataSigner, WithdrawDraf
 import {
   SWAP_RECORD_VERSION,
   type SwapRecord,
+  arrivedInFull,
   isFinished,
   isRecoverable,
   isResumable,
+  outLeg,
   swapIdOf,
 } from './record-shape.js';
 import {
@@ -111,7 +127,10 @@ export type SessionStatus =
   /** Only part of the pay amount reached the temporary wallet (S2): waiting for the user's choice,
    *  "Wait for the rest" or "Bridge back" what arrived. */
   | { kind: 'partial' }
-  | { kind: 'done' }
+  /** `closing`: every token arrived at the user's address (verified on Sepolia) and the bridge is
+   *  closing the request in the background (P4.2-fix4). `conflict`: the sponsor reports something
+   *  that contradicts the verified arrival; the page shows it and sends nothing more. */
+  | { kind: 'done'; closing?: boolean; conflict?: string }
   /** `canResume`: a failed swap the sponsor marked recoverable (P4.2-fix C5): Resume revives it. */
   | { kind: 'error'; message: string; canRetry: boolean; canResume?: boolean }
   | { kind: 'stopped'; message: string };
@@ -142,6 +161,9 @@ export interface SessionDeps {
   save(record: SwapRecord): void;
   /** Why the connected wallet may not fund a swap here (mock mode with a real wallet), or null. */
   fundingRefusal?: () => string | null;
+  /** The Sepolia transfers already counted as arrivals of ANOTHER swap in this browser: never counted
+   *  for this one too (P4.2-fix4). */
+  claimedArrivals?: (swapId: string) => ReadonlySet<string>;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   newSalt?: () => string;
@@ -190,7 +212,8 @@ function describe(e: unknown): string {
 export class SwapSession {
   private snap: SessionSnapshot;
   private readonly listeners = new Set<() => void>();
-  private readonly deps: Required<Omit<SessionDeps, 'fundingRefusal'>> & Pick<SessionDeps, 'fundingRefusal'>;
+  private readonly deps: Required<Omit<SessionDeps, 'fundingRefusal' | 'claimedArrivals'>> &
+    Pick<SessionDeps, 'fundingRefusal' | 'claimedArrivals'>;
   /** LOCAL ONLY: the "start swap" salt (never sent, never in a URL or a log; P4.2-fix C14). */
   private readonly salt: string;
   /** SECRET: the sponsor's bearer token for this swap. */
@@ -209,6 +232,11 @@ export class SwapSession {
   private decide: ((ok: boolean) => void) | null = null;
   /** One more automatic withdrawal after MAX_AUTO_RETRIES refunds, approved by the user. */
   private retryApproved = false;
+  /** P4.2-fix4: the Sepolia transfers whose mined receipt did NOT verify as this swap's payout, and
+   *  why (read once: a mined receipt does not change). */
+  private readonly verdicts = new Map<string, Exclude<TransferCheck['kind'], 'arrived'> | 'claimed'>();
+  /** The block of the user's own funding transfer of this swap (the payout must be mined after it). */
+  private fundedAt: number | null = null;
 
   private constructor(
     salt: string,
@@ -849,7 +877,8 @@ export class SwapSession {
         const record = applyView(before, view, this.deps.now());
         // A withdrawal ended without a transfer (C1: from the sponsor's signal, not the page's counters).
         const ended = record.bridgeOut.refunds ?? 0;
-        if (ended > (before.bridgeOut.refunds ?? 0)) {
+        // Not after a verified arrival of everything: that refund contradicts it (`afterArrival`).
+        if (ended > (before.bridgeOut.refunds ?? 0) && !arrivedInFull(record)) {
           const attempt = ended < MAX_AUTO_RETRIES ? ` (attempt ${ended + 1})` : '';
           this.set({
             notice:
@@ -867,6 +896,14 @@ export class SwapSession {
         // A funding transfer still pending: read its receipt, whatever the sponsor's state.
         if (record.funding.eth?.status === 'sent' || record.funding.token?.status === 'sent')
           await this.checkReceipts();
+        // P4.2-fix4: the payout's arrival, read on Sepolia, before what the sponsor's state says next.
+        await this.checkArrivals(view);
+        if (this.closed) return;
+        if (arrivedInFull(this.record) && view.state !== 'done') {
+          if (await this.afterArrival(view)) return;
+          await this.deps.sleep(backends.pollMs);
+          continue;
+        }
         const act = nextAction(this.record, view);
         if (act === 'finished') {
           this.status(
@@ -915,6 +952,120 @@ export class SwapSession {
     } finally {
       this.looping = false;
     }
+  }
+
+  // ── arrival (P4.2-fix4) ─────────────────────────────────────────────────
+
+  /** The block of the user's own funding transfer of this swap's token, read once from its receipt;
+   *  null while it cannot be read (then no payout is counted yet). */
+  private async fundingBlock(): Promise<number | null> {
+    if (this.fundedAt !== null) return this.fundedAt;
+    const t = this.record.funding.token;
+    if (!t || t.status === 'failed') return null;
+    const r = await this.deps.evm.minedReceipt(t.hash).catch(() => null);
+    if (!r || r.status !== 'success') return null;
+    this.fundedAt = r.blockNumber;
+    return r.blockNumber;
+  }
+
+  /** Read the receipts of the Sepolia transfers the sponsor reported for this swap's withdrawals, and
+   *  keep the ones that verify as its payout on the record (./arrival.ts). A pending or unreadable
+   *  receipt is read again at the next poll; one that is mined and does not verify is said once. */
+  private async checkArrivals(view: SwapView): Promise<void> {
+    const exp = expectedArrival(this.record, this.deps.network, this.deps.registry);
+    if (!exp || arrivedInFull(this.record)) return;
+    const todo = arrivalCandidates(this.record, view).filter((h) => !this.verdicts.has(h));
+    if (todo.length === 0) return;
+    const fundedAt = await this.fundingBlock();
+    const claimed = this.deps.claimedArrivals?.(this.snap.swapId) ?? new Set<string>();
+    for (const hash of todo) {
+      const receipt = await this.deps.evm.minedReceipt(hash).catch(() => null);
+      if (this.closed) return;
+      if (receipt === null) continue;
+      const check = checkTransfer(receipt, exp, fundedAt);
+      // The funding block is not known yet: decide at a later poll.
+      if (check.kind === 'too-early' && fundedAt === null) continue;
+      if (check.kind !== 'arrived' || claimed.has(hash)) {
+        const why = check.kind === 'arrived' ? 'claimed' : check.kind;
+        this.verdicts.set(hash, why);
+        this.set({ notice: this.notCountedText(why, hash) });
+        continue;
+      }
+      const r = this.record;
+      this.saveRecord({
+        ...r,
+        arrivals: [
+          ...(r.arrivals ?? []),
+          { tx: hash, colour: exp.colour, amount: check.amount.toString(), at: this.deps.now() },
+        ].slice(-16),
+        updatedAt: this.deps.now(),
+      });
+    }
+  }
+
+  private notCountedText(why: Exclude<TransferCheck['kind'], 'arrived'> | 'claimed', hash: string): string {
+    const tx = `${hash.slice(0, 10)}…${hash.slice(-6)}`;
+    const leg = outLeg(this.record);
+    switch (why) {
+      case 'reverted':
+        return `The transfer to your address failed on Sepolia (${tx}): nothing arrived. The bridge returns the tokens to the swap's temporary wallet, and the page then sends them again.`;
+      case 'no-transfer':
+        return `The Sepolia transaction the bridge reported (${tx}) does not carry the transfer of ${leg.symbol} from the bridge to your address that this page expects, so it does not count it. The page keeps following the bridge.`;
+      case 'too-early':
+        return `The Sepolia transfer the bridge reported (${tx}) was mined before you funded this swap, so it is not this swap's: the page does not count it, and keeps following the bridge.`;
+      case 'claimed':
+        return `The Sepolia transfer the bridge reported (${tx}) is already counted for another of your swaps in this browser, so the page does not count it for this one, and keeps following the bridge.`;
+    }
+  }
+
+  /** Every token arrived (verified): the swap is done for the user. While the sponsor closes the
+   *  request in the background the page says so quietly. Any other state contradicts the arrival:
+   *  the receipts are read again (an arrival that no longer verifies is dropped, and the swap goes on
+   *  as the sponsor says), then the conflict is shown and nothing more is sent. True when the loop
+   *  must stop (the sponsor says `failed`). */
+  private async afterArrival(view: SwapView): Promise<boolean> {
+    if (AGREES_WITH_ARRIVAL.has(view.state)) {
+      const st = this.snap.status;
+      if (!(st.kind === 'done' && st.closing && !st.conflict)) this.status({ kind: 'done', closing: true });
+      return false;
+    }
+    if (await this.arrivalsUndone()) return false;
+    const r = this.record;
+    const reported =
+      view.state === 'failed'
+        ? `failed (${(view.message ?? view.reason ?? 'no reason given').slice(0, 160)})`
+        : view.state === 'partial'
+          ? 'waiting for part of the deposit'
+          : view.state === 'awaiting_funds' || view.state === 'depositing'
+            ? 'still bridging in'
+            : 'holding the tokens in the temporary wallet again';
+    const conflict = `Your ${legText(outLeg(r))} arrived at your address on Sepolia (verified from the transaction's receipt), but the bridge now reports this swap as ${reported}. This page sends nothing more on its own. If this does not clear, contact the operator with this swap's id.`;
+    this.status({ kind: 'done', closing: view.state !== 'failed', conflict });
+    if (view.state !== 'failed') return false;
+    await this.wallet?.close().catch(() => undefined);
+    return true;
+  }
+
+  /** The arrivals read again (after the sponsor contradicted them): the ones whose receipt now reads
+   *  as something else are dropped from the record. True when one was dropped. A receipt that cannot
+   *  be read now keeps its arrival. */
+  private async arrivalsUndone(): Promise<boolean> {
+    const r = this.record;
+    const exp = expectedArrival(r, this.deps.network, this.deps.registry);
+    if (!exp) return false;
+    const keep: NonNullable<SwapRecord['arrivals']> = [];
+    for (const a of r.arrivals ?? []) {
+      const receipt = await this.deps.evm.minedReceipt(a.tx).catch(() => null);
+      const check = receipt ? checkTransfer(receipt, exp, this.fundedAt) : null;
+      if (check === null || (check.kind === 'arrived' && check.amount.toString() === a.amount)) keep.push(a);
+    }
+    if (keep.length === (r.arrivals ?? []).length) return false;
+    this.saveRecord({ ...r, arrivals: keep, updatedAt: this.deps.now() });
+    this.set({
+      notice:
+        'A transfer to your address that this page had seen on Sepolia no longer reads as it did (a chain reorganisation?), and the bridge says the swap goes on: the page follows it.',
+    });
+    return true;
   }
 
   /** The coin is minted: take, bridge out, bridge back or wait. True when the loop must stop. */

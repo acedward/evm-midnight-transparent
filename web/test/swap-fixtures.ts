@@ -7,7 +7,7 @@ import { secp256k1 } from '@noble/curves/secp256k1';
 import { TypedDataEncoder, Wallet, getAddress, getBytes, hexlify } from 'ethers';
 
 import type { MockSettings } from '../src/config.js';
-import { EvmError, type EvmPort } from '../src/swap/evm.js';
+import { EvmError, type EvmPort, type MinedReceipt, parseReceipt } from '../src/swap/evm.js';
 import { type MockEnvironment, createMockEnvironment } from '../src/swap/mock/index.js';
 import type { SwapBackends, TypedData, TypedDataSigner } from '../src/swap/ports.js';
 import { HttpSponsorApi } from '../src/swap/sponsor-client.js';
@@ -114,6 +114,30 @@ export class FakeSepolia implements EvmPort {
 
   async receipt(_hash?: string): Promise<'success' | 'reverted' | null> {
     return 'success';
+  }
+
+  /** The mock bridge's transfers on this fake Sepolia (P4.2-fix4): a test points it at the mock
+   *  world's receipts (`env.controls.sepoliaReceipt`). Unset: the bridge's hashes are unknown here. */
+  bridgeReceipts: ((hash: string) => Record<string, unknown> | null) | null = null;
+  /** A receipt the test replaces (null: the transaction is gone, as after a reorganisation). */
+  readonly receiptOverride = new Map<string, Record<string, unknown> | null>();
+  /** Every receipt read with logs, in order. */
+  readonly receiptReads: string[] = [];
+
+  /** As the real port: `ready()` first, then the receipt with its logs. This wallet's own
+   *  transactions are mined at block 5,000,000 + their number (below the mock bridge's blocks). */
+  async minedReceipt(hash: string): Promise<MinedReceipt | null> {
+    await this.ready();
+    this.receiptReads.push(hash);
+    const h = hash.toLowerCase();
+    if (this.receiptOverride.has(h)) return parseReceipt(this.receiptOverride.get(h), hash);
+    const own = this.sent.findIndex((t) => t.hash.toLowerCase() === h);
+    if (own >= 0)
+      return parseReceipt(
+        { transactionHash: h, status: '0x1', blockNumber: `0x${(5_000_001 + own).toString(16)}`, logs: [] },
+        hash,
+      );
+    return parseReceipt(this.bridgeReceipts?.(h) ?? null, hash);
   }
 }
 

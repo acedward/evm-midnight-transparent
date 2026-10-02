@@ -1,7 +1,9 @@
 // One swap's page: six stages with every hash as it lands (spec US1), "Swap is not available" with
 // Bridge back (Q6), the determinism warning (Q4), refund retries (Q9 A), Resume for a swap that is
-// not running in this tab (US2.2), and a PARTIAL deposit (P4.2-fix3 S2): what arrived, what is
-// missing, "Wait for the rest" or "Bridge back" what arrived.
+// not running in this tab (US2.2), a PARTIAL deposit (P4.2-fix3 S2): what arrived, what is missing,
+// "Wait for the rest" or "Bridge back" what arrived; and Done on arrival (P4.2-fix4): Done as soon as
+// every token is at the user's address, verified on Sepolia, with a quiet note while the bridge
+// closes the request in the background, and the bridge's report shown if it contradicts that.
 
 import type { NetworkProfile } from '@evm-midnight-transparent/core';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -20,12 +22,21 @@ import {
   StageTracker,
   type TrackerStage,
 } from '../../design/index.js';
+import { BRIDGE_CLOSE_ESTIMATE_MIN } from '../../swap/arrival.js';
 import { amountText, clockText, elapsedText, ethText, legText } from '../../swap/display.js';
 import { type StageKey, bridgeInStartedAt, stageStates, stageTitle } from '../../swap/flow.js';
 import { bridgeRequestUrl, midnightTxUrl, sepoliaAddressUrl, sepoliaTxUrl } from '../../swap/links.js';
 import { BRIDGE_IN_ESTIMATE_MIN } from '../../swap/offers.js';
 import { partialOf } from '../../swap/partial.js';
-import { type SwapRecord, isFinished, isResumable } from '../../swap/record-shape.js';
+import {
+  type SwapRecord,
+  arrivedAmount,
+  arrivedInFull,
+  isDoneForUser,
+  isFinished,
+  isResumable,
+  outLeg as paidOutLeg,
+} from '../../swap/record-shape.js';
 import type { SessionSnapshot, SessionStatus, SwapSession } from '../../swap/session.js';
 import { useSession, useSwap } from '../../swap/SwapContext.js';
 
@@ -100,8 +111,19 @@ const PROMPT: Record<Extract<SessionStatus, { kind: 'signing' }>['prompt'], stri
 const SIGN_HERE_ONLY =
   'Only sign it here, in this app: the signature is the key to the swap’s tokens, and whoever gets it can take them. Never sign it on another site.';
 
+/** "Bridged back." or "Done.": the sponsor's outcome, or before it says `done` the user's choice. */
+const doneText = (record: SwapRecord | null) =>
+  (record?.outcome ?? (record?.choice === 'bridge-back' ? 'bridged-back' : 'swapped')) === 'bridged-back'
+    ? 'Bridged back.'
+    : 'Done.';
+
 function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): string {
-  if (!snap) return record && isFinished(record) ? 'Finished.' : 'Not running in this tab.';
+  if (!snap)
+    return record && isFinished(record)
+      ? 'Finished.'
+      : record && isDoneForUser(record)
+        ? doneText(record)
+        : 'Not running in this tab.';
   const s = snap.status;
   switch (s.kind) {
     case 'signing':
@@ -125,7 +147,7 @@ function statusLine(snap: SessionSnapshot | null, record: SwapRecord | null): st
     case 'partial':
       return 'Only part of your deposit reached the temporary wallet: choose below.';
     case 'done':
-      return record?.outcome === 'bridged-back' ? 'Bridged back.' : 'Done.';
+      return s.conflict ? `${doneText(record)} The bridge reports something else: see below.` : doneText(record);
     case 'error':
       return 'Stopped by an error.';
     case 'stopped':
@@ -245,6 +267,11 @@ export function SwapProgress({ swapId }: { swapId: string }) {
   const states = stageStates(record);
   const finished = !!record && isFinished(record);
   const resumable = !!record && isResumable(record);
+  // P4.2-fix4: every token is at the user's address (verified on Sepolia); `closing` while the bridge
+  // has not closed the request yet (the sponsor's `done`).
+  const doneForUser = !!record && isDoneForUser(record);
+  const closing = doneForUser && record?.phase !== 'done';
+  const conflict = status?.kind === 'done' ? (status.conflict ?? null) : null;
   const unavailable = record?.phase === 'unavailable';
   const back = record?.choice === 'bridge-back';
   // P4.2-fix3 S2: part of the pay amount is in the temporary wallet, the rest at the deposit address.
@@ -463,7 +490,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
     </Notice>
   );
   // S2 after "Bridge back": what came back, and the rest on its way in to be bridged back too.
-  const partialBackDetail = record && partial && back && !finished && (
+  const partialBackDetail = record && partial && back && !finished && !doneForUser && (
     <Notice tone="info" className="gap-top" data-testid="partial-back">
       Only part of your deposit arrived, and you chose to bridge it back.{' '}
       {partial.minted === '0' ? (
@@ -546,6 +573,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
         : record.offer.pay
       : record.offer.receive
     : null;
+  const arrivedNow = record ? arrivedAmount(record) : 0n;
   const bridgeOutDetail = record && outLeg && (
     <>
       {partialBackDetail}
@@ -553,12 +581,26 @@ export function SwapProgress({ swapId }: { swapId: string }) {
         {legText(outLeg)} to your address: it arrives about a minute after the withdrawal starts; the bridge closes the
         request about 17 minutes later.
       </p>
-      {record.bridgeOut.sepoliaTx && !(back && partial) && (
-        <p data-testid="arrived">
+      {arrivedNow > 0n ? (
+        // P4.2-fix4: read from the transfers' receipts (./arrival.ts), never from the sponsor's word.
+        <p data-testid="arrived" data-full={arrivedInFull(record) ? 'yes' : 'no'}>
           <strong>
-            {legText(outLeg)} {back ? 'came back' : 'arrived'} on Sepolia.
-          </strong>
+            {arrivedInFull(record)
+              ? `${legText(paidOutLeg(record))} ${back ? 'came back' : 'arrived'} on Sepolia.`
+              : `${amountText(arrivedNow, paidOutLeg(record).decimals)} of ${legText(paidOutLeg(record))} ${back ? 'came back' : 'arrived'} on Sepolia so far.`}
+          </strong>{' '}
+          <span className="small muted">Checked from the transfer&apos;s receipt on Sepolia.</span>
         </p>
+      ) : (
+        record.phase === 'done' &&
+        record.bridgeOut.sepoliaTx &&
+        !(back && partial) && (
+          <p data-testid="arrived">
+            <strong>
+              {legText(outLeg)} {back ? 'came back' : 'arrived'} on Sepolia.
+            </strong>
+          </p>
+        )
       )}
       <SubStages stages={record.bridgeOut.stages} testId="bridge-out-stages" leg="withdraw" />
       <ul className="tx-list">
@@ -582,15 +624,23 @@ export function SwapProgress({ swapId }: { swapId: string }) {
     </>
   );
 
-  const doneDetail = record?.phase === 'done' && (
-    <p data-testid="done-summary">
-      {record.outcome === 'bridged-back'
-        ? partial && partial.remaining !== '0'
-          ? `The swap did not happen: ${payPart(partial.minted)} came back to your address. The other ${payPart(partial.remaining)} did not reach the temporary wallet: the sponsor found none of it at the deposit address ${record.deposit.address}.`
-          : `The swap did not happen: ${legText(record.offer.pay)} came back to your address${partial ? ', in parts' : ''}.`
-        : `You paid ${legText(record.offer.pay)} and received ${legText(record.offer.receive)}.`}{' '}
-      The temporary wallet is empty.
-    </p>
+  const doneDetail = record && doneForUser && (
+    <>
+      <p data-testid="done-summary">
+        {(record.outcome ?? (back ? 'bridged-back' : 'swapped')) === 'bridged-back'
+          ? partial && partial.remaining !== '0' && !arrivedInFull(record)
+            ? `The swap did not happen: ${payPart(partial.minted)} came back to your address. The other ${payPart(partial.remaining)} did not reach the temporary wallet: the sponsor found none of it at the deposit address ${record.deposit.address}.`
+            : `The swap did not happen: ${legText(record.offer.pay)} came back to your address${partial ? ', in parts' : ''}.`
+          : `You paid ${legText(record.offer.pay)} and received ${legText(record.offer.receive)}.`}{' '}
+        The temporary wallet is empty.
+      </p>
+      {closing && !conflict && (
+        <p className="small muted" data-testid="closing-note">
+          The bridge closes the request on Midnight in the background (about {BRIDGE_CLOSE_ESTIMATE_MIN} minutes); there
+          is nothing for you to do.
+        </p>
+      )}
+    </>
   );
 
   const titles: Record<StageKey, string> = {
@@ -628,6 +678,7 @@ export function SwapProgress({ swapId }: { swapId: string }) {
       data-testid="swap-page"
       data-phase={record?.phase ?? 'starting'}
       data-status={status?.kind ?? 'idle'}
+      data-done={doneForUser ? (closing ? 'closing' : 'closed') : 'no'}
       aria-labelledby="swap-title"
     >
       <PageHead
@@ -670,6 +721,17 @@ export function SwapProgress({ swapId }: { swapId: string }) {
       {snap?.notice && (
         <Notice tone="warning" role="status" className="panel-intro" data-testid="swap-notice">
           {snap.notice}
+        </Notice>
+      )}
+      {conflict && (
+        <Notice
+          tone="danger"
+          role="alert"
+          className="panel-intro"
+          data-testid="arrival-conflict"
+          title="Your tokens arrived, but the bridge reports something else."
+        >
+          {conflict}
         </Notice>
       )}
       {status?.kind === 'error' && (

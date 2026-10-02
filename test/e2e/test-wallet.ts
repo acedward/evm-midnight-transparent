@@ -13,6 +13,12 @@
 //
 // `nonDeterministic: true` signs typed data with a RANDOM nonce (valid, low-s, but different every
 // time), the way a wallet without RFC 6979 would: the page's determinism warning (Q4).
+//
+// Receipts in FAKE mode (P4.2-fix4): the wallet's own transactions are mined at block 5,000,000 +
+// their number, with no logs; the mock bridge's transfers to the user (the withdrawals, mined by the
+// mock world in the page) are answered in the page from `__emtMock.sepoliaReceipt`, with their ERC20
+// `Transfer` logs, so the page's Done-on-arrival check reads them as it reads a real receipt. A hash
+// neither knows has no receipt (null).
 
 import type { Page } from '@playwright/test';
 import { secp256k1 } from '@noble/curves/secp256k1';
@@ -65,6 +71,8 @@ export async function installTestWallet(
     privateKey?: string;
     live?: LiveSepolia;
     nonDeterministic?: boolean;
+    /** Transactions another tab of this wallet sent (FAKE mode): their receipts are answered too. */
+    alsoMined?: TestWallet['sent'];
   } = {},
 ): Promise<TestWallet> {
   const rpc = opts.live ? new JsonRpcProvider(opts.live.rpcUrl, 11155111, { staticNetwork: true }) : null;
@@ -151,8 +159,12 @@ export async function installTestWallet(
         sent.push({ to: tx.to, data: tx.data ?? '', value, hash });
         return hash;
       }
-      case 'eth_getTransactionReceipt':
-        return { status: '0x1', transactionHash: params[0] };
+      case 'eth_getTransactionReceipt': {
+        const hash = String(params[0]).toLowerCase();
+        const own = [...(opts.alsoMined ?? []), ...sent].findIndex((t) => t.hash.toLowerCase() === hash);
+        if (own < 0) return null;
+        return { status: '0x1', transactionHash: hash, blockNumber: hexq(5_000_001n + BigInt(own)), logs: [] };
+      }
       case 'eth_signTypedData_v4': {
         const td = JSON.parse(String(params[1])) as {
           domain: Record<string, unknown>;
@@ -183,8 +195,15 @@ export async function installTestWallet(
     ) => {
       for (const h of listeners[event] ?? []) h(arg);
     };
+    // The mock bridge's transfers live in the page's mock world (mock mode only; LIVE mode has none).
+    const mockWorld = () =>
+      (window as unknown as { __emtMock?: { sepoliaReceipt?(h: string): Record<string, unknown> | null } }).__emtMock;
     const provider = {
       async request({ method, params }: { method: string; params?: unknown[] }) {
+        if (method === 'eth_getTransactionReceipt') {
+          const bridged = mockWorld()?.sepoliaReceipt?.(String(params?.[0] ?? ''));
+          if (bridged) return bridged;
+        }
         const result = await bridge(method, params ?? []);
         const err = (result as { __error?: { code: number; message: string } } | null)?.__error;
         if (err) throw Object.assign(new Error(err.message), { code: err.code });
@@ -236,5 +255,6 @@ export async function installTestWallet(
 export function reopenTestWallet(page: Page, first: TestWallet, sepolia: FakeSepolia): Promise<TestWallet> {
   const same = { sepolia } as Parameters<typeof installTestWallet>[1] & object;
   same.privateKey = first.privateKey;
+  same.alsoMined = first.sent;
   return installTestWallet(page, same);
 }

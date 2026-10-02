@@ -51,6 +51,53 @@ const quantity = (v: unknown): bigint => {
   return v === '0x' ? 0n : BigInt(v);
 };
 
+/** A log of a mined transaction: the emitting contract, its topics and data (lowercase hex). */
+export interface ReceiptLog {
+  address: string;
+  topics: readonly string[];
+  data: string;
+}
+
+/** A mined transaction's receipt as the page reads it (P4.2-fix4: the arrival of the tokens). */
+export interface MinedReceipt {
+  hash: string;
+  status: 'success' | 'reverted';
+  blockNumber: number;
+  logs: readonly ReceiptLog[];
+}
+
+const HEX32 = /^0x[0-9a-f]{64}$/;
+const ADDRESS = /^0x[0-9a-f]{40}$/;
+
+/**
+ * An `eth_getTransactionReceipt` answer for `hash`, checked: null while the transaction is pending or
+ * unknown, and for an answer that is not a receipt of that transaction (another hash, no status, no
+ * block). A log that is not well formed is dropped (it cannot be the transfer the page looks for).
+ */
+export function parseReceipt(raw: unknown, hash: string): MinedReceipt | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as { transactionHash?: unknown; status?: unknown; blockNumber?: unknown; logs?: unknown };
+  const want = hash.toLowerCase();
+  if (typeof r.transactionHash === 'string' && r.transactionHash.toLowerCase() !== want) return null;
+  if (r.status !== '0x1' && r.status !== '0x0') return null;
+  if (typeof r.blockNumber !== 'string' || !/^0x[0-9a-fA-F]{1,16}$/.test(r.blockNumber)) return null;
+  const logs: ReceiptLog[] = [];
+  for (const l of Array.isArray(r.logs) ? (r.logs as unknown[]) : []) {
+    const x = l as { address?: unknown; topics?: unknown; data?: unknown; removed?: unknown } | null;
+    if (!x || x.removed === true || typeof x.address !== 'string' || typeof x.data !== 'string') continue;
+    const address = x.address.toLowerCase();
+    const topics = Array.isArray(x.topics) ? x.topics.map((t) => (typeof t === 'string' ? t.toLowerCase() : '')) : [];
+    if (!ADDRESS.test(address) || topics.some((t) => !HEX32.test(t)) || !/^0x([0-9a-fA-F]{2})*$/.test(x.data)) continue;
+    logs.push({ address, topics, data: x.data.toLowerCase() });
+  }
+  return {
+    hash: want,
+    status: r.status === '0x1' ? 'success' : 'reverted',
+    blockNumber: Number.parseInt(r.blockNumber, 16),
+    logs,
+  };
+}
+
 export interface EvmPort {
   address: string;
   /** Throws an `EvmError` unless the wallet is on the bound chain with the bound account right now. */
@@ -61,6 +108,9 @@ export interface EvmPort {
   erc20Balance(token: string, holder: string): Promise<bigint>;
   /** The receipt's outcome, or null while it is pending. */
   receipt(hash: string): Promise<'success' | 'reverted' | null>;
+  /** The mined receipt with its logs, read on the bound chain (`ready()` first: never another
+   *  network's), or null while it is pending or unknown (P4.2-fix4). */
+  minedReceipt(hash: string): Promise<MinedReceipt | null>;
 }
 
 /** The connected account on one chain (`chain`: its id and name, e.g. Sepolia's `0xaa36a7`). */
@@ -141,6 +191,11 @@ export function evmPort(
       } | null;
       if (!r || typeof r.status !== 'string') return null;
       return r.status === '0x1' ? 'success' : 'reverted';
+    },
+    async minedReceipt(hash) {
+      if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return null;
+      await ready();
+      return parseReceipt(await provider.request({ method: 'eth_getTransactionReceipt', params: [hash] }), hash);
     },
   };
 }

@@ -410,7 +410,8 @@ describe('the six stages', () => {
   it('titles the sponsor stages per leg, and shows an unknown one as it came', () => {
     expect(stageTitle('deposit', 'settled')).toBe('Minted to the temporary wallet');
     expect(stageTitle('withdraw', 'settled')).toBe('Withdrawal closed on Midnight');
-    expect(stageTitle('withdraw', 'evm-broadcast')).toBe('Tokens sent to you on Sepolia');
+    // The relay reports `evm-broadcast` once the transfer's receipt is seen: mined (P4.2-fix4 wording).
+    expect(stageTitle('withdraw', 'evm-broadcast')).toBe('Transfer to you mined on Sepolia');
     expect(stageTitle('deposit', 'something-new')).toBe('something-new');
     // FS2's new stage ids (P4.2-fix2 R4, R5, R6).
     expect(stageTitle('deposit', 'budget-wait')).toMatch(/daily budget/);

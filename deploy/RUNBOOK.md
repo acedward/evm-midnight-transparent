@@ -555,9 +555,12 @@ accounts, and this sponsor's only closes requests of its own swaps (section 13.3
 
 Put this where users read it (the site says the same on its pages):
 
-- **A swap takes about 35 minutes**: about 17 minutes to bridge in (Sepolia finality), a few seconds
-  to take the offer, and the received token arrives on Sepolia about 1 to 2 minutes after the take.
-  The swap shows "done" about 18 minutes later, when the vault has settled.
+- **A swap takes about 20 minutes for the user**: about 17 minutes to bridge in (Sepolia finality), a
+  few seconds to take the offer, and the received token arrives on Sepolia about 1 to 2 minutes after
+  the take. The page shows "Done" as soon as it has checked that transfer's receipt (status 1, the
+  token's `Transfer` from the vault's EVM account to the user's address); the bridge then closes the
+  request in the background (about 18 minutes more, until the sponsor's own `done`), with nothing
+  for the user to do.
 - **Three signatures to start**: two identical "start swap" signatures (they create the swap's
   temporary Midnight wallet) and one to open the swap with the sponsor. If the two "start swap"
   signatures differ, the wallet does not sign deterministically: keep the tab open until the swap is
