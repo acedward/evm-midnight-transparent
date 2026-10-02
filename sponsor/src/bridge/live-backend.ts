@@ -35,6 +35,7 @@ import type {
   RequestDetail,
   SwapBackend,
   SwapProver,
+  TxLookup,
   WithdrawCallArgs,
 } from '../swaps/backend.js';
 import { jsonRpcEvmReader } from './evm.js';
@@ -51,6 +52,7 @@ import {
   sponsorWalletProvider,
   startDeposit as vaultStartDeposit,
   verifyVaultKeys,
+  type ProviderHooks,
   type VaultRuntime,
 } from './vault.js';
 
@@ -131,6 +133,49 @@ export async function indexerHead(
   return { height, timeMs: t < 1e12 ? t * 1000 : t };
 }
 
+/**
+ * A Midnight transaction by one of its identifiers (audit T1). The indexer's head is read FIRST, so
+ * "not found" means "not included up to that block" (an indexer serves whole blocks). Throws when the
+ * indexer cannot answer.
+ */
+export async function findTransaction(
+  indexerUrl: string,
+  identifier: string,
+  fetchFn: (url: string, init: RequestInit) => Promise<Response> = fetch,
+): Promise<TxLookup> {
+  const asOf = await indexerHead(indexerUrl, fetchFn);
+  const id = norm(identifier);
+  if (!/^[0-9a-f]{2,256}$/.test(id)) throw new Error('not a transaction identifier');
+  const res = await fetchFn(indexerUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      query:
+        'query SPONSOR_TX($id: HexEncoded!) { transactions(offset: {identifier: $id}) { hash block { height } ... on RegularTransaction { transactionResult { status } } } }',
+      variables: { id },
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`the indexer answered ${res.status}`);
+  const body = (await res.json()) as {
+    data?: {
+      transactions?: { hash?: unknown; block?: { height?: unknown }; transactionResult?: { status?: unknown } }[];
+    };
+    errors?: unknown[];
+  };
+  if (!body.data || !Array.isArray(body.data.transactions)) throw new Error('the indexer did not answer the lookup');
+  const t = body.data.transactions[0];
+  if (!t) return { found: null, asOf };
+  return {
+    found: {
+      hash: norm(String(t.hash)),
+      height: Number(t.block?.height),
+      success: String(t.transactionResult?.status ?? '') === 'SUCCESS',
+    },
+    asOf,
+  };
+}
+
 /** Load the vault and its keys, verify them against the chain, and compose the backend. Throws a
  *  BridgeConfigError when the keys are not the deployed ones (the sponsor then bridges nothing). */
 export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBackend> {
@@ -182,7 +227,10 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
   const evm = jsonRpcEvmReader(o.evmRpcUrl);
 
   /** Run `fn` with the sponsor wallet as midnight-js providers (balancing and paying). */
-  const withProviders = <T>(fn: (providers: Any, opened: OpenedWallet) => Promise<T>): Promise<T> =>
+  const withProviders = <T>(
+    fn: (providers: Any, opened: OpenedWallet) => Promise<T>,
+    hooks: ProviderHooks = {},
+  ): Promise<T> =>
     o.sponsor.withWallet(async (handle) => {
       const opened = { handle } as OpenedWallet;
       const h = handle as Any;
@@ -192,6 +240,8 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
         opened,
         st.shielded.coinPublicKey.toHexString(),
         st.shielded.encryptionPublicKey.toHexString(),
+        undefined,
+        hooks,
       );
       const providers = {
         publicDataProvider: pdp,
@@ -350,26 +400,34 @@ export async function loadLiveBackend(o: LiveBackendOptions): Promise<LiveBacken
     attestation,
 
     settle: (i) =>
-      withProviders(async (providers) => {
-        const out = await vaultSettle(providers, rt, vault, i.circuit, {
-          requestId: i.requestId,
-          event: i.attestation.event,
-          serializedOutput: i.attestation.serializedOutput,
-          recipientCoinPublicKeyHex: i.recipientCoinPk,
-          recipientEncryptionPublicKeyHex: i.recipientEncPk,
-        });
-        return { ...(await facts(out.txId, out.status, out.txHash)), minted: out.minted !== null };
-      }),
+      withProviders(
+        async (providers) => {
+          const out = await vaultSettle(providers, rt, vault, i.circuit, {
+            requestId: i.requestId,
+            event: i.attestation.event,
+            serializedOutput: i.attestation.serializedOutput,
+            recipientCoinPublicKeyHex: i.recipientCoinPk,
+            recipientEncryptionPublicKeyHex: i.recipientEncPk,
+          });
+          return { ...(await facts(out.txId, out.status, out.txHash)), minted: out.minted !== null };
+        },
+        { onSubmit: i.onSubmit },
+      ),
 
     abandonDeposit: (i) =>
-      withProviders(async (providers) => {
-        const out = await callVault(providers, rt, vault, 'abandonDeposit', [
-          hexToBytes(i.requestId, 32),
-          i.attestation.event,
-          i.attestation.serializedOutput,
-        ]);
-        return facts(out.txId, out.status, out.txHash);
-      }),
+      withProviders(
+        async (providers) => {
+          const out = await callVault(providers, rt, vault, 'abandonDeposit', [
+            hexToBytes(i.requestId, 32),
+            i.attestation.event,
+            i.attestation.serializedOutput,
+          ]);
+          return facts(out.txId, out.status, out.txHash);
+        },
+        { onSubmit: i.onSubmit },
+      ),
+
+    findTransaction: (identifier) => findTransaction(o.network.midnight.indexerUrl, identifier),
 
     async vaultStateMark(): Promise<string> {
       const state: Any = await pdp.queryContractState(vault);

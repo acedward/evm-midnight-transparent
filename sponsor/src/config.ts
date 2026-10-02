@@ -122,6 +122,9 @@ export interface SponsorConfig {
     reconcileSeconds: number;
     /** Per-token sweep gas limits (symbol -> gas); see swaps/sweep-gas.ts. */
     sweepGasLimits: Record<string, bigint>;
+    /** The gas a deposit request's ERC20 transfer is taken to need when Sepolia cannot estimate it: a
+     *  request with less never sweeps, so it is not a competitor (audit T2). */
+    sweepMinExecGas: bigint;
     /** Refuse to open a swap whose sweep ETH would exceed this (a Sepolia gas spike). */
     maxSweepWei: bigint;
   };
@@ -415,6 +418,9 @@ export function loadConfig(env: Env, readFile: ReadFile): { config: SponsorConfi
         }
       })(),
       maxSweepWei: big(env.SWEEP_MAX_WEI, 5_000_000_000_000_000n, 'SWEEP_MAX_WEI'),
+      // The measured stk sweep used 29,677 gas (G-BRIDGE B.2.4); every request below that cannot move a
+      // token (audit T2).
+      sweepMinExecGas: big(env.SWEEP_MIN_EXEC_GAS, 30_000n, 'SWEEP_MIN_EXEC_GAS'),
     },
     staleCloser: {
       enabled: bool(env.STALE_CLOSER_ENABLED, true, 'STALE_CLOSER_ENABLED'),

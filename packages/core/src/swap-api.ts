@@ -218,7 +218,9 @@ export const PartialDepositSchema = z.object({
   /** What the temporary wallet holds from completed deposits (every completed request for its recipient,
    *  whoever started it), minus what a Bridge back from `partial` already returned. */
   minted: baseUnits,
-  /** What is still to be deposited for the wallet to hold the whole pay amount. */
+  /** What is still to be deposited for the wallet to hold the whole pay amount. After a loss to another
+   *  party's settle (`SwapView.settledElsewhere`, audit T1) the rest can no longer arrive in full: it is
+   *  then what the sponsor will still deposit, i.e. what waits at the deposit address. */
   remaining: baseUnits,
   /** The pay token the sponsor last read at the deposit address (informative). */
   atAddress: baseUnits,
@@ -226,6 +228,37 @@ export const PartialDepositSchema = z.object({
   options: z.array(z.enum(PARTIAL_OPTIONS)),
 });
 export type PartialDeposit = z.infer<typeof PartialDepositSchema>;
+
+/**
+ * A vault request for this swap's recipient that ANOTHER party settled (plan 00048 P4.2-fix4, audit
+ * T1 / F-A41). The vault's `completeDeposit`, `completeWithdraw`, `refundWithdraw` and `abandonDeposit`
+ * are permissionless, and the submitter of a settle chooses the minted coin's nonce and the key its
+ * ciphertext is sealed to; the nonce is never public (only the coin's commitment is). A coin minted
+ * by another party's settle is owned by the temporary coin key but described only to that party: the
+ * temporary wallet can neither see nor spend it, and nobody else can spend it (`lost`). Settles that
+ * mint nothing (a successful withdrawal, an abandon, a token that returned false) lose nothing.
+ */
+export const SETTLED_ELSEWHERE_KINDS = ['deposit', 'withdraw'] as const;
+export const SettledElsewhereSchema = z.object({
+  kind: z.enum(SETTLED_ELSEWHERE_KINDS),
+  /** The vault request (absent for a foreign sweep the sponsor only saw on Sepolia). */
+  requestId: hex64.optional(),
+  attested: z.enum(ATTESTED_KINDS),
+  /** The colour and amount the settle minted (or would have minted) to the temporary coin key. */
+  colour: hex64,
+  amount: z.string().regex(/^(0|[1-9][0-9]{0,38})$/, 'expected base units'),
+  /** True when that settle minted `amount` of `colour` that the temporary wallet cannot use. */
+  lost: z.boolean(),
+  /** The Sepolia transaction (the sweep, or the withdrawal's transfer), when known. */
+  evmTx: z.string().optional(),
+  /** Unix seconds: when the sponsor found it. */
+  at: z.number().int(),
+});
+export type SettledElsewhere = z.infer<typeof SettledElsewhereSchema>;
+
+/** The `failed` reason of a swap whose funds were all lost to settles by other parties (audit T1):
+ *  never recoverable. */
+export const SETTLED_ELSEWHERE_REASON = 'settled-elsewhere' as const;
 
 export const SwapLegViewSchema = z.object({
   colour: z.string(),
@@ -260,6 +293,9 @@ export const SwapViewSchema = z.object({
   /** On `partial` (always present then): what arrived, what is missing, and what the page may do
    *  (audit S2). */
   partial: PartialDepositSchema.optional(),
+  /** Vault requests of this swap that another party settled, oldest first; present only when there
+   *  is one (audit T1). A `lost` entry's amount is gone for the user. */
+  settledElsewhere: z.array(SettledElsewhereSchema).optional(),
   /** On `done`. */
   outcome: z.enum(['swapped', 'bridged-back']).optional(),
   /** On `failed`: a stable code, and a sentence for the page. */

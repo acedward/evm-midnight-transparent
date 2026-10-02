@@ -18,7 +18,32 @@ export interface EvmReader {
   nonce(address: string, tag: 'latest' | 'pending'): Promise<bigint>;
   /** The latest block's base fee per gas. */
   baseFeePerGas(): Promise<bigint>;
+  /**
+   * The gas an ERC20 `transfer(to, amount)` sent from `from` needs at the latest block
+   * (`eth_estimateGas`), or 'reverts' when it cannot execute there. Throws when Sepolia cannot be
+   * read (audit T2: a deposit request whose gas limit is below this can never sweep).
+   */
+  estimateTransferGas(token: string, from: string, to: string, amount: bigint): Promise<bigint | 'reverts'>;
+  /** The latest block number. */
+  blockNumber(): Promise<bigint>;
+  /**
+   * The ERC20 `Transfer` logs of `token` sent FROM `from` in blocks [fromBlock, latest] (audit T1: a
+   * deposit address only ever sends its tokens in a vault sweep for its recipient, so these are every
+   * sweep, whoever started and settled it).
+   */
+  transfersFrom(token: string, from: string, fromBlock: bigint): Promise<EvmTransfer[]>;
 }
+
+export interface EvmTransfer {
+  txHash: string;
+  /** The receiving address (0x…, lowercase). */
+  to: string;
+  amount: bigint;
+  block: bigint;
+}
+
+/** EIP-7825's per-transaction gas cap: a request with a larger gas limit can never be included. */
+export const MAX_TX_GAS = 16_777_216n;
 
 export type BridgeKind = 'deposit' | 'withdraw';
 
@@ -72,6 +97,21 @@ export const WITHDRAW_TX_TTL_MS = 60_000;
  *  uncertain until the request id settles it. */
 export class NotSubmittedError extends Error {
   override name = 'NotSubmittedError';
+}
+
+/** What identifies a transaction the sponsor submits, told BEFORE it reaches the node (audit T1): if
+ *  the sponsor never hears back, its identifiers find it on chain, and past its expiry (its DUST
+ *  balancing's time to live, ms) it can no longer land. */
+export interface SubmissionInfo {
+  identifiers: string[];
+  expiresAtMs: number;
+}
+
+/** A Midnight transaction looked up by identifier: `found` null means not included as of `asOf` (the
+ *  indexer's head, read BEFORE the lookup). */
+export interface TxLookup {
+  found: { hash: string; height: number; success: boolean } | null;
+  asOf: ReadWatermark;
 }
 
 /** A Midnight transaction the sponsor submitted and saw finalized. */
@@ -174,16 +214,24 @@ export interface SwapBackend {
   }): Promise<RelayOutcome>;
   /** The request's attestation if one already verifies, without waiting or broadcasting. */
   attestation(kind: BridgeKind, requestId: string): Promise<Attestation | null>;
-  /** A settle, sealing any coin it mints to the temporary wallet's encryption key. */
+  /** A settle, sealing any coin it mints to the temporary wallet's encryption key. `onSubmit` is told
+   *  the transaction's identifiers before it reaches the node (audit T1). */
   settle(input: {
     circuit: SettleCircuit;
     requestId: string;
     attestation: Attestation;
     recipientCoinPk: string;
     recipientEncPk: string;
+    onSubmit?: (s: SubmissionInfo) => void;
   }): Promise<MidnightTxFacts & { minted: boolean }>;
   /** The vault's permissionless `abandonDeposit`, for a sweep attested never-executed. */
-  abandonDeposit(input: { requestId: string; attestation: Attestation }): Promise<MidnightTxFacts>;
+  abandonDeposit(input: {
+    requestId: string;
+    attestation: Attestation;
+    onSubmit?: (s: SubmissionInfo) => void;
+  }): Promise<MidnightTxFacts>;
+  /** A Midnight transaction by any of its identifiers (audit T1: did the sponsor's own settle land?). */
+  findTransaction(identifier: string): Promise<TxLookup>;
   /** A digest of the vault's current contract state: it changes whenever the vault's state does
    *  (a request started or settled), so `/prove` can tell a moved vault from a wrong call. */
   vaultStateMark(): Promise<string>;
