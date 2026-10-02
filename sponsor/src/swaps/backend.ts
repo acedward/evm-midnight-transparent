@@ -32,6 +32,26 @@ export interface EvmReader {
    * sweep, whoever started and settled it).
    */
   transfersFrom(token: string, from: string, fromBlock: bigint): Promise<EvmTransfer[]>;
+  /**
+   * A MINED transaction's own fields (`eth_getTransactionByHash`), or null while it is pending or
+   * unknown; throws when Sepolia cannot be read (audit U2: a sweep's `Transfer` log explains a drop
+   * at the deposit address only when its transaction IS a pending request's signed sweep: the same
+   * nonce, gas limit and fee fields).
+   */
+  transaction(hash: string): Promise<EvmTransaction | null>;
+}
+
+export interface EvmTransaction {
+  /** 0x…, lowercase. */
+  hash: string;
+  /** The sender (0x…, lowercase). */
+  from: string;
+  nonce: bigint;
+  gasLimit: bigint;
+  /** The EIP-1559 fee cap (a legacy transaction: its gas price). */
+  maxFeePerGas: bigint;
+  /** The EIP-1559 tip (a legacy transaction: its gas price). */
+  maxPriorityFeePerGas?: bigint;
 }
 
 export interface EvmTransfer {

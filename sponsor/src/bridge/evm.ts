@@ -3,7 +3,7 @@
 // The URL usually carries an API key: it is never logged, and errors say only which method failed
 // (the logger also redacts the URL).
 
-import type { EvmReader, EvmTransfer } from '../swaps/backend.js';
+import type { EvmReader, EvmTransaction, EvmTransfer } from '../swaps/backend.js';
 
 const quantity = (v: unknown): bigint => {
   if (typeof v !== 'string' || !/^0x[0-9a-fA-F]*$/.test(v)) throw new Error('not a hex quantity');
@@ -14,6 +14,31 @@ const quantity = (v: unknown): bigint => {
 export const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 /** Blocks per `eth_getLogs` call (well inside every public provider's range limit). */
 export const LOG_CHUNK_BLOCKS = 5_000n;
+
+const optQuantity = (v: unknown): bigint | undefined => (v === undefined || v === null ? undefined : quantity(v));
+
+/** An `eth_getTransactionByHash` answer for `hash`, checked: null while it is pending (no block) or
+ *  unknown, and for an answer about another transaction (audit U2). */
+export function parseTransaction(raw: unknown, hash: string): EvmTransaction | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const t = raw as Record<string, unknown>;
+  const want = hash.toLowerCase();
+  if (typeof t.hash !== 'string' || t.hash.toLowerCase() !== want) return null;
+  if (t.blockNumber === null || t.blockNumber === undefined) return null;
+  if (typeof t.from !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(t.from)) return null;
+  const gasPrice = optQuantity(t.gasPrice);
+  const maxFeePerGas = optQuantity(t.maxFeePerGas) ?? gasPrice;
+  const maxPriorityFeePerGas = optQuantity(t.maxPriorityFeePerGas) ?? gasPrice;
+  if (maxFeePerGas === undefined) return null;
+  return {
+    hash: want,
+    from: t.from.toLowerCase(),
+    nonce: quantity(t.nonce),
+    gasLimit: quantity(t.gas),
+    maxFeePerGas,
+    ...(maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas } : {}),
+  };
+}
 
 const word = (address: string) => `0x${address.toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
 const hexQ = (n: bigint) => `0x${n.toString(16)}`;
@@ -117,5 +142,6 @@ export function jsonRpcEvmReader(
       }
       return out;
     },
+    transaction: async (hash) => parseTransaction(await call('eth_getTransactionByHash', [hash]), hash),
   };
 }

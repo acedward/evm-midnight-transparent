@@ -71,6 +71,8 @@ export interface MockControls {
    *  answers it, or null: the mock and test EVM wallets answer the page's receipt reads with it
    *  (P4.2-fix4). */
   sepoliaReceipt(hash: string): Record<string, unknown> | null;
+  /** The transaction of such a transfer, as `eth_getTransactionByHash` answers it (P4.2-fix5 U4). */
+  sepoliaTransaction(hash: string): Record<string, unknown> | null;
 }
 
 export interface MockEnvironment {
@@ -146,7 +148,14 @@ export function createMockEnvironment(input: {
 
   // The mock sponsor reads the deposit address through whichever wallet is connected (the built-in
   // one answers balance reads for any address, as the specs' test wallet does).
-  const builtIn = settings.evmWallet ? announceMockEvmWallet(registry, window, (h) => chain.sepoliaReceipt(h)) : null;
+  const builtIn = settings.evmWallet
+    ? announceMockEvmWallet(
+        registry,
+        window,
+        (h) => chain.sepoliaReceipt(h),
+        (h) => chain.sepoliaTransaction(h),
+      )
+    : null;
 
   const controls: MockControls = {
     consumeOffer: (id) => chain.consume(id),
@@ -180,6 +189,7 @@ export function createMockEnvironment(input: {
     requests: () => [...sponsor.requests],
     walletStats: () => ({ ...wallet.stats }),
     sepoliaReceipt: (hash) => chain.sepoliaReceipt(hash),
+    sepoliaTransaction: (hash) => chain.sepoliaTransaction(hash),
   };
   (globalThis as { __emtMock?: MockControls }).__emtMock = controls;
 

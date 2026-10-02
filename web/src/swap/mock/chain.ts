@@ -48,6 +48,9 @@ export interface MockSepoliaTransfer {
   /** The receipt's status: 1 mined and executed, 0 reverted (then no log). */
   status: 0 | 1;
   blockNumber: number;
+  /** The sender's transaction nonce (decimal): the vault account's nonce the withdrawal signed
+   *  (P4.2-fix5 U4). Absent in a world saved before. */
+  nonce?: string;
 }
 
 /** The `Transfer(address,address,uint256)` event's topic. */
@@ -256,6 +259,25 @@ export class MockChain {
               },
             ]
           : [],
+    };
+  }
+
+  /** The transaction of a bridge transfer, shaped as `eth_getTransactionByHash` answers it (P4.2-fix5
+   *  U4: the page binds the payout to its own withdrawal by the sender's nonce); null for a hash it did
+   *  not mine, or one saved without its nonce. */
+  sepoliaTransaction(txHash: string): Record<string, unknown> | null {
+    const t = this.transfers.get(txHash.toLowerCase());
+    if (!t || t.nonce === undefined) return null;
+    return {
+      hash: t.hash,
+      blockNumber: `0x${t.blockNumber.toString(16)}`,
+      from: t.from.toLowerCase(),
+      to: t.token.toLowerCase(),
+      nonce: `0x${BigInt(t.nonce).toString(16)}`,
+      gas: '0x186a0',
+      maxFeePerGas: '0x2540be400',
+      maxPriorityFeePerGas: '0x3b9aca00',
+      value: '0x0',
     };
   }
 

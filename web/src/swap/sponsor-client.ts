@@ -120,7 +120,9 @@ const SwapViewShape = z.object({
   takeTx: optText,
   /** P4.2-fix4 T1 (FS4): vault requests of this swap that ANOTHER party settled; a `lost` entry's
    *  amount was minted with a nonce only that party knows, so the temporary wallet can never use it.
-   *  Read only through ./settled-elsewhere.ts. */
+   *  Read only through ./settled-elsewhere.ts. The sponsor sends at most 16 (P4.2-fix5 U5); the page
+   *  reads up to 256, so an older sponsor's longer list never makes the whole view unreadable; an
+   *  empty list means nothing is lost (any more: P4.2-fix5 U3). */
   settledElsewhere: z
     .array(
       z.object({
@@ -140,7 +142,7 @@ const SwapViewShape = z.object({
         at: z.number().optional(),
       }),
     )
-    .max(16)
+    .max(256)
     .optional(),
   withdraw: LegProgressSchema.optional(),
   /** Every withdrawal attempt, oldest first: the page counts the ones that ended without a transfer

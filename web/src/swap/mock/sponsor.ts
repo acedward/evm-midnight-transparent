@@ -59,8 +59,10 @@ export interface MockScenario {
   /** What each swap's FIRST withdrawal's Sepolia transfer looks like on the fake Sepolia (P4.2-fix4;
    *  later ones are always right): `reverted` (status 0, no log; the bridge then refunds it and the
    *  page retries), `wrong-token` (another ERC20's log), `wrong-amount` (one base unit off), `older`
-   *  (mined before the user funded the swap). Default: the right transfer. */
-  transferReceipt?: 'ok' | 'reverted' | 'wrong-token' | 'wrong-amount' | 'older';
+   *  (mined before the user funded the swap), `foreign` (the right token, amount, sender and
+   *  recipient, mined after the funding, but ANOTHER withdrawal's: the vault account's nonce is not the
+   *  one this swap's withdrawal signed; P4.2-fix5 U4). Default: the right transfer. */
+  transferReceipt?: 'ok' | 'reverted' | 'wrong-token' | 'wrong-amount' | 'older' | 'foreign';
   /** A withdrawal whose transfer is mined (and not reverted) waits there (the bridge's ~17 minutes of
    *  closing, held) until this is cleared: the specs check the page's Done on arrival (P4.2-fix4). */
   holdAfterTransfer?: boolean;
@@ -118,6 +120,8 @@ export interface MockSwap {
   /** The running (or last) Bridge back is of a partial deposit, for `backAmount` (S2). */
   partialBack?: boolean;
   backAmount?: string;
+  /** The vault account's nonce the latest accepted withdrawal signed (decimal; P4.2-fix5 U4). */
+  attemptNonce?: string;
 }
 
 export interface MockSponsorDump {
@@ -519,6 +523,7 @@ export class MockSponsor {
     const failStart = !!this.o.scenario.failFirstStart && s.withdrawals === 0;
     if ((this.o.chain.balances(s.payload.tempCoinPk).get(tx.colour!) ?? 0n) < BigInt(tx.amount!))
       return fail(409, 'conflict', 'the temporary wallet does not hold that coin');
+    s.attemptNonce = tx.evmNonce;
     if (!failStart) {
       // The start lands: the coin is spent into the vault (the wallet's next sync sees it spent). A
       // start that fails in the lane never lands: its coin is never spent, and stays booked in the
@@ -633,6 +638,8 @@ export class MockSponsor {
       amount: (kind === 'wrong-amount' ? (amount > 1n ? amount - 1n : amount + 1n) : amount).toString(),
       status: kind === 'reverted' ? 0 : 1,
       ...(kind === 'older' ? { blockNumber: 4_000_000 } : {}),
+      // The vault account's nonce this withdrawal signed; `foreign`: another withdrawal's.
+      nonce: (BigInt(s.attemptNonce ?? String(this.evmNonce - 1)) + (kind === 'foreign' ? 1_000n : 0n)).toString(),
     });
   }
 

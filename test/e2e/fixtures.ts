@@ -23,8 +23,9 @@ export interface MockSettings {
     refundFirstWithdrawal?: boolean;
     refuseOpen?: string;
     failFirstStart?: boolean;
-    /** P4.2-fix4: the first withdrawal's Sepolia transfer; hold the bridge's closing after a transfer. */
-    transferReceipt?: 'ok' | 'reverted' | 'wrong-token' | 'wrong-amount' | 'older';
+    /** P4.2-fix4: the first withdrawal's Sepolia transfer (P4.2-fix5 U4: `foreign`, another
+     *  withdrawal's); hold the bridge's closing after a transfer. */
+    transferReceipt?: 'ok' | 'reverted' | 'wrong-token' | 'wrong-amount' | 'older' | 'foreign';
     holdAfterTransfer?: boolean;
   };
   book?: 'default' | 'empty';

@@ -98,6 +98,30 @@ export function parseReceipt(raw: unknown, hash: string): MinedReceipt | null {
   };
 }
 
+/** A mined transaction's sender and nonce as the page reads them (P4.2-fix5 U4: a payout is this
+ *  swap's only when the vault account's nonce is one this swap's own withdrawal signed). */
+export interface MinedTransaction {
+  hash: string;
+  /** The sender (0x…, lowercase). */
+  from: string;
+  nonce: bigint;
+}
+
+/**
+ * An `eth_getTransactionByHash` answer for `hash`, checked: null while the transaction is pending (no
+ * block) or unknown, and for an answer that is not about that transaction or not well formed.
+ */
+export function parseTransaction(raw: unknown, hash: string): MinedTransaction | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const t = raw as { hash?: unknown; from?: unknown; nonce?: unknown; blockNumber?: unknown };
+  const want = hash.toLowerCase();
+  if (typeof t.hash !== 'string' || t.hash.toLowerCase() !== want) return null;
+  if (typeof t.blockNumber !== 'string' || !/^0x[0-9a-fA-F]{1,16}$/.test(t.blockNumber)) return null;
+  if (typeof t.from !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(t.from)) return null;
+  if (typeof t.nonce !== 'string' || !/^0x[0-9a-fA-F]{1,16}$/.test(t.nonce)) return null;
+  return { hash: want, from: t.from.toLowerCase(), nonce: BigInt(t.nonce) };
+}
+
 export interface EvmPort {
   address: string;
   /** Throws an `EvmError` unless the wallet is on the bound chain with the bound account right now. */
@@ -111,6 +135,9 @@ export interface EvmPort {
   /** The mined receipt with its logs, read on the bound chain (`ready()` first: never another
    *  network's), or null while it is pending or unknown (P4.2-fix4). */
   minedReceipt(hash: string): Promise<MinedReceipt | null>;
+  /** The mined transaction's sender and nonce, read on the bound chain (`ready()` first), or null
+   *  while it is pending or unknown (P4.2-fix5 U4). */
+  minedTransaction(hash: string): Promise<MinedTransaction | null>;
 }
 
 /** The connected account on one chain (`chain`: its id and name, e.g. Sepolia's `0xaa36a7`). */
@@ -196,6 +223,11 @@ export function evmPort(
       if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return null;
       await ready();
       return parseReceipt(await provider.request({ method: 'eth_getTransactionReceipt', params: [hash] }), hash);
+    },
+    async minedTransaction(hash) {
+      if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return null;
+      await ready();
+      return parseTransaction(await provider.request({ method: 'eth_getTransactionByHash', params: [hash] }), hash);
     },
   };
 }

@@ -197,6 +197,8 @@ async function fundedSwap(scenario: MockScenario = {}, extra: Partial<SessionDep
   const signer = testSigner();
   const evm = new FakeSepolia(signer.address);
   evm.bridgeReceipts = (h) => env.controls.sepoliaReceipt(h);
+  // P4.2-fix5 U4: the payout's transaction (its vault-account nonce) is read too.
+  evm.bridgeTransactions = (h) => env.controls.sepoliaTransaction(h);
   env.setEvmReader(evm);
   const deps: SessionDeps = {
     backends: backendsOf(env),
@@ -400,6 +402,7 @@ describe('P4.2-fix4: a partial Bridge back is Done only when everything came bac
     const signer = testSigner();
     const evm = new FakeSepolia(signer.address);
     evm.bridgeReceipts = (h) => env.controls.sepoliaReceipt(h);
+    evm.bridgeTransactions = (h) => env.controls.sepoliaTransaction(h);
     env.setEvmReader(evm);
     const s = SwapSession.begin(offer, {
       backends: backendsOf(env),

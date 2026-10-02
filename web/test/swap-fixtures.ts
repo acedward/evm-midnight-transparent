@@ -7,7 +7,14 @@ import { secp256k1 } from '@noble/curves/secp256k1';
 import { TypedDataEncoder, Wallet, getAddress, getBytes, hexlify } from 'ethers';
 
 import type { MockSettings } from '../src/config.js';
-import { EvmError, type EvmPort, type MinedReceipt, parseReceipt } from '../src/swap/evm.js';
+import {
+  EvmError,
+  type EvmPort,
+  type MinedReceipt,
+  type MinedTransaction,
+  parseReceipt,
+  parseTransaction,
+} from '../src/swap/evm.js';
 import { type MockEnvironment, createMockEnvironment } from '../src/swap/mock/index.js';
 import type { SwapBackends, TypedData, TypedDataSigner } from '../src/swap/ports.js';
 import { HttpSponsorApi } from '../src/swap/sponsor-client.js';
@@ -138,6 +145,32 @@ export class FakeSepolia implements EvmPort {
         hash,
       );
     return parseReceipt(this.bridgeReceipts?.(h) ?? null, hash);
+  }
+
+  /** The mock bridge's transfers' transactions (P4.2-fix5 U4: the sender's nonce), from the mock world
+   *  (`env.controls.sepoliaTransaction`). Unset: unknown here. */
+  bridgeTransactions: ((hash: string) => Record<string, unknown> | null) | null = null;
+  /** Every transaction read, in order. */
+  readonly transactionReads: string[] = [];
+
+  /** As the real port: `ready()` first, then the mined transaction (its sender and nonce). This
+   *  wallet's own transactions carry their number − 1 as their nonce. */
+  async minedTransaction(hash: string): Promise<MinedTransaction | null> {
+    await this.ready();
+    this.transactionReads.push(hash);
+    const h = hash.toLowerCase();
+    const own = this.sent.findIndex((t) => t.hash.toLowerCase() === h);
+    if (own >= 0)
+      return parseTransaction(
+        {
+          hash: h,
+          from: this.address.toLowerCase(),
+          nonce: `0x${own.toString(16)}`,
+          blockNumber: `0x${(5_000_001 + own).toString(16)}`,
+        },
+        hash,
+      );
+    return parseTransaction(this.bridgeTransactions?.(h) ?? null, hash);
   }
 }
 
