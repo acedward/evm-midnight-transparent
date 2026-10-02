@@ -169,8 +169,17 @@ const storedText = (page: Page) =>
 
 const phaseOf = (page: Page) => page.getByTestId('swap-page').getAttribute('data-phase');
 
-/** Wait until the swap page's phase is one of `phases`; returns it. Screens and records any error. */
-async function waitPhase(page: Page, phases: string[], timeoutMs: number, label: string): Promise<string> {
+/** Wait until the swap page's phase is one of `phases`; returns it. Screens and records any error.
+ *  `ignoreError` (E.5): a transient page error is NOT fatal — while the sponsor is intentionally
+ *  paused (the griefer runs) the page's `/sponsor` proxy returns 502, which the page shows as "The
+ *  swap stopped"; the test must wait through it until the sponsor is back and resolves the swap. */
+async function waitPhase(
+  page: Page,
+  phases: string[],
+  timeoutMs: number,
+  label: string,
+  ignoreError = false,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let last = '';
   while (Date.now() < deadline) {
@@ -184,7 +193,7 @@ async function waitPhase(page: Page, phases: string[], timeoutMs: number, label:
       .getByTestId('swap-page')
       .getAttribute('data-status')
       .catch(() => null);
-    if (status === 'error') {
+    if (status === 'error' && !ignoreError) {
       const msg = await page
         .getByTestId('swap-error')
         .innerText()
@@ -538,5 +547,334 @@ test('E.3: the offer is taken by a competitor during the bridge-in: "Swap is not
   });
   expect(final.outcome).toBe('bridged-back');
   expect(existsSync(join(STATE_DIR, 'e3-ready.json'))).toBe(true);
+  await context.close();
+});
+
+// ── helpers for E.6 / E.5 (P4.2-live) ─────────────────────────────────────────
+
+const dataDone = (page: Page) => page.getByTestId('swap-page').getAttribute('data-done');
+
+/** Wait until the swap page's `data-done` is one of `values` (no/closing/closed). */
+async function waitDataDone(page: Page, values: string[], timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const v = (await dataDone(page).catch(() => null)) ?? '';
+    if (values.includes(v)) return v;
+    await page.waitForTimeout(3_000);
+  }
+  throw new Error(
+    `timed out waiting for data-done in {${values.join(',')}} (last ${await dataDone(page).catch(() => '?')})`,
+  );
+}
+
+/** Every stage id the page shows must carry a human title (not the raw id): the FW4 rule, read from
+ *  the live page. Each stage `li` has `data-stage=<id>` and shows `stageTitle(leg, id)`; an untitled
+ *  id would show the id verbatim. Returns the (stage id -> title) seen, and throws on an untitled one. */
+async function assertStagesTitled(page: Page): Promise<Record<string, string>> {
+  const seen: Record<string, string> = {};
+  for (const testId of ['bridge-in-stages', 'bridge-out-stages']) {
+    const lis = page.getByTestId(testId).locator('li');
+    const n = await lis.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+      const li = lis.nth(i);
+      const id = (await li.getAttribute('data-stage')) ?? '';
+      if (!id) continue;
+      const title = (
+        (await li
+          .locator('span')
+          .first()
+          .innerText()
+          .catch(() => '')) ?? ''
+      ).trim();
+      if (title === id || title === '') throw new Error(`the stage id "${id}" is shown untitled in ${testId}`);
+      seen[id] = title;
+    }
+  }
+  return seen;
+}
+
+// ── E.6: one honest swap end to end on the final code, Done on arrival checked ─
+
+test('E.6: an honest swap end to end, Done shown as soon as the payout is mined', async ({ browser, baseURL }) => {
+  test.skip(PHASE !== 'e6', 'phase e6 only');
+  const t0 = Date.now();
+  const times: Record<string, number> = {};
+  const config = await getJson<{ tokens: Array<{ symbol: string; sepoliaAddress: string; midnightColour: string }> }>(
+    `${baseURL}/sponsor/v1/config`,
+  );
+  const tokenAddr = Object.fromEntries(config.tokens.map((t) => [t.symbol, t.sepoliaAddress]));
+  const healthBefore = await health(baseURL!);
+  const balancesBefore = await balances(tokenAddr);
+  await evidence('e6-00-before', {
+    offerId: OFFER,
+    kernelStatus: await getJson(`${KERNEL}/v1/offers/${OFFER}/status`),
+    balancesBefore,
+    sponsorHealth: healthBefore,
+  });
+
+  const context = await browser.newContext({ baseURL, viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const w = await installTestWallet(page, { privateKey: userKey(), live: { rpcUrl: RPC } });
+  const started = await startSwap(page, w, times, t0);
+  const swapId = String(started.record.swapId);
+  await evidence('e6-01-opened', {
+    swapId,
+    listed: started.listed,
+    depositAddress: started.deposit,
+    tempAddress: started.temp,
+    record: started.record,
+    times,
+  });
+  const funding = await sendFunds(page, w, times, t0);
+  await evidence('e6-02-funded', {
+    swapId,
+    funding,
+    receipts: await Promise.all(funding.map((f) => sepoliaTx(f.hash))),
+    times,
+  });
+
+  await waitPhase(page, ['bridging-in'], 15 * MIN, 'bridge-in');
+  times.bridgingIn = since(t0);
+  await waitBridgeInStage(page, /Deposit started on Midnight/, 15 * MIN);
+  times.depositStarted = since(t0);
+  await shot(page, '05-bridge-in');
+
+  await waitPhase(page, ['taking', 'bridging-out', 'done'], 45 * MIN, 'minted');
+  times.minted = since(t0);
+  await shot(page, '06-taking');
+  await waitPhase(page, ['bridging-out', 'done'], 20 * MIN, 'take');
+  times.taken = since(t0);
+  const afterTake = await swapRecord(page, swapId);
+  await evidence('e6-03-taken', { swapId, record: afterTake, times });
+
+  // Done on arrival (FW4): the page shows Done as soon as the payout transfer is mined and verified
+  // on Sepolia, BEFORE the sponsor's own `done` (~17 min later, after completeWithdraw).
+  const doneState = await waitDataDone(page, ['closing', 'closed'], 25 * MIN);
+  times.doneOnArrival = since(t0);
+  const arrivedFull = await page
+    .getByTestId('arrived')
+    .getAttribute('data-full')
+    .catch(() => null);
+  const recAtArrival = (await swapRecord(page, swapId))!;
+  const stagesAtArrival = await assertStagesTitled(page);
+  await shot(page, '07-done-on-arrival');
+  await evidence('e6-04-done-on-arrival', {
+    swapId,
+    dataDone: doneState,
+    arrivedFull,
+    phaseAtArrival: recAtArrival.phase,
+    arrivals: recAtArrival.arrivals ?? null,
+    bridgeOut: recAtArrival.bridgeOut ?? null,
+    stageTitlesSeen: stagesAtArrival,
+    times,
+  });
+  expect(arrivedFull).toBe('yes'); // the whole receive leg arrived, verified on Sepolia
+
+  // The sponsor reaches its own `done` after the attestation + completeWithdraw.
+  await waitDataDone(page, ['closed'], 30 * MIN);
+  await waitPhase(page, ['done'], 5 * MIN, 'sponsor-done');
+  times.done = since(t0);
+  await shot(page, '08-done');
+  const summary = await page.getByTestId('done-summary').innerText();
+  const final = (await swapRecord(page, swapId))!;
+  const stagesFinal = await assertStagesTitled(page);
+  const stored = await storedText(page);
+  expect(stored).not.toMatch(/"seed|swapToken|signature/i);
+
+  const balancesAfter = await balances(tokenAddr);
+  const healthAfter = await health(baseURL!);
+  const bi = final.bridgeIn as Record<string, string>;
+  const bo = final.bridgeOut as Record<string, string>;
+  const take = final.take as Record<string, string>;
+  await evidence('e6-05-done', {
+    swapId,
+    summary,
+    record: final,
+    stageTitlesSeen: stagesFinal,
+    doneOnArrivalMinutes: times.doneOnArrival ? times.doneOnArrival / 60 : null,
+    sponsorDoneMinutes: times.done ? times.done / 60 : null,
+    arrivalToSponsorDoneMinutes: times.done && times.doneOnArrival ? (times.done - times.doneOnArrival) / 60 : null,
+    sepolia: {
+      funding: await Promise.all(funding.map((f) => sepoliaTx(f.hash))),
+      sweep: bi.sweepTx ? await sepoliaTx(bi.sweepTx) : null,
+      transferOut: bo.sepoliaTx ? await sepoliaTx(bo.sepoliaTx) : null,
+    },
+    midnight: {
+      startDeposit: await midnightTx(bi.startTx),
+      completeDeposit: await midnightTx(bi.completeTx),
+      take: await midnightTx(take.tx),
+      startWithdraw: await midnightTx(bo.startTx),
+      completeWithdraw: await midnightTx(bo.completeTx),
+    },
+    balancesBefore,
+    balancesAfter,
+    sponsorHealthBefore: healthBefore,
+    sponsorHealthAfter: healthAfter,
+    times,
+  });
+  expect(final.phase).toBe('done');
+  expect(final.outcome).toBe('swapped');
+  await context.close();
+});
+
+// ── E.5: T1 containment — a griefer completes the deposit; the swap ends settled-elsewhere ────────
+
+test('E.5: a griefer completes the deposit with its own key: the swap ends failed/settled-elsewhere', async ({
+  browser,
+  baseURL,
+}) => {
+  test.skip(PHASE !== 'e5', 'phase e5 only');
+  const t0 = Date.now();
+  const times: Record<string, number> = {};
+  const config = await getJson<{ tokens: Array<{ symbol: string; sepoliaAddress: string }> }>(
+    `${baseURL}/sponsor/v1/config`,
+  );
+  const tokenAddr = Object.fromEntries(config.tokens.map((t) => [t.symbol, t.sepoliaAddress]));
+  const healthBefore = await health(baseURL!);
+  const balancesBefore = await balances(tokenAddr);
+  await evidence('e5-00-before', {
+    offerId: OFFER,
+    kernelStatus: await getJson(`${KERNEL}/v1/offers/${OFFER}/status`),
+    balancesBefore,
+    sponsorHealth: healthBefore,
+  });
+
+  const context = await browser.newContext({ baseURL, viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const w = await installTestWallet(page, { privateKey: userKey(), live: { rpcUrl: RPC } });
+  const started = await startSwap(page, w, times, t0);
+  const swapId = String(started.record.swapId);
+  // Public inputs for the griefer (temp coin key, deposit address, pay token), read from the record.
+  const rec0 = started.record as unknown as {
+    temp: { coinPk: string };
+    deposit: { address: string };
+    offer: { pay: { symbol?: string; colour?: string } };
+  };
+  await evidence('e5-01-opened', {
+    swapId,
+    listed: started.listed,
+    depositAddress: started.deposit,
+    tempAddress: started.temp,
+    record: started.record,
+    times,
+  });
+  const funding = await sendFunds(page, w, times, t0);
+  await evidence('e5-02-funded', {
+    swapId,
+    funding,
+    receipts: await Promise.all(funding.map((f) => sepoliaTx(f.hash))),
+    times,
+  });
+
+  await waitPhase(page, ['bridging-in'], 15 * MIN, 'bridge-in');
+  await waitBridgeInStage(page, /Deposit started on Midnight/, 15 * MIN);
+  times.depositStarted = since(t0);
+  await shot(page, '05-bridge-in');
+
+  // Hand the griefer the public inputs it needs, then the operator stops the sponsor, runs the
+  // griefer (run-live.sh grief) and restarts the sponsor.
+  await writeFile(
+    join(STATE_DIR, 'e5-ready.json'),
+    `${JSON.stringify(
+      {
+        swapId,
+        offerId: OFFER,
+        tempCoinPk: rec0.temp.coinPk,
+        depositAddress: rec0.deposit.address,
+        paySymbol: rec0.offer.pay.symbol,
+        payColour: rec0.offer.pay.colour,
+        at: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  console.log(
+    `[${new Date().toISOString()}] e5: bridge-in started; waiting for the griefer + the sponsor's containment`,
+  );
+
+  // The sponsor must resolve its gone request as settled-elsewhere and fail the swap (never hang).
+  // Tolerate the transient 502 while the sponsor is paused for the griefer.
+  await waitPhase(page, ['failed'], 60 * MIN, 'settled-elsewhere', true);
+  times.failed = since(t0);
+  await expect(page.getByTestId('lost-notice')).toBeVisible({ timeout: 2 * MIN });
+  const stagesSeen = await assertStagesTitled(page);
+  await shot(page, '06-settled-elsewhere');
+  const final = (await swapRecord(page, swapId))!;
+  expect(await storedText(page)).not.toMatch(/"seed|swapToken|signature/i);
+  const balancesAfter = await balances(tokenAddr);
+  await evidence('e5-03-settled-elsewhere', {
+    swapId,
+    record: final,
+    lost: final.lost ?? null,
+    reason: final.reason ?? null,
+    recoverable: final.recoverable ?? null,
+    stageTitlesSeen: stagesSeen,
+    balancesBefore,
+    balancesAfter,
+    sponsorHealthBefore: healthBefore,
+    sponsorHealthAfter: await health(baseURL!),
+    times,
+  });
+  expect(final.phase).toBe('failed');
+  expect(final.recoverable).toBe(false);
+  await context.close();
+});
+
+// ── E.5-view: show the loss on the page for an already-griefed swap (import + resume) ─────────────
+// Captures the FW4/FS4 page evidence for a swap the griefer already settled elsewhere, without a
+// second grief: import the swap's public record, resume once (re-open → a new token), and the page
+// shows the sponsor's failed / settled-elsewhere view with the lost notice.
+
+test('E.5-view: the loss is shown on the page (import + resume of a settled-elsewhere swap)', async ({
+  browser,
+  baseURL,
+}) => {
+  test.skip(PHASE !== 'e5-view', 'phase e5-view only');
+  test.skip(!IMPORT_FILE, 'needs LIVE_IMPORT_FILE (the griefed swap record export)');
+  const t0 = Date.now();
+  const times: Record<string, number> = {};
+  const text = readFileSync(IMPORT_FILE, 'utf8');
+  const file = JSON.parse(text) as { records: Array<{ value: { data: Record<string, unknown> } }> };
+  const swapId = String(file.records[0]!.value.data.swapId);
+
+  const context = await browser.newContext({ baseURL, viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const w = await installTestWallet(page, { privateKey: userKey(), live: { rpcUrl: RPC } });
+  await page.goto('/#swap');
+  await connect(page);
+  expect(w.address).toBe(USER);
+  await page.goto('/#local');
+  await page.getByTestId('import-file').setInputFiles({
+    name: 'swap-record.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(text),
+  });
+  await expect(page.getByTestId('local-message')).toContainText('Imported 1 records');
+  await page.goto('/#swap');
+  const row = page.locator(`[data-testid=swap-record][data-swap-id="${swapId}"]`);
+  await expect(row).toBeVisible({ timeout: 2 * MIN });
+  await row.getByTestId('record-resume').click();
+  times.resumeClicked = since(t0);
+
+  // The re-open returns the failed / settled-elsewhere view (recoverable:false, not revived).
+  await waitPhase(page, ['failed'], 10 * MIN, 'settled-elsewhere', true);
+  times.failed = since(t0);
+  await expect(page.getByTestId('lost-notice')).toBeVisible({ timeout: 2 * MIN });
+  const stagesSeen = await assertStagesTitled(page);
+  await shot(page, '07-settled-elsewhere');
+  const final = (await swapRecord(page, swapId))!;
+  expect(await storedText(page)).not.toMatch(/"seed|swapToken|signature/i);
+  await evidence('e5-04-view-settled-elsewhere', {
+    swapId,
+    record: final,
+    lost: final.lost ?? null,
+    reason: final.reason ?? null,
+    recoverable: final.recoverable ?? null,
+    stageTitlesSeen: stagesSeen,
+    times,
+  });
+  expect(final.phase).toBe('failed');
+  expect(final.recoverable).toBe(false);
   await context.close();
 });
