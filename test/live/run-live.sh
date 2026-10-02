@@ -35,7 +35,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CMD="${1:?usage: run-live.sh env|preflight|build|keys|up|stop|start|health|phase|temp-check|competitor-fund|competitor-take|logs|down}"
+CMD="${1:?usage: run-live.sh env|preflight|build|keys|up|stop|start|sponsor-stop|sponsor-start|grief|health|phase|temp-check|competitor-fund|competitor-take|logs|down}"
 shift || true
 
 P=aa00048-p3
@@ -347,6 +347,53 @@ PY
   logs)
     docker logs "$P-sponsor-1" >"$STATE/logs/sponsor-$(date -u +%Y%m%dT%H%M%SZ).log" 2>&1 || true
     say "sponsor log saved in $STATE/logs"
+    ;;
+
+  sponsor-stop)
+    # E.5: pause the sponsor WITHOUT releasing the funding lock (the holder process from `up` keeps
+    # it). The griefer then uses the shared seed alone while the sponsor is down.
+    [[ -s "$STATE/lock-holder.pid" ]] || { say "the funding lock is not held: run 'up' first"; exit 2; }
+    docker logs "$P-sponsor-1" >"$STATE/logs/sponsor-prepause-$(date -u +%Y%m%dT%H%M%SZ).log" 2>&1 || true
+    docker stop "$P-sponsor-1"
+    say "sponsor container stopped; the funding lock stays held by this script (holder pid $(cat "$STATE/lock-holder.pid"))"
+    ;;
+
+  sponsor-start)
+    docker start "$P-sponsor-1"
+    wait_synced || { say "the sponsor did not re-sync after restart"; exit 1; }
+    say "sponsor restarted and synced"
+    ;;
+
+  grief)
+    # E.5: the griefer completes the swap's own deposit with its own encryption key and mint nonce
+    # (test/live/griefer.ts; it reuses sponsor/src/bridge). Inputs come from $STATE/e5-ready.json
+    # (public), written by the e5 Playwright phase. It pays DUST from `.stagenet` under the lock this
+    # script holds; run it only while the sponsor is stopped (sponsor-stop).
+    [[ -s "$STATE/lock-holder.pid" ]] || { say "the funding lock is not held: run 'up' first"; exit 2; }
+    [[ -s "$STATE/e5-ready.json" ]] || { say "no $STATE/e5-ready.json yet (run 'phase e5' first)"; exit 2; }
+    if docker inspect -f '{{.State.Running}}' "$P-sponsor-1" 2>/dev/null | grep -q true; then
+      say "the sponsor is still running: 'sponsor-stop' first so only the griefer uses the seed"; exit 2
+    fi
+    tcp="$(python3 -c "import json;print(json.load(open('$STATE/e5-ready.json'))['tempCoinPk'])")"
+    dep="$(python3 -c "import json;print(json.load(open('$STATE/e5-ready.json'))['depositAddress'])")"
+    sym="$(python3 -c "import json;print(json.load(open('$STATE/e5-ready.json')).get('paySymbol') or 'stkA')")"
+    sync_tree >/dev/null
+    log="$STATE/logs/grief-$(date -u +%Y%m%dT%H%M%SZ).log"
+    say "griefer: completing the deposit for temp coin pk ${tcp:0:12}… ($sym), log $log"
+    set +e
+    docker run --rm --name "$P-grief" --network "container:$P-proof-server-1" --init --memory 6g \
+      -v "$CHECK-app:/app" -v "$CHECK-bun:/opt/bun:ro" \
+      -v "${P}_vault-keys:/app/vault-managed:ro" \
+      -v "$SEED_FILE:/secrets/stagenet:ro" -v "$STATE:/live" -v "$EVIDENCE:/evidence" \
+      -e PATH=/opt/bun:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root \
+      -e STAGENET_WALLET_FILE=/secrets/stagenet -e VAULT_MANAGED_DIR=/app/vault-managed \
+      -e PROOF_SERVER_URL=http://127.0.0.1:6300 -e SEPOLIA_RPC_URL="$RPC" \
+      -e GRIEF_EVIDENCE_DIR=/evidence -e FEE_BLOCKS_MARGIN=20 \
+      -w /app "$RUNNER_IMAGE" /opt/bun/bun test/live/griefer.ts \
+      --temp-coin-pk "$tcp" --deposit-address "$dep" --token "$sym" --name e5-grief 2>&1 | tee "$log"
+    status="${PIPESTATUS[0]}"
+    set -e
+    exit "$status"
     ;;
 
   down)
