@@ -12,7 +12,10 @@
 //                 decides from its own record, the wallet and the sponsor's withdrawal signal, not
 //                 from the state's name, so a refund (back to `minted`, Q9 A), a failed start and a
 //                 resume all land on the right step;
-//   stageStates   the six stages the page shows, and which one is current.
+//   stageStates   the six stages the page shows, and which one is current: all done once every token
+//                 arrived at the user's address, verified on Sepolia, while the bridge closes the
+//                 request in the background (P4.2-fix4, ./arrival.ts);
+//   stageTitle    a human title for every stage id the sponsor writes.
 //
 // A PARTIAL deposit (P4.2-fix3 S2, ./partial.ts; the sponsor's state `partial`: part of the pay
 // amount minted to the temporary wallet, the rest still at the deposit address) is its own next
@@ -24,7 +27,7 @@ import type { WithdrawalLast } from '@evm-midnight-transparent/core';
 import { clockText } from './display.js';
 import { bridgeBackAmount, partialOf, partialRecord } from './partial.js';
 
-import type { SwapPhase, SwapRecord } from './record-shape.js';
+import { type SwapPhase, type SwapRecord, isDoneForUser } from './record-shape.js';
 import { lostRecord } from './settled-elsewhere.js';
 import type { SponsorStage, SwapView } from './sponsor-client.js';
 
@@ -321,35 +324,67 @@ export function stageStates(record: SwapRecord | null): Record<StageKey, StageSt
     return out;
   }
   const failed = record.phase === 'failed';
-  const at = failed ? failedStage(record) : PHASE_STAGE[record.phase];
+  // P4.2-fix4: every token arrived at the user's address (verified): done, while the bridge closes.
+  const phase: SwapPhase = isDoneForUser(record) ? 'done' : record.phase;
+  const at = failed ? failedStage(record) : PHASE_STAGE[phase];
   STAGE_KEYS.forEach((k, i) => {
     out[k] = i < at ? 'done' : i === at ? (failed ? 'failed' : 'current') : 'pending';
   });
-  if (record.phase === 'done') out.done = 'done';
+  if (phase === 'done') out.done = 'done';
   // The offer was gone: the take stage failed, whatever happens after.
   if (record.choice === 'bridge-back' || record.phase === 'unavailable') out.take = 'failed';
   return out;
 }
 
-/** Plain titles for the sponsor's stage ids, per leg (the real sponsor's, sponsor/src/swaps/service.ts,
- *  and the mock's `settled`); an unknown id is shown as it came. */
-export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Readonly<Record<string, string>>>> = {
+/**
+ * Plain titles for the sponsor's stage ids (the real sponsor's, sponsor/src/swaps/service.ts, and the
+ * mock's `settled` and `evm-failed`). A leg's own words first (`deposit`: the bridge-in list,
+ * `withdraw`: the bridge-out list), then `shared`: the ids that read the same in either list, or that
+ * only one leg emits. web/test/fix4-stage-titles.test.ts reads every stage id the sponsor's code can
+ * write and fails when one has no title in either list (P4.2-fix4: the owner saw "evm-pending"
+ * untitled in both). An id this page does not know yet is still shown as it came.
+ */
+export const SPONSOR_STAGE_TITLES: Readonly<
+  Record<'deposit' | 'withdraw' | 'shared', Readonly<Record<string, string>>>
+> = {
   deposit: {
-    'waiting-for-funds': 'Waiting for your funds at the deposit address',
-    'funds-seen': 'Your funds reached the deposit address',
-    'budget-wait': "Waiting for room in the sponsor's daily budget",
     starting: 'Starting the deposit on Midnight',
     adopted: 'Deposit found on Midnight',
     started: 'Deposit started on Midnight',
     'mpc-signed': 'Sweep signed by the MPC network',
-    'evm-broadcast': 'Sweep sent on Sepolia',
+    'evm-broadcast': 'Sweep mined on Sepolia',
     'evm-not-broadcast': 'The sweep could not be sent on Sepolia',
     'evm-final': 'Sweep final on Sepolia',
     attested: 'Sweep attested by the MPC network',
-    'relay-stalled': 'Waiting on the bridge (the sponsor retries)',
     completing: 'Minting to the temporary wallet',
     completed: 'Minted to the temporary wallet',
     settled: 'Minted to the temporary wallet',
+    // P4.2-fix4 FS4 (Lane contracts, FS4 item 4): a settle the sponsor did not track; a lost amount
+    // is the sponsor's own note on the page.
+    'settled-elsewhere': 'Deposit request found completed on Midnight',
+  },
+  withdraw: {
+    starting: 'Starting the withdrawal on Midnight',
+    adopted: 'Withdrawal found on Midnight',
+    started: 'Withdrawal started on Midnight',
+    'mpc-signed': 'Transfer signed by the MPC network',
+    'evm-broadcast': 'Transfer to you mined on Sepolia',
+    'evm-not-broadcast': 'The Sepolia transfer could not be sent',
+    'evm-final': 'Transfer final on Sepolia',
+    attested: 'Transfer attested by the MPC network',
+    completing: 'Closing the withdrawal on Midnight',
+    completed: 'Withdrawal closed on Midnight',
+    settled: 'Withdrawal closed on Midnight',
+    'settled-elsewhere': 'Withdrawal request found completed on Midnight',
+  },
+  shared: {
+    // The relay sent the MPC-signed transaction and waits for Sepolia to mine it (both legs).
+    'evm-pending': 'Waiting for the Sepolia transaction',
+    'relay-stalled': 'Waiting on the bridge (the sponsor retries)',
+    // The deposit leg's own ids.
+    'waiting-for-funds': 'Waiting for your funds at the deposit address',
+    'funds-seen': 'Your funds reached the deposit address',
+    'budget-wait': "Waiting for room in the sponsor's daily budget",
     abandoning: 'The sweep did not happen: closing the request',
     abandoned: 'The sweep did not happen: the deposit will be retried',
     'completed-foreign': 'Another request swept the deposit address: the sponsor completed it',
@@ -357,28 +392,19 @@ export const SPONSOR_STAGE_TITLES: Readonly<Record<'deposit' | 'withdraw', Reado
     partial: 'Part of your deposit reached the temporary wallet',
     'rearm-wait': 'Waiting to start the deposit of the rest (the sponsor paces them)',
     closed: 'Deposit request closed',
-  },
-  withdraw: {
+    // The withdrawal leg's own ids.
     queued: 'Waiting for the withdrawal lane',
-    starting: 'Starting the withdrawal on Midnight',
     submitting: 'Submitting the withdrawal on Midnight',
     'submission-uncertain': 'Checking whether the withdrawal reached Midnight',
-    adopted: 'Withdrawal found on Midnight',
-    started: 'Withdrawal started on Midnight',
     resumed: 'Withdrawal resumed by the sponsor',
-    'mpc-signed': 'Transfer signed by the MPC network',
-    'evm-broadcast': 'Tokens sent to you on Sepolia',
-    'evm-not-broadcast': 'The Sepolia transfer could not be sent',
-    'evm-final': 'Transfer final on Sepolia',
     'evm-failed': 'The Sepolia transfer failed',
-    attested: 'Transfer attested by the MPC network',
-    'relay-stalled': 'Waiting on the bridge (the sponsor retries)',
-    completing: 'Closing the withdrawal on Midnight',
-    completed: 'Withdrawal closed on Midnight',
-    settled: 'Withdrawal closed on Midnight',
     refunded: 'Refunded to the temporary wallet',
     failed: 'The withdrawal failed',
   },
 };
 
-export const stageTitle = (leg: 'deposit' | 'withdraw', id: string) => SPONSOR_STAGE_TITLES[leg][id] ?? id;
+const ownTitle = (table: Readonly<Record<string, string>>, id: string) =>
+  Object.hasOwn(table, id) ? table[id] : undefined;
+
+export const stageTitle = (leg: 'deposit' | 'withdraw', id: string): string =>
+  ownTitle(SPONSOR_STAGE_TITLES[leg], id) ?? ownTitle(SPONSOR_STAGE_TITLES.shared, id) ?? id;

@@ -1,6 +1,7 @@
 // "Your swaps": the connected wallet's swap records in this browser (Local data holds them; Export
 // takes them to another browser), with Open, and Resume for one that is not finished and not running
-// in this tab.
+// in this tab. A swap whose tokens all arrived at the user's address (verified on Sepolia) shows Done
+// while the bridge closes the request in the background, as on its page (P4.2-fix4).
 
 import {
   ButtonLink,
@@ -14,7 +15,13 @@ import {
   type PillStatus,
 } from '../../design/index.js';
 import { dateText, legText } from '../../swap/display.js';
-import { type SwapRecord, isRecoverable, isRecoverableUnknown, isResumable } from '../../swap/record-shape.js';
+import {
+  type SwapRecord,
+  isDoneForUser,
+  isRecoverable,
+  isRecoverableUnknown,
+  isResumable,
+} from '../../swap/record-shape.js';
 import { useSwap } from '../../swap/SwapContext.js';
 
 const PHASE_TEXT: Record<SwapRecord['phase'], string> = {
@@ -29,7 +36,10 @@ const PHASE_TEXT: Record<SwapRecord['phase'], string> = {
 };
 
 function pill(r: SwapRecord): PillStatus {
-  if (r.phase === 'done') return r.outcome === 'bridged-back' ? 'refunded' : 'done';
+  if (isDoneForUser(r))
+    return (r.outcome ?? (r.choice === 'bridge-back' ? 'bridged-back' : 'swapped')) === 'bridged-back'
+      ? 'refunded'
+      : 'done';
   if (r.phase === 'failed') return 'failed';
   return 'progress';
 }
@@ -51,8 +61,13 @@ export function YourSwaps() {
         {records.map((r) => {
           const s = session(r.swapId);
           const running = !!s && !s.isClosed && !s.isStuck;
-          const text =
-            r.outcome === 'bridged-back'
+          // P4.2-fix4: every token arrived (verified); the sponsor has not closed the request yet.
+          const closing = isDoneForUser(r) && r.phase !== 'done';
+          const text = closing
+            ? r.choice === 'bridge-back'
+              ? 'Bridged back'
+              : 'Done'
+            : r.outcome === 'bridged-back'
               ? r.partial
                 ? 'Bridged back what arrived'
                 : 'Bridged back'
@@ -67,7 +82,13 @@ export function YourSwaps() {
                     ? 'Failed: resume to ask the sponsor'
                     : PHASE_TEXT[r.phase];
           return (
-            <tr key={r.swapId} data-testid="swap-record" data-swap-id={r.swapId} data-phase={r.phase}>
+            <tr
+              key={r.swapId}
+              data-testid="swap-record"
+              data-swap-id={r.swapId}
+              data-phase={r.phase}
+              data-done={isDoneForUser(r) ? (closing ? 'closing' : 'closed') : 'no'}
+            >
               <Cell block>
                 <strong>
                   {legText(r.offer.pay)} → {legText(r.offer.receive)}
@@ -79,7 +100,8 @@ export function YourSwaps() {
               <Cell label="State">
                 <span>
                   <StatusPill status={pill(r)}>{text}</StatusPill>
-                  {running && <Sub>running in this tab</Sub>}
+                  {closing && <Sub multiline>the bridge closes the request in the background</Sub>}
+                  {running && !closing && <Sub>running in this tab</Sub>}
                 </span>
               </Cell>
               <Cell label="Started" align="right" num>

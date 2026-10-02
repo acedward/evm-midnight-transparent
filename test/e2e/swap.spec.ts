@@ -68,7 +68,8 @@ test('the whole swap (happy path), with every stage and hash', async ({ page }) 
   await expect(stage(page, 'bridge-in')).toHaveAttribute('data-state', 'current');
   await expect(stage(page, 'bridge-in')).toContainText('About 18 minutes');
   await setMockStep(page, 100);
-  await expect(page.getByTestId('bridge-in-stages').locator('li')).toHaveCount(7);
+  // The mock's eight bridge-in stages, `evm-pending` included as the real relay reports it (P4.2-fix4).
+  await expect(page.getByTestId('bridge-in-stages').locator('li')).toHaveCount(8);
 
   // Stages 4–6: take, bridge out, done.
   await expect(page.getByTestId('swap-page')).toHaveAttribute('data-phase', 'done', { timeout: 30_000 });

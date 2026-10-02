@@ -16,6 +16,11 @@
 // P4.2-fix2 R3). A version-1 record (written before: its id IS its salt, derivation 1) is read as a
 // legacy version 2 and still resumes; a failed one without `recoverable` is offered for Resume, and
 // the sponsor's answer to the re-open decides.
+//
+// P4.2-fix4 (optional, so earlier records still read): `arrivals`, the token transfers to the user's
+// address this page VERIFIED on Sepolia (./arrival.ts). When they add up to the whole amount the
+// swap pays out, the swap is done for the user (`isDoneForUser`) while the bridge closes the request
+// in the background (about 17 minutes), even though the sponsor still says `withdrawing`.
 
 import { publicSwapId } from '@evm-midnight-transparent/core';
 import { z } from 'zod';
@@ -60,6 +65,10 @@ const Stage = z.object({ stage: shortText, at: ms }).strict();
 const SentTx = z
   .object({ hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/), status: z.enum(['sent', 'confirmed', 'failed']) })
   .strict();
+
+/** A verified transfer to the user's address (P4.2-fix4): its Sepolia hash, the token's colour on
+ *  Midnight, the base units its `Transfer` log carried, and when the page saw it. */
+const Arrival = z.object({ tx: z.string().regex(/^0x[0-9a-f]{64}$/), colour: hex64, amount: decimal, at: ms }).strict();
 
 export const SWAP_PHASES = [
   /** The sponsor has the swap; the user has not sent the funds yet. */
@@ -184,6 +193,10 @@ const SwapRecordV2 = z
           .optional(),
       })
       .strict(),
+    /** The token transfers to `evmAddress` this page verified on Sepolia from their receipts
+     *  (P4.2-fix4, ./arrival.ts): mined with status 1, an ERC20 `Transfer` from the vault's EVM account
+     *  to this address of the token the swap pays out, after the swap was funded. Oldest first. */
+    arrivals: z.array(Arrival).max(16).optional(),
     phase: z.enum(SWAP_PHASES),
     outcome: z.enum(['swapped', 'bridged-back']).optional(),
     /** Why the swap failed or stopped, as shown to the user. */
@@ -226,6 +239,28 @@ export const isRecoverable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
 export const isRecoverableUnknown = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
   r.phase === 'failed' && r.recoverable === undefined;
 
-/** What the page offers Resume for: not finished; failed and recoverable; or failed and not known. */
-export const isResumable = (r: Pick<SwapRecord, 'phase' | 'recoverable'>) =>
-  !isFinished(r) || isRecoverable(r) || isRecoverableUnknown(r);
+/** The leg the swap's withdrawal pays out to the user: what it receives, or after Bridge back what
+ *  it paid. */
+export const outLeg = (r: Pick<SwapRecord, 'choice' | 'offer'>): SwapRecord['offer']['pay'] =>
+  r.choice === 'bridge-back' ? r.offer.pay : r.offer.receive;
+
+/** What the verified arrivals of the paid-out leg add up to (P4.2-fix4). */
+export function arrivedAmount(r: Pick<SwapRecord, 'choice' | 'offer' | 'arrivals'>): bigint {
+  const colour = outLeg(r).colour;
+  return (r.arrivals ?? []).filter((a) => a.colour === colour).reduce((sum, a) => sum + BigInt(a.amount), 0n);
+}
+
+/** Every token the swap pays out is at the user's address, verified on Sepolia: the arrivals add up
+ *  to EXACTLY the leg's whole amount (never for a part of it: a partial Bridge back's first part). */
+export const arrivedInFull = (r: Pick<SwapRecord, 'choice' | 'offer' | 'arrivals'>): boolean =>
+  r.arrivals !== undefined && r.arrivals.length > 0 && arrivedAmount(r) === BigInt(outLeg(r).amount);
+
+/** Done as the user sees it: the sponsor said `done`, or every token arrived at the user's address
+ *  while the bridge closes the request in the background (P4.2-fix4: the swap shows Done on arrival). */
+export const isDoneForUser = (r: Pick<SwapRecord, 'phase' | 'choice' | 'offer' | 'arrivals'>): boolean =>
+  r.phase === 'done' || ((r.phase === 'bridging-out' || r.phase === 'bridging-back') && arrivedInFull(r));
+
+/** What the page offers Resume for: not finished (and not done for the user: P4.2-fix4); failed and
+ *  recoverable; or failed and not known. */
+export const isResumable = (r: Pick<SwapRecord, 'phase' | 'recoverable' | 'choice' | 'offer' | 'arrivals'>) =>
+  (!isFinished(r) && !isDoneForUser(r)) || isRecoverable(r) || isRecoverableUnknown(r);

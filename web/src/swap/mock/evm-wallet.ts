@@ -3,13 +3,21 @@
 // page, fake Sepolia balances (1 ETH and 1,000 of every vault token), transfers that only move those
 // numbers, and real EIP-712 signatures. Announced through EIP-6963 as "Mock wallet (no real funds)".
 // The Playwright specs use their own test wallet (test/e2e/test-wallet.ts) instead.
+//
+// Receipts (P4.2-fix4): its own transactions are mined at block 5,000,000 + their number; the mock
+// bridge's transfers to the user (the withdrawals) come from the mock world (`bridgeReceipt`), so the
+// page can check their `Transfer` logs and show Done on arrival in the mock-mode demo too.
 
 import type { TokenRegistry } from '@evm-midnight-transparent/core';
 import { Wallet } from 'ethers';
 
 const hexq = (v: bigint) => `0x${v.toString(16)}`;
 
-export function announceMockEvmWallet(registry: TokenRegistry, win: Window = window): { address: string } {
+export function announceMockEvmWallet(
+  registry: TokenRegistry,
+  win: Window = window,
+  bridgeReceipt: (hash: string) => Record<string, unknown> | null = () => null,
+): { address: string } {
   const wallet = Wallet.createRandom();
   const me = wallet.address.toLowerCase();
   const eth = new Map<string, bigint>([[me, 10n ** 18n]]);
@@ -61,8 +69,19 @@ export function announceMockEvmWallet(registry: TokenRegistry, win: Window = win
           }
           return `0x${(++sent).toString(16).padStart(64, 'd')}`;
         }
-        case 'eth_getTransactionReceipt':
-          return { status: '0x1', transactionHash: params[0] };
+        case 'eth_getTransactionReceipt': {
+          const hash = String(params[0]).toLowerCase();
+          const bridged = bridgeReceipt(hash);
+          if (bridged) return bridged;
+          // Its own: `0x…ddd<n>` is its n-th transaction.
+          const n = /^0xd*([0-9a-f]{1,8})$/.exec(hash)?.[1];
+          return {
+            status: '0x1',
+            transactionHash: hash,
+            blockNumber: hexq(5_000_000n + BigInt(n ? Number.parseInt(n, 16) : 0)),
+            logs: [],
+          };
+        }
         case 'eth_signTypedData_v4': {
           const td = JSON.parse(String(params[1])) as {
             domain: Record<string, unknown>;
