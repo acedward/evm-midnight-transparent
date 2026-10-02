@@ -19,6 +19,7 @@ import {
   expectedArrival,
 } from '../src/swap/arrival.js';
 import { type MinedReceipt, evmPort, parseReceipt } from '../src/swap/evm.js';
+import { announceMockEvmWallet } from '../src/swap/mock/evm-wallet.js';
 import { stageStates } from '../src/swap/flow.js';
 import type { MockEnvironment, MockScenario } from '../src/swap/mock/index.js';
 import { type SwapRecord, arrivedAmount, arrivedInFull, isDoneForUser, isResumable } from '../src/swap/record-shape.js';
@@ -504,5 +505,36 @@ describe('P4.2-fix4: the record and the flow decisions', () => {
 
   it('the states that agree with an arrival are the closing ones and done', () => {
     expect([...AGREES_WITH_ARRIVAL].sort()).toEqual(['bridging_back', 'done', 'withdrawing']);
+  });
+});
+
+describe("P4.2-fix4: the mock-mode demo wallet answers the bridge's receipts", () => {
+  it('returns the mock world receipt for a bridge transfer, and its own transactions mined below it', async () => {
+    env = mockEnv();
+    let provider: Eip1193Provider | null = null;
+    const grab = (e: Event) => (provider = (e as CustomEvent<{ provider: Eip1193Provider }>).detail.provider);
+    window.addEventListener('eip6963:announceProvider', grab);
+    const { address } = announceMockEvmWallet(registry, window, (h) => env.controls.sepoliaReceipt(h));
+    window.removeEventListener('eip6963:announceProvider', grab);
+    const p = provider!;
+    const own = (await p.request({
+      method: 'eth_sendTransaction',
+      params: [{ from: address, to: address, value: '0x1' }],
+    })) as string;
+    const ownReceipt = parseReceipt(await p.request({ method: 'eth_getTransactionReceipt', params: [own] }), own)!;
+    expect(ownReceipt).toMatchObject({ status: 'success', blockNumber: 5_000_001, logs: [] });
+    const bridged = env.chain.mineSepoliaTransfer({
+      token: STKA.sepoliaAddress,
+      from: VAULT_EVM,
+      to: address,
+      amount: '100000000',
+      status: 1,
+    });
+    const r = parseReceipt(await p.request({ method: 'eth_getTransactionReceipt', params: [bridged] }), bridged)!;
+    expect(r.blockNumber).toBeGreaterThan(ownReceipt.blockNumber);
+    expect(checkTransfer(r, { ...expected, to: address.toLowerCase() }, ownReceipt.blockNumber)).toEqual({
+      kind: 'arrived',
+      amount: 100_000_000n,
+    });
   });
 });
