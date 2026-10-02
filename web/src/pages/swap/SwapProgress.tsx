@@ -3,7 +3,8 @@
 // not running in this tab (US2.2), a PARTIAL deposit (P4.2-fix3 S2): what arrived, what is missing,
 // "Wait for the rest" or "Bridge back" what arrived; and Done on arrival (P4.2-fix4): Done as soon as
 // every token is at the user's address, verified on Sepolia, with a quiet note while the bridge
-// closes the request in the background, and the bridge's report shown if it contradicts that.
+// closes the request in the background, and the bridge's report shown if it contradicts that; and a
+// quiet note while the sponsor is not answering, which the swap waits out (P4.5), never a stop.
 
 import type { NetworkProfile } from '@evm-midnight-transparent/core';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -717,6 +718,12 @@ export function SwapProgress({ swapId }: { swapId: string }) {
         <Notice tone="danger" className="panel-intro" data-testid="nondet-warning" title="Keep this tab open.">
           Your wallet does not sign the start message the same way twice, so this swap cannot be recovered if this tab
           closes before it is done.
+        </Notice>
+      )}
+      {snap?.outage && (
+        // P4.5: a passing sponsor outage is waited out; this is a note, not a stop.
+        <Notice tone="info" role="status" className="panel-intro" data-testid="sponsor-outage">
+          {snap.outage}
         </Notice>
       )}
       {snap?.notice && (

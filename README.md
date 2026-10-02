@@ -12,8 +12,8 @@ stagenet, and signs. The app then:
 
 A small sponsor service pays the Midnight fees of the bridge legs. It never holds a user's keys.
 
-Status: work in progress. Test networks only (Midnight stagenet and Ethereum Sepolia); nothing
-here carries real value.
+Status: ready for deployment: master PR #1 is ready for review. Test networks only (Midnight
+stagenet and Ethereum Sepolia); nothing here carries real value.
 
 ## Licence
 
@@ -23,8 +23,8 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 `00048-evm-midnight-transparent` is the master branch of this project's single pull request into
 `main`. Work is done on short-lived branches whose temporary pull requests target this branch,
-and each is merged in with a merge commit once its checks are green. The master pull request
-stays a draft until the work is complete; the owner merges it.
+and each is merged in with a merge commit once its checks are green. The master pull request is
+ready for review; the owner merges it.
 
 ## Repository layout
 

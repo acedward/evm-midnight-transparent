@@ -45,6 +45,20 @@ export class SponsorApiError extends Error {
   get rebuild(): boolean {
     return this.code === 'stale-vault-state' || this.code === 'stale-evm-nonce';
   }
+
+  /** A passing failure, not a refusal (plan 00048 P4.5): no answer at all (a network error or a
+   *  timeout: status 0, code `network`), 408, 429 (too many requests), or any 5xx (a gateway's 502,
+   *  503 or 504 while the sponsor is down or restarting, or the sponsor's own coded "try again": busy,
+   *  low on fees, the proof server or Sepolia unavailable). The caller waits and asks again; it never
+   *  gives up on a swap for it. A 4xx with a code is the sponsor's definitive answer. */
+  get transient(): boolean {
+    return (
+      (this.status === 0 && this.code === 'network') ||
+      this.status === 408 ||
+      this.status === 429 ||
+      (this.status >= 500 && this.status <= 599)
+    );
+  }
 }
 
 export type SponsorFetch = (url: string, init: RequestInit) => Promise<Response>;

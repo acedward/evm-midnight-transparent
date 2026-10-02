@@ -886,6 +886,11 @@ start the sponsor resumes every deposit and withdrawal in flight from its record
 withdrawal it had accepted but not yet submitted goes back to `minted` (`interrupted`), and the page
 rebuilds it; one it was submitting is `submission-uncertain` until its request id settles it
 (section 13.2). Prefer to restart when `queue.lanes.withdrawal` shows 0 running and 0 waiting.
+While the sponsor is down or restarting, open swap pages do not stop: an unanswered request, a
+timeout, the gateway's 502/503/504 and the sponsor's own coded 5xx "try again" are waited out (the
+wait grows to at most a minute between tries), with the quiet note "The sponsor is not answering;
+still trying"; each page goes on by itself once the sponsor answers. Only a definitive refusal (a
+4xx with a code) stops a swap.
 
 **Back up** the sponsor seed file and `swaps.json`:
 

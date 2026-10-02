@@ -173,6 +173,30 @@ describe('SponsorClient', () => {
     expect(e).toBeInstanceOf(SponsorApiError);
     expect(e).toMatchObject({ status: 409, code: 'stale-vault-state', detail: 'moved', rebuild: true });
     const nf = await c.swap(hex('cd'), 't'.repeat(43)).catch((x: unknown) => x);
-    expect(nf).toMatchObject({ status: 404, code: 'not-found', rebuild: false });
+    expect(nf).toMatchObject({ status: 404, code: 'not-found', rebuild: false, transient: false });
+  });
+
+  it('marks a passing failure as transient (plan 00048 P4.5): a gateway’s 5xx, the sponsor’s coded 503, a 429', async () => {
+    const { f } = fakeFetch({
+      [`GET /v1/swaps/${hex('ab')}`]: { status: 502, body: '<html>502 Bad Gateway</html>' },
+      [`GET /v1/swaps/${hex('cd')}`]: {
+        status: 503,
+        body: { error: { code: 'sponsor-busy', message: 'too many swaps wait for funds; try again later' } },
+      },
+      [`GET /v1/swaps/${hex('ef')}`]: { status: 429, body: '' },
+      [`GET /v1/swaps/${hex('12')}`]: {
+        status: 422,
+        body: { error: { code: 'invalid-tx', message: 'not this swap' } },
+      },
+    });
+    const c = new SponsorClient({ baseUrl: 'https://sponsor.example', fetch: f });
+    const err = (id: string) => c.swap(hex(id), 't'.repeat(43)).catch((x: unknown) => x as SponsorApiError);
+    expect(await err('ab')).toMatchObject({ status: 502, code: 'http', transient: true });
+    expect(await err('cd')).toMatchObject({ status: 503, code: 'sponsor-busy', transient: true });
+    expect(await err('ef')).toMatchObject({ status: 429, code: 'rate-limited', transient: true });
+    expect(await err('12')).toMatchObject({ status: 422, code: 'invalid-tx', transient: false });
+    expect(new SponsorApiError(0, 'network', 'unreachable').transient).toBe(true);
+    expect(new SponsorApiError(0, 'bad-request', 'not hex').transient).toBe(false);
+    expect(new SponsorApiError(200, 'invalid-response', 'unreadable').transient).toBe(false);
   });
 });

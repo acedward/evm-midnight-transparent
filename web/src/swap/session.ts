@@ -36,7 +36,15 @@
 //           user's funding). Once the verified arrivals add up to the whole amount, the swap is DONE
 //           for the user (P4.2-fix4: the owner's "stuck on done"), with a quiet note that the bridge
 //           closes the request in the background; the loop keeps reading the sponsor until it says
-//           `done`, and a state that contradicts the arrival is shown (nothing more is sent).
+//           `done`, and a state that contradicts the arrival is shown (nothing more is sent);
+//   outage  a passing sponsor outage (no answer, a timeout, a gateway's 502/503/504, the sponsor's own
+//           coded 5xx "try again", 408, 429: core `SponsorApiError.transient`) while the page polls
+//           the swap or asks for the take's or the withdrawal's proof, parameters or submission is
+//           waited out, never a stop (plan 00048 P4.5, found live in E.5): every unsent draft is
+//           released as before, the next round waits longer (pollMs × 2, × 4, × 8, at most pollMs × 12
+//           and a minute), and a quiet notice says the sponsor is not answering until a round meets
+//           no outage. Only a definitive refusal stops the swap: a session the sponsor no longer
+//           knows (401/404), a 4xx with a code, or an answer the page cannot read ten times in a row.
 //
 // The swap's PUBLIC id is keccak256(tag ‖ salt) (P4.2-fix C14): the sponsor, URLs and the snapshot
 // see it; the salt stays in this tab and the local record. Secrets stay in memory only: the sponsor's
@@ -90,6 +98,12 @@ import {
   openSwapMessage,
   signOpenSwap,
 } from './sponsor-client.js';
+
+/** What the page says while the sponsor does not answer (P4.5): the swap waits; it is not stopped. */
+export const SPONSOR_OUTAGE_NOTICE = 'The sponsor is not answering; still trying.';
+
+/** The longest wait between two rounds while the sponsor is down (P4.5). */
+export const MAX_OUTAGE_WAIT_MS = 60_000;
 
 /** The most sweep ETH the page will send (the sponsor sizes it; G-BRIDGE: 0.0001625 ETH). */
 export const MAX_SWEEP_WEI = 3n * 10n ** 15n;
@@ -151,6 +165,8 @@ export interface SessionSnapshot {
   notice: string | null;
   /** Why "Send funds" is paused (the wallet left Sepolia or the swap's account; P4.2-fix C9), or null. */
   fundingBlocked: string | null;
+  /** The quiet note while the sponsor does not answer and the swap waits for it (P4.5), or null. */
+  outage: string | null;
 }
 
 export interface SessionDeps {
@@ -203,6 +219,18 @@ const leg = (l: SwapOffer['pay']) => ({
   amount: l.amount.toString(),
 });
 
+/** A passing sponsor outage, not a refusal (P4.5): waited out, never a stop. */
+const isOutage = (e: unknown): e is SponsorError => e instanceof SponsorError && e.transient;
+
+/** The quiet note for an outage: the sponsor's own words when it said why (a coded 5xx such as
+ *  `prover-unavailable`), else that it is not answering (no answer, a gateway's page, a 429). */
+function outageText(e: SponsorError): string {
+  const own = e.status >= 500 && !/^(http(-\d+)?|network|rate-limited)$/.test(e.code) && e.message.trim() !== '';
+  return own
+    ? `The sponsor cannot go on right now (${e.message.trim().slice(0, 160)}); still trying.`
+    : SPONSOR_OUTAGE_NOTICE;
+}
+
 /** The user-facing text of an error, never a secret (errors here carry no key material). */
 function describe(e: unknown): string {
   if (e instanceof EvmError || e instanceof SponsorError || e instanceof SessionError) return e.message;
@@ -244,6 +272,9 @@ export class SwapSession {
   private readonly verdicts = new Map<string, NotCounted>();
   /** The block of the user's own funding transfer of this swap (the payout must be mined after it). */
   private fundedAt: number | null = null;
+  /** P4.5: the loop's rounds in a row that met a passing sponsor outage, and whether this round did. */
+  private outages = 0;
+  private down = false;
 
   private constructor(
     salt: string,
@@ -269,6 +300,7 @@ export class SwapSession {
       view: null,
       notice: null,
       fundingBlocked: null,
+      outage: null,
     };
   }
 
@@ -860,6 +892,7 @@ export class SwapSession {
     let misses = 0;
     try {
       while (!this.closed) {
+        this.down = false;
         let view: SwapView;
         try {
           view = await backends.sponsor!.swap(this.snap.swapId, this.token!);
@@ -872,11 +905,17 @@ export class SwapSession {
             );
             return;
           }
+          // P4.5: a passing outage (no answer, a gateway's 5xx, a timeout) is waited out: never a stop.
+          if (this.sponsorDown(e)) {
+            await this.pause();
+            continue;
+          }
+          // An answer the page cannot use (unreadable, or a refusal of the poll itself): ten in a row stop.
           if (++misses >= 10) {
             this.fail(e, true);
             return;
           }
-          this.set({ notice: 'The sponsor did not answer; trying again.' });
+          this.set({ notice: 'The sponsor sent an answer this page cannot use; trying again.' });
           await this.deps.sleep(backends.pollMs * 2);
           continue;
         }
@@ -908,7 +947,7 @@ export class SwapSession {
         if (this.closed) return;
         if (arrivedInFull(this.record) && view.state !== 'done') {
           if (await this.afterArrival(view)) return;
-          await this.deps.sleep(backends.pollMs);
+          await this.pause();
           continue;
         }
         const act = nextAction(this.record, view);
@@ -954,11 +993,37 @@ export class SwapSession {
           const stop = await this.onMinted(view);
           if (stop) return;
         }
-        await this.deps.sleep(backends.pollMs);
+        await this.pause();
       }
     } finally {
       this.looping = false;
     }
+  }
+
+  /** P4.5: a passing sponsor outage met in this round (no answer, a timeout, a gateway's 5xx, the
+   *  sponsor's coded "try again"): noted for the round's wait, and said quietly. False for anything
+   *  else (a definitive refusal, an unreadable answer), which the caller handles as before. */
+  private sponsorDown(e: unknown): boolean {
+    if (!isOutage(e)) return false;
+    this.down = true;
+    const text = outageText(e);
+    if (this.snap.outage !== text) this.set({ outage: text });
+    return true;
+  }
+
+  /** The wait before the next round (P4.5): the poll interval; after a round that met an outage, a
+   *  growing one (pollMs × 2, × 4, × 8, …, at most pollMs × 12 and MAX_OUTAGE_WAIT_MS). A round that
+   *  met none ends the outage and its note. */
+  private async pause(): Promise<void> {
+    const { pollMs } = this.deps.backends;
+    if (!this.down) {
+      this.outages = 0;
+      if (this.snap.outage !== null) this.set({ outage: null });
+      return this.deps.sleep(pollMs);
+    }
+    this.outages++;
+    const wait = Math.min(pollMs * 2 ** Math.min(this.outages, 16), pollMs * 12, MAX_OUTAGE_WAIT_MS);
+    return this.deps.sleep(Math.max(pollMs, wait));
   }
 
   // ── arrival (P4.2-fix4) ─────────────────────────────────────────────────
@@ -1127,6 +1192,12 @@ export class SwapSession {
           return false;
       }
     } catch (e) {
+      // P4.5: the sponsor did not answer the take's or the withdrawal's call (its draft was released on
+      // the way out): wait, then the next round decides again from the sponsor's view.
+      if (this.sponsorDown(e)) {
+        this.status({ kind: 'working', what: 'Waiting for the sponsor to answer' });
+        return false;
+      }
       this.fail(e, true);
       return true;
     }
