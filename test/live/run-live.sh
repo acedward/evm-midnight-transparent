@@ -35,7 +35,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CMD="${1:?usage: run-live.sh env|preflight|build|keys|up|stop|start|sponsor-stop|sponsor-start|grief|health|phase|temp-check|competitor-fund|competitor-take|logs|down}"
+CMD="${1:?usage: run-live.sh env|preflight|build|keys|up|stop|start|sponsor-stop|sponsor-start|sponsor-outage|grief|health|phase|temp-check|competitor-fund|competitor-take|logs|down}"
 shift || true
 
 P=aa00048-p3
@@ -362,6 +362,21 @@ PY
     docker start "$P-sponsor-1"
     wait_synced || { say "the sponsor did not re-sync after restart"; exit 1; }
     say "sponsor restarted and synced"
+    ;;
+
+  sponsor-outage)
+    # E.7 (P4.5 live): a passing sponsor outage. Stop the sponsor container (the lock stays held),
+    # wait <seconds> (default 120), start it again and wait until it has re-synced.
+    secs="${1:-120}"
+    [[ -s "$STATE/lock-holder.pid" ]] || { say "the funding lock is not held: run 'up' first"; exit 2; }
+    docker logs "$P-sponsor-1" >"$STATE/logs/sponsor-preoutage-$(date -u +%Y%m%dT%H%M%SZ).log" 2>&1 || true
+    docker stop "$P-sponsor-1" >/dev/null
+    say "sponsor stopped (outage starts; lock kept, holder pid $(cat "$STATE/lock-holder.pid")); waiting ${secs} s"
+    sleep "$secs"
+    docker start "$P-sponsor-1" >/dev/null
+    say "sponsor started again; waiting for its wallet to re-sync"
+    wait_synced || { say "the sponsor did not re-sync after the outage"; exit 1; }
+    say "sponsor back (outage over)"
     ;;
 
   grief)

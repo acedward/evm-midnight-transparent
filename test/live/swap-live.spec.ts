@@ -878,3 +878,206 @@ test('E.5-view: the loss is shown on the page (import + resume of a settled-else
   expect(final.recoverable).toBe(false);
   await context.close();
 });
+
+// ── E.7: the final master's honest path, through a sponsor outage during the bridge-in ─────────────
+// P4.5 live: while the swap bridges in, the operator stops the sponsor for ~2 minutes and starts it
+// again (run-live.sh sponsor-outage, on LIVE_STATE_DIR/e7-outage-ready.json). The page must keep
+// waiting with the quiet `sponsor-outage` note ("The sponsor is not answering; still trying.") and
+// never stop (no swap-error, no Retry), then finish. Done on arrival must be bound to this swap's own
+// withdrawal nonce (P4.2-fix5 U4: the payout transaction's nonce is one of `bridgeOut.evmNonces`).
+
+/** Watch the page through a sponsor outage: returns when the outage note was shown and then cleared.
+ *  Throws if the page stops (swap-error, Retry or data-status=error) at any point. */
+async function watchOutage(page: Page, timeoutMs: number, t0: number) {
+  const deadline = Date.now() + timeoutMs;
+  let first: number | null = null;
+  let last: number | null = null;
+  let text = '';
+  let polls = 0;
+  let shown = 0;
+  while (Date.now() < deadline) {
+    polls++;
+    const stopped =
+      (await page
+        .getByTestId('swap-error')
+        .isVisible()
+        .catch(() => false)) ||
+      (await page
+        .getByTestId('retry')
+        .isVisible()
+        .catch(() => false)) ||
+      (await page
+        .getByTestId('swap-page')
+        .getAttribute('data-status')
+        .catch(() => null)) === 'error';
+    if (stopped) {
+      await shot(page, 'outage-stopped');
+      const msg = await page
+        .getByTestId('swap-error')
+        .innerText()
+        .catch(() => '');
+      throw new Error(`P4.5: the page STOPPED during the sponsor outage: ${msg}`);
+    }
+    const note = page.getByTestId('sponsor-outage');
+    if (await note.isVisible().catch(() => false)) {
+      shown++;
+      if (first === null) {
+        first = since(t0);
+        text = (await note.innerText().catch(() => '')).trim();
+        console.log(`[${new Date().toISOString()}] e7: outage note shown: ${text}`);
+        await shot(page, '06-sponsor-outage');
+      }
+      last = since(t0);
+    } else if (first !== null) {
+      console.log(`[${new Date().toISOString()}] e7: outage note cleared`);
+      return { noteFirstSeenS: first, noteLastSeenS: last, noteClearedS: since(t0), text, polls, pollsWithNote: shown };
+    }
+    await page.waitForTimeout(3_000);
+  }
+  await shot(page, 'outage-timeout');
+  throw new Error(first === null ? 'P4.5: the outage note was never shown' : 'P4.5: the outage never cleared');
+}
+
+test('E.7: an honest swap on the final master, waiting out a sponsor outage', async ({ browser, baseURL }) => {
+  test.skip(PHASE !== 'e7', 'phase e7 only');
+  const t0 = Date.now();
+  const times: Record<string, number> = {};
+  const config = await getJson<{ tokens: Array<{ symbol: string; sepoliaAddress: string; midnightColour: string }> }>(
+    `${baseURL}/sponsor/v1/config`,
+  );
+  const tokenAddr = Object.fromEntries(config.tokens.map((t) => [t.symbol, t.sepoliaAddress]));
+  const healthBefore = await health(baseURL!);
+  const balancesBefore = await balances(tokenAddr);
+  await evidence('e7-00-before', {
+    offerId: OFFER,
+    kernelStatus: await getJson(`${KERNEL}/v1/offers/${OFFER}/status`),
+    balancesBefore,
+    sponsorHealth: healthBefore,
+  });
+
+  const context = await browser.newContext({ baseURL, viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const w = await installTestWallet(page, { privateKey: userKey(), live: { rpcUrl: RPC } });
+  const started = await startSwap(page, w, times, t0);
+  const swapId = String(started.record.swapId);
+  await evidence('e7-01-opened', {
+    swapId,
+    listed: started.listed,
+    depositAddress: started.deposit,
+    tempAddress: started.temp,
+    record: started.record,
+    times,
+  });
+  const funding = await sendFunds(page, w, times, t0);
+  await evidence('e7-02-funded', {
+    swapId,
+    funding,
+    receipts: await Promise.all(funding.map((f) => sepoliaTx(f.hash))),
+    times,
+  });
+
+  await waitPhase(page, ['bridging-in'], 15 * MIN, 'bridge-in');
+  await waitBridgeInStage(page, /Deposit started on Midnight/, 15 * MIN);
+  times.depositStarted = since(t0);
+  await shot(page, '05-bridge-in');
+
+  // P4.5 live: the operator bounces the sponsor now.
+  await writeFile(
+    join(STATE_DIR, 'e7-outage-ready.json'),
+    `${JSON.stringify({ swapId, offerId: OFFER, at: new Date().toISOString() })}\n`,
+  );
+  console.log(`[${new Date().toISOString()}] e7: bridge-in started; waiting for the operator's sponsor outage`);
+  const outage = await watchOutage(page, 30 * MIN, t0);
+  times.outageCleared = since(t0);
+  await evidence('e7-03-sponsor-outage', { swapId, outage, record: await swapRecord(page, swapId), times });
+
+  await waitPhase(page, ['taking', 'bridging-out', 'done'], 45 * MIN, 'minted');
+  times.minted = since(t0);
+  await waitPhase(page, ['bridging-out', 'done'], 20 * MIN, 'take');
+  times.taken = since(t0);
+  await evidence('e7-04-taken', { swapId, record: await swapRecord(page, swapId), times });
+
+  // Done on arrival, bound to this swap's own withdrawal nonce (U4).
+  const doneState = await waitDataDone(page, ['closing', 'closed'], 25 * MIN);
+  times.doneOnArrival = since(t0);
+  const arrivedFull = await page
+    .getByTestId('arrived')
+    .getAttribute('data-full')
+    .catch(() => null);
+  const recAtArrival = (await swapRecord(page, swapId))!;
+  const stagesAtArrival = await assertStagesTitled(page);
+  await shot(page, '07-done-on-arrival');
+  const bo = (recAtArrival.bridgeOut ?? {}) as { sepoliaTx?: string; evmNonces?: string[] };
+  const arrivals = (recAtArrival.arrivals ?? []) as Array<{ tx: string; amount: string }>;
+  const payoutHash = arrivals[0]?.tx ?? bo.sepoliaTx ?? '';
+  const payoutTx = payoutHash ? await sepolia().getTransaction(payoutHash) : null;
+  const binding = {
+    payoutTx: payoutHash,
+    from: payoutTx?.from ?? null,
+    nonce: payoutTx ? String(payoutTx.nonce) : null,
+    evmNonces: bo.evmNonces ?? null,
+    boundToOwnNonce:
+      !!payoutTx &&
+      payoutTx.from.toLowerCase() === VAULT_EVM.toLowerCase() &&
+      (bo.evmNonces ?? []).includes(String(payoutTx.nonce)),
+  };
+  await evidence('e7-05-done-on-arrival', {
+    swapId,
+    dataDone: doneState,
+    arrivedFull,
+    phaseAtArrival: recAtArrival.phase,
+    arrivals,
+    binding,
+    stageTitlesSeen: stagesAtArrival,
+    times,
+  });
+  expect(arrivedFull).toBe('yes');
+  expect(binding.boundToOwnNonce).toBe(true);
+
+  await waitDataDone(page, ['closed'], 30 * MIN);
+  await waitPhase(page, ['done'], 5 * MIN, 'sponsor-done');
+  times.done = since(t0);
+  await shot(page, '08-done');
+  const summary = await page.getByTestId('done-summary').innerText();
+  const final = (await swapRecord(page, swapId))!;
+  const stagesFinal = await assertStagesTitled(page);
+  expect(await storedText(page)).not.toMatch(/"seed|swapToken|signature/i);
+  const balancesAfter = await balances(tokenAddr);
+  const healthAfter = await health(baseURL!);
+  const bi = final.bridgeIn as Record<string, string>;
+  const bo2 = final.bridgeOut as Record<string, string>;
+  const take = final.take as Record<string, string>;
+  await evidence('e7-06-done', {
+    swapId,
+    summary,
+    record: final,
+    lost: final.lost ?? null,
+    stageTitlesSeen: stagesFinal,
+    outage,
+    binding,
+    doneOnArrivalMinutes: times.doneOnArrival / 60,
+    sponsorDoneMinutes: times.done / 60,
+    arrivalToSponsorDoneMinutes: (times.done - times.doneOnArrival) / 60,
+    sepolia: {
+      funding: await Promise.all(funding.map((f) => sepoliaTx(f.hash))),
+      sweep: bi.sweepTx ? await sepoliaTx(bi.sweepTx) : null,
+      transferOut: bo2.sepoliaTx ? await sepoliaTx(bo2.sepoliaTx) : null,
+    },
+    midnight: {
+      startDeposit: await midnightTx(bi.startTx),
+      completeDeposit: await midnightTx(bi.completeTx),
+      take: await midnightTx(take.tx),
+      startWithdraw: await midnightTx(bo2.startTx),
+      completeWithdraw: await midnightTx(bo2.completeTx),
+    },
+    balancesBefore,
+    balancesAfter,
+    sponsorHealthBefore: healthBefore,
+    sponsorHealthAfter: healthAfter,
+    times,
+  });
+  expect(final.phase).toBe('done');
+  expect(final.outcome).toBe('swapped');
+  expect(final.lost ?? null).toBeNull();
+  await context.close();
+});
