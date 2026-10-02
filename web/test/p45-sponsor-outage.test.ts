@@ -215,7 +215,11 @@ describe('P4.5: every existing stop stays', () => {
     const { s, w } = await fundedSwap();
     down({ status: 422, code: 'invalid-tx', message: 'the transaction is not this swap’s take' }, '/prove');
     await waitFor(() => statusOf(s).kind === 'error', 10_000, 'the stop');
-    expect(statusOf(s)).toMatchObject({ kind: 'error', canRetry: true, message: 'the transaction is not this swap’s take' });
+    expect(statusOf(s)).toMatchObject({
+      kind: 'error',
+      canRetry: true,
+      message: 'the transaction is not this swap’s take',
+    });
     expect(hits()).toBe(1);
     expect(w.outages).toEqual([]);
     // Nothing was taken, and the draft was released.
